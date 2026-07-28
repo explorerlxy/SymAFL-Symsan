@@ -3,26 +3,28 @@
 namespace pcbt {
 
 uint32_t Tree::InsertTrace(const std::vector<Event> &events,
-                           rgd::RGDAstParser *parser) {
+                           const dfsan_label_info *table,
+                           size_t table_labels) {
   if (events.empty()) return 0;
   num_traces += 1;
   num_events += events.size();
 
-  Node *cur = &root_;
-  size_t i = 0;
+  Node *parent = &root_;
+  uint8_t dir = 0;  // entry slot: the first decision node is root_.child[0]
   uint64_t depth = 0;
 
-  // Walk the existing trie prefix. Stop at the first missing child
-  // (divergence point) or on a path conflict (discard the trace).
+  // Walk the existing trie; stop at the first missing child (insert point)
+  // or bail out on a path conflict (cid mismatch at an existing node).
+  size_t i = 0;
   for (; i < events.size(); i++) {
-    uint8_t d = events[i].result ? 1 : 0;
-    Node *nxt = cur->child[d];
-    if (!nxt) break;                       // frontier: insert from here
-    if (nxt->cid != events[i].cid) {       // conflict: same decision prefix
-      num_conflicts += 1;                  // but different next branch site
+    Node *nxt = parent->child[dir];
+    if (!nxt) break;
+    if (nxt->cid != events[i].cid) {
+      num_conflicts += 1;
       return 0;
     }
-    cur = nxt;
+    parent = nxt;
+    dir = events[i].result ? 1 : 0;
     depth += 1;
   }
 
@@ -32,16 +34,17 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     auto node = std::make_unique<Node>();
     node->cid = events[i].cid;
     node->id = next_id_++;
-    try {
-      node->pred = parser->materialize(events[i].label);
-    } catch (const std::exception &) {
-      node->pred = nullptr;  // unparsable predicate: keep node, mark opaque
+    node->pred = predicate_from_label(table, table_labels, events[i].label);
+    if (!node->pred) {
+      node->pred = std::make_shared<Predicate>();
+      node->pred->opaque = true;  // unparsable: keep node, mark opaque
     }
-    uint8_t d = events[i].result ? 1 : 0;
+    if (node->pred->opaque) num_opaque += 1;
     Node *raw = node.get();
     arena_.push_back(std::move(node));
-    cur->child[d] = raw;
-    cur = raw;
+    parent->child[dir] = raw;
+    parent = raw;
+    dir = events[i].result ? 1 : 0;
     created += 1;
     depth += 1;
   }
@@ -49,6 +52,40 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   num_nodes += created;
   if (depth > max_depth) max_depth = depth;
   return created;
+}
+
+bool Tree::CheckInput(const uint8_t *input, uint32_t len, Node **out_node,
+                      uint8_t *out_dir, uint32_t rlimit) {
+  Node *cur = root_.child[0];
+  if (!cur) {
+    *out_node = nullptr;  // empty tree (bootstrap): admit all, no bookkeeping
+    *out_dir = 0;
+    return true;
+  }
+
+  while (true) {
+    uint8_t d;
+    if (!cur->pred || cur->pred->opaque) {
+      // cannot evaluate this node: conservative admit (no bookkeeping)
+      *out_node = nullptr;
+      *out_dir = 0;
+      return true;
+    }
+    uint64_t v = 0;
+    if (!eval_predicate(*cur->pred, input, len, &v)) {
+      d = 0;  // undefined (read past input end): v1's conservative rule
+    } else {
+      d = v ? 1 : 0;
+    }
+    Node *nxt = cur->child[d];
+    if (!nxt) {
+      // frontier in direction d
+      *out_node = cur;
+      *out_dir = d;
+      return cur->rCnt[d] < rlimit;
+    }
+    cur = nxt;
+  }
 }
 
 }  // namespace pcbt

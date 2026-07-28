@@ -15,9 +15,6 @@
 
 #include "dfsan/dfsan.h"
 
-#include "ast.h"
-#include "parse-rgd.h"
-
 #include "pcbt.hpp"
 
 extern "C" {
@@ -26,6 +23,7 @@ extern "C" {
 }
 
 #include <algorithm>
+#include <stdexcept>
 #include <string>
 #include <unordered_set>
 #include <vector>
@@ -51,7 +49,6 @@ using namespace __dfsan;
 #define DEBUGF(_str...) do { } while (0)
 #endif
 
-#define MAX_AST_SIZE 200
 #define MIN_TIMEOUT 50U
 
 static int TraceBounds = 0;
@@ -73,14 +70,13 @@ struct my_mutator_t {
   my_mutator_t() = delete;
   explicit my_mutator_t(const afl_state_t *afl)
       : afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
-        argv(NULL), out_fd(-1), parser(NULL) {}
+        argv(NULL), out_fd(-1) {}
 
   ~my_mutator_t() {
     if (out_fd >= 0) close(out_fd);
     ck_free(out_dir);
     ck_free(out_file);
     ck_free(argv);
-    delete parser;
   }
 
   const afl_state_t *afl;
@@ -90,15 +86,27 @@ struct my_mutator_t {
   char **argv;
   int out_fd;
 
-  rgd::RGDAstParser *parser;
   pcbt::Tree tree;
   std::unordered_set<std::string> traced_entries;
+
+  // screening state (post_process)
+  bool screening = true;
+  uint32_t rlimit = 16;
+  pcbt::Node *last_node = nullptr;
+  uint8_t last_dir = 0;
+  bool last_gained = true;
 
   // stats
   uint64_t traced_runs = 0;
   uint64_t failed_runs = 0;
   uint64_t trace_timeouts = 0;
   uint64_t memerr_events = 0;
+  uint64_t screened = 0;
+  uint64_t admitted = 0;
+  uint64_t vetoed = 0;
+  uint64_t vetoes_since_admit = 0;
+  bool saturation_logged = false;
+  uint64_t selfcheck_fail = 0;  // inserted input vetoed by its own tree
 };
 
 // shared union table (owned by the launcher)
@@ -184,11 +192,11 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     FATAL("Failed to init symsan launcher: %s\n", strerror(errno));
   }
 
-  // setup the AST parser (predicate materialization only; no nested solving)
-  data->parser = new rgd::RGDAstParser(__dfsan_label_info, uniontable_size,
-                                       false, MAX_AST_SIZE);
-  if (!data->parser) {
-    FATAL("Failed to create parser\n");
+  if (getenv("SYMAFL_NO_SCREEN")) {
+    data->screening = false;
+  }
+  if (const char *rl = getenv("SYMAFL_RCNT_LIMIT")) {
+    data->rlimit = (uint32_t)atoi(rl);
   }
 
   return data;
@@ -198,13 +206,20 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   const pcbt::Tree &t = data->tree;
   fprintf(stderr,
           "[pcbt] traces=%llu nodes=%llu depth=%llu conflicts=%llu "
-          "failed=%llu timeouts=%llu memerr=%llu\n",
+          "failed=%llu timeouts=%llu memerr=%llu screened=%llu "
+          "admitted=%llu vetoed=%llu saturated=%llu "
+          "selfcheck_fail=%llu\n",
           (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
           (unsigned long long)t.max_depth,
           (unsigned long long)t.num_conflicts,
           (unsigned long long)data->failed_runs,
           (unsigned long long)data->trace_timeouts,
-          (unsigned long long)data->memerr_events);
+          (unsigned long long)data->memerr_events,
+          (unsigned long long)data->screened,
+          (unsigned long long)data->admitted,
+          (unsigned long long)data->vetoed,
+          (unsigned long long)(data->screening ? 0 : 1),
+          (unsigned long long)data->selfcheck_fail);
   symsan_destroy();
   delete data;
 }
@@ -270,11 +285,6 @@ static void trace_and_insert(my_mutator_t *data, const u8 *buf,
     return;
   }
   data->traced_runs += 1;
-
-  // reset the per-run parser state (labels are per-run)
-  std::vector<symsan::input_t> inputs;
-  inputs.push_back({buf, buf_size});
-  data->parser->restart(inputs);
 
   std::vector<pcbt::Event> events;
   events.reserve(4096);
@@ -342,7 +352,19 @@ static void trace_and_insert(my_mutator_t *data, const u8 *buf,
     return;  // discard truncated traces (v1 replay-mismatch semantics)
   }
 
-  data->tree.InsertTrace(events, data->parser);
+  data->tree.InsertTrace(events, __dfsan_label_info, MAX_LABEL);
+
+  // self-consistency check: the just-inserted input must be admitted by
+  // CheckInput (its path now exists and ends at a fresh frontier). A veto
+  // here means converter/evaluator semantics diverge from execution.
+  {
+    pcbt::Node *node = nullptr;
+    uint8_t dir = 0;
+    if (!data->tree.CheckInput(buf, (uint32_t)buf_size, &node, &dir,
+                               data->rlimit)) {
+      data->selfcheck_fail += 1;
+    }
+  }
 }
 
 /// Read a queue file and trace+insert it (once per entry).
@@ -381,7 +403,57 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                                          const u8 *filename_new_queue,
                                          const u8 *filename_orig_queue) {
   (void)(filename_orig_queue);
+  data->last_gained = true;  // the last admitted candidate gained coverage
   trace_entry_file(data, (const char *)filename_new_queue);
+  return 0;
+}
+
+/// PCBT screening: veto mutated candidates that cannot reach an unexplored
+/// frontier. Returning 0 with *out_buf=NULL tells AFL++ to skip executing
+/// this candidate entirely.
+extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
+                                          size_t buf_size, u8 **out_buf) {
+  // rCnt bookkeeping for the previously admitted candidate
+  if (data->last_node) {
+    if (!data->last_gained) data->last_node->rCnt[data->last_dir] += 1;
+    data->last_node = nullptr;
+  }
+
+  if (!data->screening) {
+    *out_buf = buf;
+    return buf_size;
+  }
+
+  data->screened += 1;
+  pcbt::Node *node = nullptr;
+  uint8_t dir = 0;
+  if (data->tree.CheckInput(buf, (uint32_t)buf_size, &node, &dir,
+                            data->rlimit)) {
+    data->admitted += 1;
+    data->vetoes_since_admit = 0;
+    if (node) {
+      data->last_node = node;
+      data->last_dir = dir;
+      data->last_gained = false;
+    }
+    *out_buf = buf;
+    return buf_size;
+  }
+
+  data->vetoed += 1;
+  // saturation watchdog: if the whole reachable frontier is rCnt-pruned,
+  // every candidate is vetoed and the fuzzer would stall. After 1M
+  // consecutive vetoes fall back to passthrough (plain AFL) and log it.
+  if (++data->vetoes_since_admit >= 1000000 && data->screening) {
+    data->screening = false;
+    if (!data->saturation_logged) {
+      data->saturation_logged = true;
+      fprintf(stderr,
+              "[pcbt] frontier saturated after %llu vetoes, screening off\n",
+              (unsigned long long)data->vetoed);
+    }
+  }
+  *out_buf = NULL;
   return 0;
 }
 
@@ -390,12 +462,19 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
   const pcbt::Tree &t = data->tree;
   snprintf(buf, sizeof(buf),
            "traces=%llu nodes=%llu depth=%llu conflicts=%llu "
-           "failed=%llu timeouts=%llu memerr=%llu",
+           "failed=%llu timeouts=%llu memerr=%llu "
+           "screened=%llu admitted=%llu vetoed=%llu saturated=%llu "
+           "selfcheck_fail=%llu",
            (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
            (unsigned long long)t.max_depth,
            (unsigned long long)t.num_conflicts,
            (unsigned long long)data->failed_runs,
            (unsigned long long)data->trace_timeouts,
-           (unsigned long long)data->memerr_events);
+           (unsigned long long)data->memerr_events,
+           (unsigned long long)data->screened,
+           (unsigned long long)data->admitted,
+           (unsigned long long)data->vetoed,
+           (unsigned long long)(data->screening ? 0 : 1),
+           (unsigned long long)data->selfcheck_fail);
   return buf;
 }
