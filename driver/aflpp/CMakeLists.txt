@@ -15,7 +15,7 @@ if (NOT IS_DIRECTORY "${AFLPP_PATH}/include")
   message(FATAL_ERROR "Invalid AFL++ directory path! ${AFLPP_PATH}")
 endif()
 
-add_library(SymSanMutator SHARED symsan.cpp )
+add_library(SymSanMutator SHARED symsan.cpp pcbt.cpp )
 target_include_directories(SymSanMutator PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include
@@ -23,7 +23,6 @@ target_include_directories(SymSanMutator PRIVATE
 target_link_libraries(SymSanMutator
   launcher
   rgd-parser
-  rgd-solver
 )
 if (ASAN_BUILD)
   target_link_libraries(SymSanMutator

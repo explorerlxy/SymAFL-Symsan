@@ -1,44 +1,43 @@
 /*
-  a custom mutator for AFL++
-  (c) 2023 - 2024 by Chengyu Song <csong@cs.ucr.edu>
-  License: Apache 2.0
+  SymAFL v2 custom mutator for AFL++: PCBT-guided seed screening.
+
+  Based on the SymSan AFL++ driver
+  (c) 2023 - 2024 by Chengyu Song <csong@ucr.edu>, Apache 2.0.
+
+  v2 strips the solving chain (no TaskManager / Solver / custom mutations):
+  AFL++ does traditional fuzzing only. The mutator
+    (1) runs traced re-executions of queue entries (SymSan instrumented
+        binary, launched per entry) and inserts their symbolic branch-event
+        streams into a PCBT (path-constraint binary trie);
+    (2) screens mutated candidates against the PCBT in
+        afl_custom_post_process (Phase 2).
 */
 
 #include "dfsan/dfsan.h"
 
 #include "ast.h"
-#include "task.h"
-#include "solver.h"
-#include "cov.h"
-#include "task_mgr.h"
+#include "parse-rgd.h"
+
+#include "pcbt.hpp"
 
 extern "C" {
 #include "afl-fuzz.h"
 #include "launch.h"
 }
 
-#include "parse-rgd.h"
-
-#include <atomic>
-#include <unordered_map>
+#include <algorithm>
+#include <string>
 #include <unordered_set>
-#include <utility>
 #include <vector>
-#include <queue>
-#include <memory>
 
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-#include <sys/ipc.h>
 #include <sys/mman.h>
-#include <sys/select.h>
-#include <sys/shm.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <sys/wait.h>
 #include <fcntl.h>
 
 using namespace __dfsan;
@@ -52,20 +51,13 @@ using namespace __dfsan;
 #define DEBUGF(_str...) do { } while (0)
 #endif
 
-#define PRINT_STATS 0
-
 #define MAX_AST_SIZE 200
-
 #define MIN_TIMEOUT 50U
 
-#define MAX_LOCAL_BRANCH_COUNTER 128
-
-static bool NestedSolving = false;
 static int TraceBounds = 0;
-static int ExitOnMemError = 1; // default is exit on memory error
+static int ExitOnMemError = 1;  // default is exit on memory error
 static int SolveUB = 0;
 static int ForceStdin = 0;
-static bool SaveSolved = false;
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -77,32 +69,18 @@ static bool SaveSolved = false;
     _tmp; \
   })
 
-using solver_t = std::shared_ptr<rgd::Solver>;
-using branch_ctx_t = std::shared_ptr<rgd::BranchContext>;
-
-enum mutation_state_t {
-  MUTATION_INVALID,
-  MUTATION_IN_VALIDATION,
-  MUTATION_VALIDATED,
-};
-
 struct my_mutator_t {
   my_mutator_t() = delete;
-  my_mutator_t(const afl_state_t *afl, rgd::TaskManager* tmgr, rgd::CovManager* cmgr) :
-    afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
-    argv(NULL), out_fd(-1), cur_queue_entry(NULL),
-    cur_mutation_state(MUTATION_INVALID), output_buf(NULL),
-    cur_task(nullptr), cur_solver_index(-1),
-    task_mgr(tmgr), cov_mgr(cmgr) {}
+  explicit my_mutator_t(const afl_state_t *afl)
+      : afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
+        argv(NULL), out_fd(-1), parser(NULL) {}
 
   ~my_mutator_t() {
     if (out_fd >= 0) close(out_fd);
     ck_free(out_dir);
     ck_free(out_file);
-    ck_free(output_buf);
     ck_free(argv);
-    delete task_mgr;
-    delete cov_mgr;
+    delete parser;
   }
 
   const afl_state_t *afl;
@@ -111,138 +89,27 @@ struct my_mutator_t {
   char *symsan_bin;
   char **argv;
   int out_fd;
-  u8* cur_queue_entry;
-  int cur_mutation_state;
-  u8* output_buf;
-  int log_fd;
 
-  std::unordered_set<u32> fuzzed_inputs;
-  rgd::TaskManager* task_mgr;
-  rgd::CovManager* cov_mgr;
-  rgd::RGDAstParser* parser;
-  std::vector<solver_t> solvers;
+  rgd::RGDAstParser *parser;
+  pcbt::Tree tree;
+  std::unordered_set<std::string> traced_entries;
 
-  // XXX: well, we have to keep track of solving states
-  rgd::task_t cur_task;
-  size_t cur_solver_index;
+  // stats
+  uint64_t traced_runs = 0;
+  uint64_t failed_runs = 0;
+  uint64_t trace_timeouts = 0;
+  uint64_t memerr_events = 0;
 };
 
-// FIXME: find another way to make the union table hash work
+// shared union table (owned by the launcher)
 static dfsan_label_info *__dfsan_label_info;
 static const size_t MAX_LABEL = uniontable_size / sizeof(dfsan_label_info);
 
-dfsan_label_info* __dfsan::get_label_info(dfsan_label label) {
+dfsan_label_info *__dfsan::get_label_info(dfsan_label label) {
   if (unlikely(label >= MAX_LABEL)) {
     throw std::out_of_range("label too large " + std::to_string(label));
   }
   return &__dfsan_label_info[label];
-}
-
-// FIXME: local filter?
-static std::unordered_map<uint32_t, uint8_t> local_counter;
-static std::unordered_set<uint32_t> local_index_filter;
-// staticstics
-static uint64_t total_branches = 0;
-static uint64_t branches_to_solve = 0;
-static uint64_t total_tasks = 0;
-static std::map<uint64_t, uint64_t> task_size_dist;
-static uint64_t solved_tasks = 0;
-static uint64_t solved_branches = 0;
-
-static void reset_global_caches(size_t buf_size) {
-  local_counter.clear();
-  local_index_filter.clear();
-}
-
-static void handle_cond(pipe_msg &msg, my_mutator_t *my_mutator) {
-  if (unlikely(msg.label == 0)) {
-    return;
-  } else if (unlikely(msg.label == kInitializingLabel)) {
-    WARNF("UBI branch cond @%p\n", (void*)msg.addr);
-    return;
-  }
-
-  total_branches += 1;
-
-  // apply a local (per input) branch filter
-  auto &lc = local_counter[msg.id];
-  if (lc > MAX_LOCAL_BRANCH_COUNTER) {
-    return;
-  } else {
-    lc += 1;
-  }
-
-  // prase flags
-  bool always_solve = (msg.flags & F_ADD_CONS) == 0;
-  bool loop_latch = (msg.flags & F_LOOP_LATCH) != 0;
-  bool loop_exit = (msg.flags & F_LOOP_EXIT) != 0;
-
-  const branch_ctx_t ctx = my_mutator->cov_mgr->add_branch((void*)msg.addr,
-      msg.id, msg.result != 0, msg.context, loop_latch, loop_exit);
-
-  branch_ctx_t neg_ctx = std::make_shared<rgd::BranchContext>();
-  *neg_ctx = *ctx;
-  neg_ctx->direction = !ctx->direction;
-
-  if (my_mutator->cov_mgr->is_branch_interesting(neg_ctx) || always_solve) {
-    // parse the uniont table AST to solving tasks
-    std::vector<uint64_t> tasks;
-    if (my_mutator->parser->parse_cond(msg.label, ctx->direction, msg.flags & F_ADD_CONS, tasks) != 0) {
-      WARNF("Failed to parse the condition %u, from input %s\n", msg.label, my_mutator->cur_queue_entry);
-      // symsan_terminate();
-      return;
-    }
-
-    // add the tasks to the task manager
-    for (auto const& task_id : tasks) {
-      auto task = my_mutator->parser->retrieve_task(task_id);
-      my_mutator->task_mgr->add_task(neg_ctx, task);
-#if PRINT_STATS
-      task_size_dist[task->constraints.size()] += 1;
-#endif
-    }
-
-    total_tasks += tasks.size();
-    branches_to_solve += 1;
-  }
-}
-
-static void handle_gep(gep_msg &gmsg, pipe_msg &msg, my_mutator_t *my_mutator) {
-  // msg.label === gmsg.index_label
-  if (unlikely(msg.label == 0)) {
-    return;
-  } else if (unlikely(msg.label == kInitializingLabel)) {
-    WARNF("UBI array index @%p\n", (void*)msg.addr);
-    return;
-  }
-
-  // apply a local (per input) index filter
-  if (!local_index_filter.insert(msg.label).second) {
-    return;
-  }
-
-  // parse the uniont table AST to solving tasks
-  std::vector<uint64_t> tasks;
-  if (my_mutator->parser->parse_gep(gmsg.ptr_label, gmsg.ptr, gmsg.index_label, gmsg.index,
-        gmsg.num_elems, gmsg.elem_size, gmsg.current_offset, false, tasks) != 0) {
-    WARNF("Failed to parse symbolic index %u, from input %s\n", gmsg.index_label, my_mutator->cur_queue_entry);
-    // symsan_terminate();
-    return;
-  }
-
-  // add the tasks to the task manager, with a dummy context
-  branch_ctx_t ctx = std::make_shared<rgd::BranchContext>();
-  ctx->addr = (void*)msg.addr;
-  ctx->direction = true;
-  for (auto const& task_id : tasks) {
-    auto task = my_mutator->parser->retrieve_task(task_id);
-    my_mutator->task_mgr->add_task(ctx, task);
-#if PRINT_STATS
-    task_size_dist[task->constraints.size()] += 1;
-#endif
-  }
-
-  total_tasks += tasks.size();
 }
 
 /// no splice input
@@ -250,57 +117,34 @@ extern "C" void afl_custom_splice_optout(my_mutator_t *data) {
   (void)(data);
 }
 
-/// @brief init the custom mutator
-/// @param afl aflpp state
-/// @param seed not used
-/// @return custom mutator state
 extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
-
   (void)(seed);
 
   struct stat st;
-  rgd::TaskManager *tmgr = new rgd::FIFOTaskManager();
-  rgd::CovManager *cmgr = new rgd::EdgeCovManager();
-  my_mutator_t *data = new my_mutator_t(afl, tmgr, cmgr);
+  my_mutator_t *data = new my_mutator_t(afl);
   if (!data) {
     FATAL("afl_custom_init alloc");
     return NULL;
   }
-  // always use the simpler i2s solver
-  data->solvers.emplace_back(std::make_shared<rgd::I2SSolver>());
-  if (getenv("SYMSAN_USE_JIGSAW"))
-    data->solvers.emplace_back(std::make_shared<rgd::JITSolver>());
-  if (getenv("SYMSAN_USE_Z3"))
-    data->solvers.emplace_back(std::make_shared<rgd::Z3Solver>());
-  // make nested solving optional too
-  if (getenv("SYMSAN_USE_NESTED")) {
-    NestedSolving = true;
-  }
-  // enable trace bounds?
+
   if (getenv("SYMSAN_TRACE_BOUNDS")) {
     TraceBounds = 1;
   }
-  // disable exit on memory error
   if (getenv("SYMSAN_DONT_EXIT_ON_MEMERROR")) {
     ExitOnMemError = 0;
   }
   if (getenv("SYMSAN_SOLVE_UB")) {
-    TraceBounds = 1; // solve undefined depends on trace bounds
+    TraceBounds = 1;  // solve undefined depends on trace bounds
     SolveUB = 1;
   }
-  // XXX: force stdin? ugly hack for aixcc
   if (getenv("SYMSAN_FORCE_STDIN")) {
     ForceStdin = 1;
-  }
-  // enable saving solved tasks
-  if (getenv("SYMSAN_SAVE_SOLVED")) {
-    SaveSolved = true;
   }
 
   if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
     FATAL(
-        "SYMSAN_TARGET not defined, this should point to the full path of the "
-        "symsan compiled binary.");
+        "SYMSAN_TARGET not defined, this should point to the full path of "
+        "the symsan compiled binary.");
   }
 
   if (!(data->out_dir = getenv("SYMSAN_OUTPUT_DIR"))) {
@@ -311,7 +155,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     PFATAL("Could not create the output directory %s", data->out_dir);
   }
 
-  // setup output file
+  // setup output file (input for traced runs)
   char *out_file;
   if (afl->file_extension) {
     out_file = alloc_printf("%s/.cur_input.%s", data->out_dir, afl->file_extension);
@@ -327,188 +171,155 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     ck_free(out_file);
   }
 
-  // create the output file
   data->out_fd = open(data->out_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
   if (data->out_fd < 0) {
-    PFATAL("Failed to create output file %s: %s\n", data->out_file, strerror(errno));
+    PFATAL("Failed to create output file %s: %s\n", data->out_file,
+           strerror(errno));
   }
 
-  // setup symsan launcher
-  __dfsan_label_info = (dfsan_label_info *)symsan_init(data->symsan_bin, uniontable_size);
+  // setup symsan launcher (shared union table)
+  __dfsan_label_info = (dfsan_label_info *)symsan_init(data->symsan_bin,
+                                                       uniontable_size);
   if (__dfsan_label_info == (void *)-1) {
     FATAL("Failed to init symsan launcher: %s\n", strerror(errno));
   }
 
-  // setup the parser
-  data->parser = new rgd::RGDAstParser(__dfsan_label_info, uniontable_size, NestedSolving, MAX_AST_SIZE);
+  // setup the AST parser (predicate materialization only; no nested solving)
+  data->parser = new rgd::RGDAstParser(__dfsan_label_info, uniontable_size,
+                                       false, MAX_AST_SIZE);
   if (!data->parser) {
     FATAL("Failed to create parser\n");
   }
-
-  // allocate output buffer
-  data->output_buf = (u8 *)malloc(MAX_FILE+1);
-  if (!data->output_buf) {
-    FATAL("Failed to alloc output buffer\n");
-  }
-
-#if PRINT_STATS
-  char *log_f = getenv("SYMSAN_LOG_FILE");
-  if (log_f) {
-    data->log_fd = open(log_f, O_RDWR | O_CREAT | O_TRUNC, 0644);
-    if (data->log_fd < 0) {
-      PFATAL("Failed to create log file: %s\n", strerror(errno));
-    }
-  } else {
-    data->log_fd = 2; // stderr by default
-  }
-#endif
 
   return data;
 }
 
 extern "C" void afl_custom_deinit(my_mutator_t *data) {
+  const pcbt::Tree &t = data->tree;
+  fprintf(stderr,
+          "[pcbt] traces=%llu nodes=%llu depth=%llu conflicts=%llu "
+          "failed=%llu timeouts=%llu memerr=%llu\n",
+          (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
+          (unsigned long long)t.max_depth,
+          (unsigned long long)t.num_conflicts,
+          (unsigned long long)data->failed_runs,
+          (unsigned long long)data->trace_timeouts,
+          (unsigned long long)data->memerr_events);
   symsan_destroy();
   delete data;
 }
 
-/// @brief the trace stage for symsan
-/// @param data the custom mutator state
-/// @param buf input buffer
-/// @param buf_size
-/// @return the number of solving tasks
-extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
-                                     size_t buf_size) {
+// One-time launcher setup (deferred: afl->argv/fsrv are not ready at
+// init, and queue_new_entry already fires during pivot_inputs before the
+// target argv is parsed). Returns false while afl->argv is unavailable.
+static bool setup_launcher_once(my_mutator_t *data) {
+  if (likely(data->argv != NULL)) return true;
+  if (data->afl->argv == NULL) return false;
 
-  // check the input id to see if it's been run before
-  // we don't use the afl_custom_queue_new_entry() because we may not
-  // want to solve all the tasks
-  u32 input_id = data->afl->queue_cur->id;
-  u32 timeout = std::min(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
-  if (data->fuzzed_inputs.find(input_id) != data->fuzzed_inputs.end()) {
-    return 0;
+  int argc = 0;
+  while (data->afl->argv[argc]) { argc++; }
+  data->argv = (char **)calloc(argc + 1, sizeof(char *));
+  if (!data->argv) {
+    FATAL("Failed to alloc argv\n");
   }
-  data->fuzzed_inputs.insert(input_id);
+  for (int i = 0; i < argc; i++) {
+    if (strstr(data->afl->argv[i], (char *)data->afl->tmp_dir)) {
+      DEBUGF("Replacing %s with %s\n", data->afl->argv[i], data->out_file);
+      data->argv[i] = data->out_file;
+    } else {
+      data->argv[i] = data->afl->argv[i];
+    }
+  }
+  data->argv[argc] = NULL;
+  symsan_set_input(data->afl->fsrv.use_stdin ? "stdin" : data->out_file);
+  symsan_set_args(argc, data->argv);
+  symsan_set_debug(DEBUG);
+  symsan_set_bounds_check(TraceBounds);
+  symsan_set_exit_on_memerror(ExitOnMemError);
+  symsan_set_solve_ub(SolveUB);
+  symsan_set_force_stdin(ForceStdin);
+  return true;
+}
 
-  // record the name of the current queue entry
-  data->cur_queue_entry = data->afl->queue_cur->fname;
-  DEBUGF("Fuzzing %s\n", data->cur_queue_entry);
+/// Run one traced execution of `buf` and insert the branch-event stream
+/// into the PCBT.
+static void trace_and_insert(my_mutator_t *data, const u8 *buf,
+                             size_t buf_size) {
+  if (!setup_launcher_once(data)) return;
 
-  // FIXME: should we use the afl->queue_cur->fname instead?
-  // write the buf to the file
+  // write the input for the traced run
   lseek(data->out_fd, 0, SEEK_SET);
   ck_write(data->out_fd, buf, buf_size, data->out_file);
   fsync(data->out_fd);
   if (ftruncate(data->out_fd, buf_size)) {
     WARNF("Failed to truncate output file: %s\n", strerror(errno));
-    return 0;
+    data->failed_runs += 1;
+    return;
   }
 
-  // setup argv in case of initialized
-  if (unlikely(!data->argv)) {
-    int argc = 0;
-    while (data->afl->argv[argc]) { argc++; }
-    data->argv = (char **)calloc(argc + 1, sizeof(char *));
-    if (!data->argv) {
-      FATAL("Failed to alloc argv\n");
-    }
-    for (int i = 0; i < argc; i++) {
-      if (strstr(data->afl->argv[i], (char*)data->afl->tmp_dir)) {
-        DEBUGF("Replacing %s with %s\n", data->afl->argv[i], data->out_file);
-        data->argv[i] = data->out_file;
-      } else {
-        data->argv[i] = data->afl->argv[i];
-      }
-    }
-    data->argv[argc] = NULL;
-    // setup symsan launcher
-    symsan_set_input(data->afl->fsrv.use_stdin ? "stdin" : data->out_file);
-    symsan_set_args(argc, data->argv);
-    symsan_set_debug(DEBUG);
-    symsan_set_bounds_check(TraceBounds);
-    symsan_set_exit_on_memerror(ExitOnMemError);
-    symsan_set_solve_ub(SolveUB);
-    symsan_set_force_stdin(ForceStdin);
-  }
+  u32 timeout = std::min(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
 
-  // launch the symsan child process
   int ret = symsan_run(data->out_fd);
   if (ret < 0) {
     WARNF("Failed to start symsan bin: %s\n", strerror(errno));
-    return 0;
+    data->failed_runs += 1;
+    return;
   } else if (ret > 0) {
     WARNF("symsan_run failed %d\n", ret);
-    return 0;
+    data->failed_runs += 1;
+    return;
   }
+  data->traced_runs += 1;
+
+  // reset the per-run parser state (labels are per-run)
+  std::vector<symsan::input_t> inputs;
+  inputs.push_back({buf, buf_size});
+  data->parser->restart(inputs);
+
+  std::vector<pcbt::Event> events;
+  events.reserve(4096);
 
   pipe_msg msg;
   gep_msg gmsg;
   memcmp_msg *mmsg;
   dfsan_label_info *info;
   size_t msg_size;
-  u32 num_tasks = 0;
   u32 num_msgs = 0;
   bool timedout = false;
   struct timeval start, end;
   gettimeofday(&start, NULL);
 
-  // clear all caches
-  std::vector<symsan::input_t> inputs;
-  inputs.push_back({buf, buf_size});
-  data->parser->restart(inputs);
-  reset_global_caches(buf_size);
-
   while (symsan_read_event(&msg, sizeof(msg), timeout) == sizeof(msg)) {
-    // create solving tasks
     switch (msg.msg_type) {
-      // conditional branch
       case cond_type:
-        handle_cond(msg, data);
+        if (unlikely(msg.label == 0 || msg.label == kInitializingLabel)) {
+          break;  // concrete branch / uninitialized: not a tree node
+        }
+        events.push_back({msg.id, msg.label, (uint8_t)(msg.result != 0)});
         break;
       case gep_type:
+        // symbolic address: consume the trailer, not a tree node (v2)
         if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
           WARNF("Failed to receive gep msg: %s\n", strerror(errno));
-          break;
         }
-        // double check
-        if (msg.label != gmsg.index_label) {
-          WARNF("Incorrect gep msg: %d vs %d\n", msg.label, gmsg.index_label);
-          break;
-        }
-        handle_gep(gmsg, msg, data);
         break;
       case memcmp_type:
-        if (msg.label == 0 || msg.label >= MAX_LABEL) {
-          WARNF("Invalid memcmp label: %d\n", msg.label);
-          break;
-        }
+        if (msg.label == 0 || msg.label >= MAX_LABEL) break;
         info = get_label_info(msg.label);
-        // if both operands are symbolic, no content to be read
-        if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL)
-          break;
-        // flags = 0 means both operands are symbolic thus no content to read
-        // if (!msg.flags)
-        //  break;
+        if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) break;
         msg_size = sizeof(memcmp_msg) + msg.result;
-        mmsg = (memcmp_msg*)malloc(msg_size);
+        mmsg = (memcmp_msg *)malloc(msg_size);
         if (symsan_read_event(mmsg, msg_size, 0) != msg_size) {
           WARNF("Failed to receive memcmp msg: %s\n", strerror(errno));
           free(mmsg);
           break;
         }
-        // double check
-        if (msg.label != mmsg->label) {
-          WARNF("Incorrect memcmp msg: %d vs %d\n", msg.label, mmsg->label);
-          free(mmsg);
-          break;
-        }
-        // save the content
-        data->parser->record_memcmp(msg.label, mmsg->content, msg.result);
-        free(mmsg);
-        break;
-      case add_constraint_type:
+        free(mmsg);  // content not needed for the tree (v2)
         break;
       case memerr_type:
-        WARNF("Memory error detected @%p, type = %d\n", (void*)msg.addr, msg.flags);
+        data->memerr_events += 1;
+        WARNF("Memory error detected @%p, type = %d\n", (void *)msg.addr,
+              msg.flags);
         break;
       default:
         break;
@@ -518,7 +329,6 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
     if (unlikely((num_msgs & 0xffffe000) != 0)) {
       gettimeofday(&end, NULL);
       if ((end.tv_sec - start.tv_sec) * 10 > timeout) {
-        // allow 100x slowdown, sec * 1000 > ms * 100
         WARNF("Possible deadloop, break\n");
         timedout = true;
         break;
@@ -527,144 +337,65 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
   }
 
   if (timedout) {
-    // kill the symsan process
     symsan_terminate();
+    data->trace_timeouts += 1;
+    return;  // discard truncated traces (v1 replay-mismatch semantics)
   }
 
-  // reinit solving state
-  data->cur_task = nullptr;
-
-  size_t max_stages = data->solvers.size();
-  // to be conservative, we return the maximum number of possible mutations
-  return (u32)(data->task_mgr->get_num_tasks() * max_stages);
-
+  data->tree.InsertTrace(events, data->parser);
 }
 
-static void print_stats(my_mutator_t *data) {
-  dprintf(data->log_fd,
-    "Total branches: %zu,\n"\
-    "Total tasks: %zu,\n"\
-    "Solved tasks: %zu,\n"\
-    "Solved branches: %zu\n",
-    total_branches, total_tasks, solved_tasks, solved_branches);
-  dprintf(data->log_fd, "Task size distribution:\n");
-  for (auto const& kv : task_size_dist) {
-    dprintf(data->log_fd, "\t %zu: %zu\n", kv.first, kv.second);
+/// Read a queue file and trace+insert it (once per entry).
+static void trace_entry_file(my_mutator_t *data, const char *fname) {
+  if (data->traced_entries.count(fname)) return;  // already traced
+  if (data->afl->argv == NULL) return;  // launcher not ready (pivot_inputs)
+
+  data->traced_entries.insert(fname);
+  int fd = open(fname, O_RDONLY);
+  if (fd < 0) {
+    WARNF("Failed to open queue file %s: %s\n", fname, strerror(errno));
+    return;
   }
-  for (auto &solver : data->solvers) {
-    solver->print_stats(data->log_fd);
+  struct stat st;
+  if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > MAX_FILE) {
+    close(fd);
+    return;
   }
+  std::vector<u8> buf(st.st_size);
+  ssize_t got = read(fd, buf.data(), buf.size());
+  close(fd);
+  if (got != (ssize_t)buf.size()) return;
+
+  trace_and_insert(data, buf.data(), buf.size());
 }
 
-extern "C"
-size_t afl_custom_fuzz(my_mutator_t *data, uint8_t *buf, size_t buf_size,
-                       u8 **out_buf, uint8_t *add_buf, size_t add_buf_size,
-                       size_t max_size) {
-  (void)(add_buf);
-  (void)(add_buf_size);
-  (void)(max_size);
-  if (buf_size > MAX_FILE) {
-    *out_buf = buf;
-    return 0;
-  }
-
-  // try to get a task if we don't already have one
-  // or if we've find a valid solution from the previous mutation
-  if (!data->cur_task || data->cur_mutation_state == MUTATION_VALIDATED) {
-    data->cur_task = data->task_mgr->get_next_task();
-    if (!data->cur_task) {
-      DEBUGF("No more tasks to solve\n");
-      data->cur_mutation_state = MUTATION_INVALID;
-      *out_buf = buf;
-#if PRINT_STATS
-      print_stats(data);
-#endif
-      return 0;
-    }
-    // reset the solver and state
-    data->cur_solver_index = 0;
-    data->cur_mutation_state = MUTATION_INVALID;
-  }
-
-  // check the previous mutation state
-  if (data->cur_mutation_state == MUTATION_IN_VALIDATION) {
-    // oops, not solve, move on to next solver
-    data->cur_solver_index++;
-    if (data->cur_solver_index >= data->solvers.size()) {
-      // if reached the max solver, move on to the next task
-      data->cur_task = data->task_mgr->get_next_task();
-      if (!data->cur_task) {
-        DEBUGF("No more tasks to solve\n");
-        data->cur_mutation_state = MUTATION_INVALID;
-        *out_buf = buf;
-#if PRINT_STATS
-        print_stats(data);
-#endif
-        return 0;
-      }
-      data->cur_solver_index = 0; // reset solver index
-    }
-  }
-
-  // default return values
-  size_t new_buf_size = 0;
-  *out_buf = buf;
-  auto &solver = data->solvers[data->cur_solver_index];
-  auto ret = solver->solve(data->cur_task, buf, buf_size,
-      data->output_buf, new_buf_size);
-  if (likely(ret == rgd::SOLVER_SAT)) {
-    DEBUGF("task solved\n");
-    data->cur_mutation_state = MUTATION_IN_VALIDATION;
-    *out_buf = data->output_buf;
-    if (SaveSolved) {
-      // save the solved task
-      char *solved_file = alloc_printf("%s/id_%zu", data->out_dir, solved_tasks);
-      if (solved_file != NULL) {
-        int fd = open(solved_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
-        if (fd < 0) {
-          WARNF("Failed to create solved file %s: %s\n", solved_file, strerror(errno));
-        } else {
-          lseek(fd, 0, SEEK_SET);
-          ck_write(fd, data->output_buf, new_buf_size, solved_file);
-          close(fd);
-        }
-        free(solved_file);
-      }
-    }
-    solved_tasks += 1;
-  } else if (ret == rgd::SOLVER_TIMEOUT) {
-    // if not solved, move on to next stage
-    data->cur_mutation_state = MUTATION_IN_VALIDATION;
-  } else if (ret == rgd::SOLVER_UNSAT) {
-    // at any stage if the task is deemed unsolvable, just skip it
-    DEBUGF("task not solvable\n");
-    data->cur_task->skip_next = true;
-    data->cur_task = nullptr;
-  } else {
-    WARNF("Unknown solver return value %d\n", ret);
-    *out_buf = NULL;
-    new_buf_size = 0;
-  }
-
-  return new_buf_size;
+/// Bootstrap: trace each queue entry when it is first selected for fuzzing
+/// (covers the initial corpus, which never triggers queue_new_entry).
+extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
+  trace_entry_file(data, (const char *)filename);
+  return 1;  // always allow fuzzing the entry
 }
 
-
-// FIXME: use new queue entry as feedback to see if the last mutation is successful
-extern "C"
-uint8_t afl_custom_queue_new_entry(my_mutator_t * data,
-                                   const uint8_t *filename_new_queue,
-                                   const uint8_t *filename_orig_queue) {
-  // if we're in validation state and the current queue entry is the same as
-  // mark the constraints as solved
-  DEBUGF("new queue entry: %s\n", filename_new_queue);
-  if (data->cur_queue_entry == filename_orig_queue &&
-      data->cur_mutation_state == MUTATION_IN_VALIDATION) {
-    data->cur_mutation_state = MUTATION_VALIDATED;
-    if (data->cur_task) {
-      data->cur_task->skip_next = true;
-      solved_branches += 1;
-    }
-  }
+/// Trace every coverage-gaining entry (v1's "gaining replay" analogue).
+extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
+                                         const u8 *filename_new_queue,
+                                         const u8 *filename_orig_queue) {
+  (void)(filename_orig_queue);
+  trace_entry_file(data, (const char *)filename_new_queue);
   return 0;
+}
+
+extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
+  static char buf[512];
+  const pcbt::Tree &t = data->tree;
+  snprintf(buf, sizeof(buf),
+           "traces=%llu nodes=%llu depth=%llu conflicts=%llu "
+           "failed=%llu timeouts=%llu memerr=%llu",
+           (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
+           (unsigned long long)t.max_depth,
+           (unsigned long long)t.num_conflicts,
+           (unsigned long long)data->failed_runs,
+           (unsigned long long)data->trace_timeouts,
+           (unsigned long long)data->memerr_events);
+  return buf;
 }
