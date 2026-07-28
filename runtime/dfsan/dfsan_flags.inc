@@ -31,6 +31,11 @@ DFSAN_FLAG(const char *, dump_labels_at_exit, "", "The path of the file where "
                                                   "program terminates.")
 DFSAN_FLAG(const char *, taint_file, "", "The path of the file which "
                                          "will be tainted.")
+DFSAN_FLAG(size_t, taint_max_len, 0,
+           "SymAFL v2 (forkserver mode): pre-create input-byte labels up to "
+           "this many bytes, and tolerate the taint file not existing at "
+           "process init (afl-fuzz creates .cur_input per run). 0 = stock "
+           "behavior.")
 DFSAN_FLAG(const char *, taint_socket, "", "The network source which "
                                           "will be tainted.")
 DFSAN_FLAG(const char *, union_table, "union.txt", "union table.")

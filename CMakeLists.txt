@@ -40,6 +40,10 @@ message(STATUS "Z3_LIBRARY: ${Z3_LIBRARY}")
 message(STATUS "Z3_INCLUDE_DIR: ${Z3_INCLUDE_DIR}")
 message(STATUS "Z3_VERSION: ${Z3_VERSION}")
 
+# SymAFL v2: propagate Z3 headers to all targets (upstream relies on
+# z3 being installed in a system include path; we use third_party/z3)
+include_directories(SYSTEM ${Z3_INCLUDE_DIR})
+
 if (LLVM_FOUND)
     message(STATUS "LLVM_VERSION_MAJOR: ${LLVM_VERSION_MAJOR}")
     message(STATUS "LLVM_VERSION_MINOR: ${LLVM_VERSION_MINOR}")

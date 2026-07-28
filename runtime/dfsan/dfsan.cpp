@@ -1522,24 +1522,62 @@ static void InitializeTaintFile() {
     tainted.fd = -1;
   } else {
     if (!realpath(filename, tainted.filename)) {
-      Report("WARNING: failed to get to real path for taint file\n");
-      return;
+      if (flags().taint_max_len == 0) {
+        Report("WARNING: failed to get to real path for taint file\n");
+        return;
+      }
+      // SymAFL v2 (forkserver mode): afl-fuzz creates the input file
+      // (.cur_input) after the forkserver has started, so the file does not
+      // exist at process init. Canonicalize via the parent directory so
+      // open-time realpath matching (taint_set_file) still works, skip
+      // mapping the (not yet existing) content, and use taint_max_len as
+      // the tainted extent (interceptors gate on taint_get_file() != 0).
+      char dir[PATH_MAX];
+      internal_strncpy(dir, filename, sizeof(dir) - 1);
+      dir[sizeof(dir) - 1] = '\0';
+      char *slash = internal_strrchr(dir, '/');
+      const char *base = dir;
+      if (slash) {
+        base = slash + 1;
+        *slash = '\0';
+      } else {
+        internal_strncpy(dir, ".", sizeof(dir));
+      }
+      char rdir[PATH_MAX];
+      if (!realpath(dir, rdir)) {
+        Report("WARNING: failed to get to real path for taint file\n");
+        return;
+      }
+      internal_snprintf(tainted.filename, sizeof(tainted.filename),
+                        "%s/%s", rdir, base);
+      tainted.size = (off_t)flags().taint_max_len;
+      tainted.is_stdin = 0;
+      tainted.buf = nullptr;
+      tainted.buf_size = 0;
+      AOUT("v2 forkserver taint file: %s\n", tainted.filename);
+    } else {
+      stat(filename, &st);
+      tainted.size = st.st_size;
+      tainted.is_stdin = 0;
+      // map a copy
+      tainted.buf = static_cast<char *>(
+        MapFileToMemory(filename, &tainted.buf_size));
+      if (tainted.buf == nullptr) {
+        Printf("FATAL: failed to map a copy of input file\n");
+        Die();
+      }
+      AOUT("%s %ld size\n", filename, tainted.size);
     }
-    stat(filename, &st);
-    tainted.size = st.st_size;
-    tainted.is_stdin = 0;
-    // map a copy
-    tainted.buf = static_cast<char *>(
-      MapFileToMemory(filename, &tainted.buf_size));
-    if (tainted.buf == nullptr) {
-      Printf("FATAL: failed to map a copy of input file\n");
-      Die();
-    }
-    AOUT("%s %ld size\n", filename, tainted.size);
   }
 
   if (tainted.fd != -1 && !tainted.is_stdin) {
-    for (off_t i = 0; i < tainted.size; i++) {
+    // SymAFL v2: pre-create labels up to max(init-time size, taint_max_len)
+    // so per-run inputs larger than the init-time file still get valid
+    // labels (forkserver mode).
+    off_t prealloc = tainted.size;
+    if ((off_t)flags().taint_max_len > prealloc)
+      prealloc = (off_t)flags().taint_max_len;
+    for (off_t i = 0; i < prealloc; i++) {
       dfsan_label label = dfsan_create_label(0, i, 1);
       dfsan_check_label(label);
     }
