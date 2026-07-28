@@ -287,6 +287,14 @@ int symsan_run(int fd) {
     close(g_config.pipefds[0]); // close the read fd
     setenv("TAINT_OPTIONS", (char*)g_config.symsan_env, 1);
     unsetenv("LD_PRELOAD"); // don't preload anything
+    // SymAFL v2: when the launcher is used from inside afl-fuzz (custom
+    // mutator), the child would otherwise inherit AFL's forkserver context
+    // (__AFL_SHM_ID env + fds 198/199) and its afl-compiler-rt would start
+    // a rogue forkserver handshake, corrupting afl-fuzz's protocol and
+    // crashing the traced run. Strip the AFL context from traced children.
+    unsetenv("__AFL_SHM_ID");
+    close(198);
+    close(199);
     if (g_config.is_input_sdtin) {
       close(0);
       lseek(fd, 0, SEEK_SET);
@@ -339,7 +347,17 @@ ssize_t symsan_read_event(void *buf, size_t size, unsigned int timeout) {
 
   ssize_t n = -1;
   if (ret > 0) { // no timeout or select okay
-    n = read(g_config.pipefds[0], buf, size);
+    // SymAFL v2: read the FULL message. A single read() may return short
+    // when the writer is between two writes of a multi-part message
+    // (e.g. gep header + trailer) — retry instead of treating it as EOF,
+    // which used to desync the whole event stream.
+    size_t got = 0;
+    while (got < size) {
+      n = read(g_config.pipefds[0], (char *)buf + got, size - got);
+      if (n <= 0) break;  // EOF or error
+      got += (size_t)n;
+    }
+    n = (ssize_t)got;
   } else {
     // time out or error on select
     kill(g_config.symsan_pid, SIGKILL);

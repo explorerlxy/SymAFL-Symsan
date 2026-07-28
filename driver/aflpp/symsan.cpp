@@ -50,6 +50,10 @@ using namespace __dfsan;
 #endif
 
 #define MIN_TIMEOUT 50U
+// traced re-runs can be much slower than fuzz runs (full concolic
+// tracing); SYMAFL_TRACE_TIMEOUT_MS overrides the cap (0 = use
+// min(MIN_TIMEOUT, exec_tmout)).
+static uint32_t TraceTimeoutMs = 0;
 
 static int TraceBounds = 0;
 static int ExitOnMemError = 1;  // default is exit on memory error
@@ -198,6 +202,9 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   if (const char *rl = getenv("SYMAFL_RCNT_LIMIT")) {
     data->rlimit = (uint32_t)atoi(rl);
   }
+  if (const char *tto = getenv("SYMAFL_TRACE_TIMEOUT_MS")) {
+    TraceTimeoutMs = (uint32_t)atoi(tto);
+  }
 
   return data;
 }
@@ -259,7 +266,7 @@ static bool setup_launcher_once(my_mutator_t *data) {
 /// Run one traced execution of `buf` and insert the branch-event stream
 /// into the PCBT.
 static void trace_and_insert(my_mutator_t *data, const u8 *buf,
-                             size_t buf_size) {
+                             size_t buf_size, const char *fname) {
   if (!setup_launcher_once(data)) return;
 
   // write the input for the traced run
@@ -272,8 +279,13 @@ static void trace_and_insert(my_mutator_t *data, const u8 *buf,
     return;
   }
 
-  u32 timeout = std::min(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
+  u32 timeout = TraceTimeoutMs ? TraceTimeoutMs
+                               : std::min(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
 
+  struct timeval t0, t1, t2;
+  gettimeofday(&t0, NULL);
+  FILE *dump = getenv("SYMAFL_TRACE_DUMP")
+                   ? fopen(getenv("SYMAFL_TRACE_DUMP"), "a") : nullptr;
   int ret = symsan_run(data->out_fd);
   if (ret < 0) {
     WARNF("Failed to start symsan bin: %s\n", strerror(errno));
@@ -302,6 +314,11 @@ static void trace_and_insert(my_mutator_t *data, const u8 *buf,
   while (symsan_read_event(&msg, sizeof(msg), timeout) == sizeof(msg)) {
     switch (msg.msg_type) {
       case cond_type:
+        if (dump) {
+          fprintf(dump, "cond cid=%x label=%u r=%llu\n", msg.id, msg.label,
+                  (unsigned long long)msg.result);
+          fflush(dump);
+        }
         if (unlikely(msg.label == 0 || msg.label == kInitializingLabel)) {
           break;  // concrete branch / uninitialized: not a tree node
         }
@@ -352,7 +369,24 @@ static void trace_and_insert(my_mutator_t *data, const u8 *buf,
     return;  // discard truncated traces (v1 replay-mismatch semantics)
   }
 
-  data->tree.InsertTrace(events, __dfsan_label_info, MAX_LABEL);
+  if (dump) fclose(dump);
+  gettimeofday(&t1, NULL);
+  int xstatus = 0;
+  if (symsan_get_exit_status(&xstatus) == 0 &&
+      !(WIFEXITED(xstatus) && WEXITSTATUS(xstatus) <= 1)) {
+    data->failed_runs += 1;
+    WARNF("traced child abnormal exit: status=0x%x (events=%zu)\n", xstatus,
+          events.size());
+  }
+
+  uint32_t created = data->tree.InsertTrace(events, __dfsan_label_info, MAX_LABEL);
+  gettimeofday(&t2, NULL);
+  fprintf(stderr,
+          "[pcbt-trace] %s events=%zu created=%u read_ms=%ld insert_ms=%ld xstatus=%#x\n",
+          fname, events.size(), created,
+          (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000,
+          (t2.tv_sec - t1.tv_sec) * 1000 + (t2.tv_usec - t1.tv_usec) / 1000,
+          xstatus);
 
   // self-consistency check: the just-inserted input must be admitted by
   // CheckInput (its path now exists and ends at a fresh frontier). A veto
@@ -388,7 +422,7 @@ static void trace_entry_file(my_mutator_t *data, const char *fname) {
   close(fd);
   if (got != (ssize_t)buf.size()) return;
 
-  trace_and_insert(data, buf.data(), buf.size());
+  trace_and_insert(data, buf.data(), buf.size(), fname);
 }
 
 /// Bootstrap: trace each queue entry when it is first selected for fuzzing

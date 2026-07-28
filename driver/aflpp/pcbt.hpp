@@ -30,7 +30,7 @@ namespace pcbt {
 
 struct Node {
   uint32_t cid = 0;                     // compile-time branch id
-  PredicatePtr pred;                    // branch predicate (input-byte AST)
+  Predicate pred;                       // branch predicate (arena view)
   Node *child[2] = {nullptr, nullptr};  // child[d]: next decision after d
   uint32_t rCnt[2] = {0, 0};            // non-gaining admissions per direction
   uint32_t id = 0;                      // stable node id

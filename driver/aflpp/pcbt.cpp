@@ -28,18 +28,16 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     depth += 1;
   }
 
-  // Append the remaining events as a fresh chain.
+  // Append the remaining events as a fresh chain. All new predicates of
+  // this trace share one arena (maximal DAG reuse via label memoization).
+  RunConverter conv(table, table_labels);
   uint32_t created = 0;
   for (; i < events.size(); i++) {
     auto node = std::make_unique<Node>();
     node->cid = events[i].cid;
     node->id = next_id_++;
-    node->pred = predicate_from_label(table, table_labels, events[i].label);
-    if (!node->pred) {
-      node->pred = std::make_shared<Predicate>();
-      node->pred->opaque = true;  // unparsable: keep node, mark opaque
-    }
-    if (node->pred->opaque) num_opaque += 1;
+    node->pred = conv.conv(events[i].label);
+    if (node->pred.opaque) num_opaque += 1;
     Node *raw = node.get();
     arena_.push_back(std::move(node));
     parent->child[dir] = raw;
@@ -65,14 +63,14 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, Node **out_node,
 
   while (true) {
     uint8_t d;
-    if (!cur->pred || cur->pred->opaque) {
+    if (!cur->pred.arena || cur->pred.opaque) {
       // cannot evaluate this node: conservative admit (no bookkeeping)
       *out_node = nullptr;
       *out_dir = 0;
       return true;
     }
     uint64_t v = 0;
-    if (!eval_predicate(*cur->pred, input, len, &v)) {
+    if (!eval_predicate(cur->pred, input, len, &v)) {
       d = 0;  // undefined (read past input end): v1's conservative rule
     } else {
       d = v ? 1 : 0;
