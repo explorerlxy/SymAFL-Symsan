@@ -92,6 +92,7 @@ struct my_mutator_t {
 
   pcbt::Tree tree;
   std::unordered_set<std::string> traced_entries;
+  bool bootstrap_done = false;
 
   // screening state (post_process)
   bool screening = true;
@@ -414,21 +415,38 @@ static void trace_entry_file(my_mutator_t *data, const char *fname) {
   }
   struct stat st;
   if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > MAX_FILE) {
+    fprintf(stderr, "[pcbt-trace] SKIP %s (fstat/size: %ld)\n", fname,
+            st.st_size);
     close(fd);
     return;
   }
   std::vector<u8> buf(st.st_size);
   ssize_t got = read(fd, buf.data(), buf.size());
   close(fd);
-  if (got != (ssize_t)buf.size()) return;
+  if (got != (ssize_t)buf.size()) {
+    fprintf(stderr, "[pcbt-trace] SKIP %s (short read %zd/%zu)\n", fname, got,
+            buf.size());
+    return;
+  }
 
   trace_and_insert(data, buf.data(), buf.size(), fname);
 }
 
-/// Bootstrap: trace each queue entry when it is first selected for fuzzing
-/// (covers the initial corpus, which never triggers queue_new_entry).
+/// Bootstrap: AFL++ v4.31c uses weighted (alias-table) queue selection —
+/// slow but coverage-rich entries (exactly the ones that grow the tree)
+/// may never be selected, so queue-selection-driven tracing starves.
+/// Instead, on the first queue_get (argv is ready by then) we sweep the
+/// entire current queue (initial corpus + dry-run finds); entries arriving
+/// later are traced by queue_new_entry. Learning is thus coverage-driven,
+/// not selection-driven.
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
-  trace_entry_file(data, (const char *)filename);
+  (void)(filename);
+  if (!data->bootstrap_done && data->afl->argv != NULL) {
+    data->bootstrap_done = true;
+    for (u32 i = 0; i < data->afl->queued_items; i++) {
+      trace_entry_file(data, (const char *)data->afl->queue_buf[i]->fname);
+    }
+  }
   return 1;  // always allow fuzzing the entry
 }
 
