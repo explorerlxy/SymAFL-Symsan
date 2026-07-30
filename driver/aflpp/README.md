@@ -5,12 +5,12 @@ not the upstream SymSan task-generation/constraint-solving plugin: the v2
 fuzzing path does not spawn a launcher sidecar, generate solving tasks, or
 invoke Jigsaw or Z3.
 
-For project setup and the complete local verification commands, see the
-superproject [README](../../../README.md) and the documentation map under
-[`docs/README.md`](../../../docs/README.md). Canonical current behavior is in
-[`docs/system.md`](../../../docs/system.md),
-[`docs/protocol.md`](../../../docs/protocol.md), and
-[`docs/pcbt.md`](../../../docs/pcbt.md).
+For project setup, complete local verification commands, and experiment design,
+see the superproject [README](../../../README.md), the documentation map under
+[`docs/README.md`](../../../docs/README.md), and
+[`docs/evaluation.md`](../../../docs/evaluation.md). Canonical system behavior,
+runtime workflow, and PCBT semantics are in
+[`docs/system.md`](../../../docs/system.md).
 
 ## Current execution model
 
