@@ -8,9 +8,9 @@ invoke Jigsaw or Z3.
 For project setup and the complete local verification commands, see the
 superproject [README](../../../README.md) and the documentation map under
 [`docs/README.md`](../../../docs/README.md). Canonical current behavior is in
-[`docs/ARCHITECTURE.md`](../../../docs/ARCHITECTURE.md),
-[`docs/RUNTIME_PROTOCOL.md`](../../../docs/RUNTIME_PROTOCOL.md), and
-[`docs/PCBT.md`](../../../docs/PCBT.md).
+[`docs/system.md`](../../../docs/system.md),
+[`docs/protocol.md`](../../../docs/protocol.md), and
+[`docs/pcbt.md`](../../../docs/pcbt.md).
 
 ## Current execution model
 
