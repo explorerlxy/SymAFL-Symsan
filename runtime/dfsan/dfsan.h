@@ -51,17 +51,18 @@ struct dfsan_label_info {
   uint32_t hash;
 } __attribute__((aligned (8), packed));
 
-// Shared-memory protocol used by SymAFL's single-pass PCBT capture mode.
-// The custom mutator arms this control block before AFL executes a candidate;
-// the forkserver child appends only symbolic condition events after skip_depth.
-// AFL consumes it only after the child has exited, so the fixed-size event
-// array needs no locks on the consumer side.
+// Shared trace-control protocol used by SymAFL's PCBT concolic phase.
+// The custom mutator selects one transport for each forkserver child:
+// full pipe during bootstrap, bounded SHM for normal suffix capture, or a
+// suffix-only pipe replay after an SHM overflow. `skip_depth` is the number
+// of symbolic condition events already represented by the PCBT prefix.
 #define SYMAFL_SINGLE_PASS_MAGIC 0x53504331U  // "SPC1"
 #define SYMAFL_SINGLE_PASS_VERSION 2U
 
 #define SYMAFL_TRACE_OFF 0U
 #define SYMAFL_TRACE_FULL_STREAM 1U
 #define SYMAFL_TRACE_SUFFIX_SHM 2U
+#define SYMAFL_TRACE_SUFFIX_PIPE 3U
 
 struct symafl_single_pass_event {
   uint32_t cid;

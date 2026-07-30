@@ -68,8 +68,9 @@ void InitializeSinglePassCapture() {
 bool IsTraceStreamEnabled() {
   if (__pipe_fd < 0) return false;
   if (!__single_pass) return true;
-  return __atomic_load_n(&__single_pass->mode, __ATOMIC_ACQUIRE) ==
-         SYMAFL_TRACE_FULL_STREAM;
+  uint32_t mode = __atomic_load_n(&__single_pass->mode, __ATOMIC_ACQUIRE);
+  return mode == SYMAFL_TRACE_FULL_STREAM ||
+         mode == SYMAFL_TRACE_SUFFIX_PIPE;
 }
 
 //===----------------------------------------------------------------------===//
@@ -80,13 +81,15 @@ void __taint_send_cond(dfsan_label label, uint8_t result,
                        uint8_t add_nested, uint8_t loop_flag,
                        uint32_t cid, void *addr) {
 
-  // AFL's SymAFL extension selects one of three per-child modes through the
-  // shared control block. FULL_STREAM falls through to the regular pipe path;
-  // SUFFIX_SHM writes only the post-frontier symbolic suffix to shared memory.
+  // AFL's SymAFL extension selects one of four per-child modes through the
+  // shared control block. FULL_STREAM writes bootstrap events to the pipe;
+  // SUFFIX_SHM writes the normal post-frontier suffix to bounded shared memory;
+  // SUFFIX_PIPE is the overflow-replay fallback and writes that suffix to pipe.
   // Standalone launcher/direct tracing has no single-pass control block.
   // Preserve its established pipe semantics: a configured pipe is a full
   // event stream. The control block is only present for forkserver runs,
-  // where the mutator explicitly selects OFF, FULL_STREAM, or SUFFIX_SHM.
+  // where the mutator explicitly selects OFF, FULL_STREAM, SUFFIX_SHM, or
+  // SUFFIX_PIPE.
   uint32_t trace_mode = __single_pass
       ? __atomic_load_n(&__single_pass->mode, __ATOMIC_ACQUIRE)
       : (__pipe_fd >= 0 ? SYMAFL_TRACE_FULL_STREAM : SYMAFL_TRACE_OFF);
@@ -94,6 +97,10 @@ void __taint_send_cond(dfsan_label label, uint8_t result,
       __atomic_load_n(&__single_pass->armed, __ATOMIC_ACQUIRE)) {
     if (label == 0 || label == kInitializingLabel) return;
     if (++__taint_symbolic_depth <= __single_pass->skip_depth) return;
+    // Once the bounded suffix buffer has overflowed, this child must not
+    // touch the event array again. The mutator will discard the partial
+    // suffix and replay this coverage-gaining input through pipe-suffix.
+    if (__atomic_load_n(&__single_pass->overflow, __ATOMIC_ACQUIRE)) return;
     uint32_t index = __atomic_fetch_add(&__single_pass->event_count, 1,
                                         __ATOMIC_RELAXED);
     if (index >= __single_pass->event_capacity) {
@@ -104,18 +111,25 @@ void __taint_send_cond(dfsan_label label, uint8_t result,
     return;
   }
 
-  if (trace_mode != SYMAFL_TRACE_FULL_STREAM) return;
+  if (trace_mode != SYMAFL_TRACE_FULL_STREAM &&
+      trace_mode != SYMAFL_TRACE_SUFFIX_PIPE) {
+    return;
+  }
 
   if (__pipe_fd < 0) return;
 
-  // Suffix tracing keeps the concolic execution and AST construction intact;
-  // it only removes already-known PCBT prefix events from the pipe. Match the
-  // mutator's tree-event definition exactly: concrete and initializing labels
-  // never count toward symbolic depth.
-  if (flags().trace_skip_depth >= 0) {
+  // Pipe suffix replay keeps concolic execution and AST construction intact;
+  // it only suppresses already-known PCBT prefix condition events. The
+  // forkserver cannot reparse TAINT_OPTIONS for every child, so use the shared
+  // skip depth in that case. The flag remains for standalone launcher tracing.
+  int skip_depth = flags().trace_skip_depth;
+  if (trace_mode == SYMAFL_TRACE_SUFFIX_PIPE) {
+    skip_depth = static_cast<int>(__single_pass->skip_depth);
+  }
+  if (skip_depth >= 0) {
     if (label == 0 || label == kInitializingLabel) return;
     if (++__taint_symbolic_depth <=
-        static_cast<uint64_t>(flags().trace_skip_depth)) {
+        static_cast<uint64_t>(skip_depth)) {
       return;
     }
   }

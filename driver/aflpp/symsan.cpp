@@ -48,7 +48,9 @@ using namespace __dfsan;
 #define DEBUGF(_str...) do { } while (0)
 #endif
 
-enum class TraceMode { Full, Suffix, SinglePass };
+// Bootstrap always uses pipe-full so every initial path enters the tree.
+// Steady state uses bounded SHM suffix capture. Pipe suffix is reserved for a
+// confirmed coverage-gaining input whose SHM capture overflowed.
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -94,7 +96,6 @@ struct my_mutator_t {
   // screening state (post_process)
   bool screening = true;
   uint32_t rlimit = 16;
-  TraceMode trace_mode = TraceMode::Full;
   pcbt::Node *last_node = nullptr;
   uint8_t last_dir = 0;
   bool last_gained = true;
@@ -249,13 +250,9 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   data->afl->pcbt_concrete_target = ck_strdup((u8 *)concrete);
 
   if (const char *mode = getenv("SYMAFL_TRACE_MODE")) {
-    if (!strcmp(mode, "suffix")) {
-      data->trace_mode = TraceMode::Suffix;
-    } else if (!strcmp(mode, "single-pass")) {
-      data->trace_mode = TraceMode::SinglePass;
-    } else if (strcmp(mode, "full")) {
-      WARNF("Unknown SYMAFL_TRACE_MODE=%s; using full\n", mode);
-    }
+    WARNF("SYMAFL_TRACE_MODE=%s is ignored: PCBT transport is selected "
+          "by lifecycle (bootstrap=pipe-full, steady=shm-suffix, "
+          "overflow+gain=pipe-suffix)\n", mode);
   }
   init_forkserver_capture(data);
 
@@ -323,6 +320,21 @@ static void arm_suffix_capture(my_mutator_t *data, pcbt::Node *node,
   data->single_pass_armed = true;
 }
 
+static void arm_pipe_suffix_capture(my_mutator_t *data, pcbt::Node *node,
+                                    uint8_t dir) {
+  symafl_single_pass_control *control = data->single_pass_control;
+  __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
+  control->skip_depth = node->depth;
+  __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_PIPE,
+                   __ATOMIC_RELEASE);
+  __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
+  data->last_node = node;
+  data->last_dir = dir;
+  data->single_pass_armed = true;
+}
+
 static bool decode_full_stream(const u8 *wire, size_t wire_size,
                                std::vector<pcbt::Event> *events) {
   size_t offset = 0;
@@ -362,15 +374,24 @@ static void selfcheck(my_mutator_t *data, const u8 *buf, size_t buf_size) {
   }
 }
 
+static bool decode_pipe_events(my_mutator_t *data,
+                               std::vector<pcbt::Event> *events,
+                               const char *fname) {
+  afl_forkserver_t *fsrv = &data->afl->fsrv;
+  if (decode_full_stream(fsrv->sym_trace_buf, fsrv->sym_trace_len, events)) {
+    return true;
+  }
+  WARNF("invalid pipe trace for %s (%zu bytes)\n", fname,
+        fsrv->sym_trace_len);
+  data->failed_runs += 1;
+  return false;
+}
+
 static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
                                size_t buf_size, const char *fname) {
   std::vector<pcbt::Event> events;
   events.reserve(4096);
-  afl_forkserver_t *fsrv = &data->afl->fsrv;
-  if (!decode_full_stream(fsrv->sym_trace_buf, fsrv->sym_trace_len, &events)) {
-    WARNF("invalid full-stream trace for %s (%zu bytes)\n", fname,
-          fsrv->sym_trace_len);
-    data->failed_runs += 1;
+  if (!decode_pipe_events(data, &events, fname)) {
     disarm_capture(data);
     return false;
   }
@@ -383,6 +404,25 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   // A run without any symbolic conditions cannot be represented by the
   // decision tree, so it has no meaningful PCBT self-check.
   if (!events.empty()) selfcheck(data, buf, buf_size);
+  return true;
+}
+
+static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
+                                       size_t buf_size, const char *fname) {
+  if (!data->single_pass_armed || !data->last_node) return false;
+  std::vector<pcbt::Event> events;
+  events.reserve(4096);
+  if (!decode_pipe_events(data, &events, fname)) {
+    disarm_capture(data);
+    return false;
+  }
+  uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
+      events, __dfsan_label_info, MAX_LABEL);
+  fprintf(stderr,
+          "[pcbt-trace] %s mode=pipe-suffix skip=%u events=%zu created=%u\n",
+          fname, data->last_node->depth, events.size(), created);
+  disarm_capture(data);
+  selfcheck(data, buf, buf_size);
   return true;
 }
 
@@ -421,19 +461,21 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
   return true;
 }
 
-static bool replay_full_stream(my_mutator_t *data, const u8 *buf,
-                               size_t buf_size, const char *fname) {
-  arm_full_capture(data);
+static bool replay_pipe_suffix(my_mutator_t *data, const u8 *buf,
+                               size_t buf_size, const char *fname,
+                               pcbt::Node *node, uint8_t dir) {
+  arm_pipe_suffix_capture(data, node, dir);
   afl_fsrv_write_to_testcase(&data->afl->fsrv, const_cast<u8 *>(buf), buf_size);
   fsrv_run_result_t result = afl_fsrv_run_target(&data->afl->fsrv,
       data->afl->fsrv.exec_tmout, &data->afl->stop_soon);
   if (result != FSRV_RUN_OK) {
-    WARNF("forkserver full replay failed for %s (%u)\n", fname, result);
+    WARNF("forkserver pipe-suffix replay failed for %s (%u)\n", fname,
+          result);
     data->failed_runs += 1;
     disarm_capture(data);
     return false;
   }
-  return insert_full_stream(data, buf, buf_size, fname);
+  return insert_pipe_suffix_capture(data, buf, buf_size, fname);
 }
 
 static bool read_queue_file(const char *fname, std::vector<u8> *buf) {
@@ -481,12 +523,18 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   }
   uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
                                   __ATOMIC_ACQUIRE);
+  pcbt::Node *node = data->last_node;
+  uint8_t dir = data->last_dir;
   bool inserted = mode == SYMAFL_TRACE_SUFFIX_SHM
       ? insert_suffix_capture(data, buf.data(), buf.size(), fname)
-      : mode == SYMAFL_TRACE_FULL_STREAM
-            ? insert_full_stream(data, buf.data(), buf.size(), fname)
-            : false;
-  if (!inserted) (void)replay_full_stream(data, buf.data(), buf.size(), fname);
+      : mode == SYMAFL_TRACE_SUFFIX_PIPE
+            ? insert_pipe_suffix_capture(data, buf.data(), buf.size(), fname)
+            : mode == SYMAFL_TRACE_FULL_STREAM
+                  ? insert_full_stream(data, buf.data(), buf.size(), fname)
+                  : false;
+  if (!inserted && node) {
+    (void)replay_pipe_suffix(data, buf.data(), buf.size(), fname, node, dir);
+  }
   data->last_gained = true;
   data->traced_entries.insert(fname);
   return 0;
@@ -519,10 +567,11 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     data->admitted += 1;
     data->vetoes_since_admit = 0;
     data->last_gained = false;
-    // Before queue selection begins, there is no established PCBT frontier
-    // for the dry-run corpus. Capture those executions as full traces even
-    // when the steady-state mode is single-pass.
-    if (!data->bootstrap_done || data->trace_mode == TraceMode::Full || !node) {
+    // Dry-run corpus paths must all enter the tree, so bootstrap is always
+    // pipe-full. Thereafter a candidate has an established frontier and uses
+    // SHM. The pipe is reserved for data that is known to be consumed: the
+    // bootstrap trace or an overflow replay after AFL++ confirms a gain.
+    if (!data->bootstrap_done || !node) {
       data->last_node = node;
       data->last_dir = dir;
       arm_full_capture(data);

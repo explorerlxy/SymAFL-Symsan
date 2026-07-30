@@ -78,6 +78,12 @@ uint32_t RunConverter::convert(uint32_t label, size_t depth) {
 uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
                                   uint32_t op_lo, size_t depth) {
   uint16_t size = info->size;
+  // The local evaluator intentionally supports one machine word. Wider
+  // bit-vectors must be conservatively admitted instead of being truncated.
+  if (size == 0 || size > 64) {
+    overflow_ = true;
+    return 0;
+  }
   PKind kind;
   bool unary = false, binary = false;
 
@@ -239,7 +245,9 @@ bool eval_predicate(const Predicate &pred, const uint8_t *input, uint32_t len,
         if (sb == 0) {
           v = mask_bits(sa < 0 ? 1 : (uint64_t)-1, bits);
         } else if (sb == -1) {
-          v = mask_bits((uint64_t)-sa, bits);
+          // Unsigned subtraction preserves the SMT bit-vector result even
+          // for INT_MIN / -1, where signed negation would be undefined.
+          v = mask_bits(0 - a, bits);
         } else {
           v = mask_bits((uint64_t)(sa / sb), bits);
         }
