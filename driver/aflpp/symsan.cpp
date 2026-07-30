@@ -6,9 +6,9 @@
 
   v2 strips the solving chain (no TaskManager / Solver / custom mutations):
   AFL++ does traditional fuzzing only. The mutator
-    (1) runs traced re-executions of queue entries (SymSan instrumented
-        binary, launched per entry) and inserts their symbolic branch-event
-        streams into a PCBT (path-constraint binary trie);
+    (1) arms the SymSan forkserver target to capture symbolic branch-event
+        streams for admitted candidates, then inserts coverage-gaining paths
+        into a PCBT (path-constraint binary trie);
     (2) screens mutated candidates against the PCBT in
         afl_custom_post_process (Phase 2).
 */
@@ -19,7 +19,6 @@
 
 extern "C" {
 #include "afl-fuzz.h"
-#include "launch.h"
 }
 
 #include <algorithm>
@@ -49,16 +48,7 @@ using namespace __dfsan;
 #define DEBUGF(_str...) do { } while (0)
 #endif
 
-#define MIN_TIMEOUT 50U
-// traced re-runs can be much slower than fuzz runs (full concolic
-// tracing); SYMAFL_TRACE_TIMEOUT_MS overrides the cap (0 = use
-// min(MIN_TIMEOUT, exec_tmout)).
-static uint32_t TraceTimeoutMs = 0;
-
-static int TraceBounds = 0;
-static int ExitOnMemError = 1;  // default is exit on memory error
-static int SolveUB = 0;
-static int ForceStdin = 0;
+enum class TraceMode { Full, Suffix, SinglePass };
 
 #undef alloc_printf
 #define alloc_printf(_str...) ({ \
@@ -72,23 +62,30 @@ static int ForceStdin = 0;
 
 struct my_mutator_t {
   my_mutator_t() = delete;
-  explicit my_mutator_t(const afl_state_t *afl)
-      : afl(afl), out_dir(NULL), out_file(NULL), symsan_bin(NULL),
-        argv(NULL), out_fd(-1) {}
+  explicit my_mutator_t(afl_state_t *afl) : afl(afl) {}
 
   ~my_mutator_t() {
-    if (out_fd >= 0) close(out_fd);
-    ck_free(out_dir);
-    ck_free(out_file);
-    ck_free(argv);
+    if (single_pass_control) {
+      munmap(single_pass_control, single_pass_size);
+    }
+    if (single_pass_label_info) {
+      munmap(single_pass_label_info, uniontable_size);
+    }
+    if (single_pass_trace_fd >= 0) close(single_pass_trace_fd);
+    if (single_pass_union_fd >= 0) close(single_pass_union_fd);
+    if (single_pass_trace_name) {
+      shm_unlink(single_pass_trace_name);
+      ck_free(single_pass_trace_name);
+    }
+    if (single_pass_union_name) {
+      shm_unlink(single_pass_union_name);
+      ck_free(single_pass_union_name);
+    }
+    if (full_stream_read_fd >= 0) close(full_stream_read_fd);
+    if (full_stream_write_fd >= 0) close(full_stream_write_fd);
   }
 
-  const afl_state_t *afl;
-  char *out_dir;
-  char *out_file;
-  char *symsan_bin;
-  char **argv;
-  int out_fd;
+  afl_state_t *afl;
 
   pcbt::Tree tree;
   std::unordered_set<std::string> traced_entries;
@@ -97,9 +94,23 @@ struct my_mutator_t {
   // screening state (post_process)
   bool screening = true;
   uint32_t rlimit = 16;
+  TraceMode trace_mode = TraceMode::Full;
   pcbt::Node *last_node = nullptr;
   uint8_t last_dir = 0;
   bool last_gained = true;
+
+  // Single-pass capture state. The target forkserver maps both regions once;
+  // each admitted candidate arms the small control block for its own child.
+  char *single_pass_union_name = nullptr;
+  char *single_pass_trace_name = nullptr;
+  int single_pass_union_fd = -1;
+  int single_pass_trace_fd = -1;
+  dfsan_label_info *single_pass_label_info = nullptr;
+  symafl_single_pass_control *single_pass_control = nullptr;
+  size_t single_pass_size = 0;
+  bool single_pass_armed = false;
+  int full_stream_read_fd = -1;
+  int full_stream_write_fd = -1;
 
   // stats
   uint64_t traced_runs = 0;
@@ -112,9 +123,11 @@ struct my_mutator_t {
   uint64_t vetoes_since_admit = 0;
   bool saturation_logged = false;
   uint64_t selfcheck_fail = 0;  // inserted input vetoed by its own tree
+  uint64_t single_pass_captures = 0;
+  uint64_t single_pass_overflows = 0;
 };
 
-// shared union table (owned by the launcher)
+// Shared union table owned by the target forkserver.
 static dfsan_label_info *__dfsan_label_info;
 static const size_t MAX_LABEL = uniontable_size / sizeof(dfsan_label_info);
 
@@ -125,6 +138,87 @@ dfsan_label_info *__dfsan::get_label_info(dfsan_label label) {
   return &__dfsan_label_info[label];
 }
 
+static void init_forkserver_capture(my_mutator_t *data) {
+  uint32_t capacity = 1U << 20;
+  if (const char *value = getenv("SYMAFL_SINGLE_PASS_CAPACITY")) {
+    char *end = nullptr;
+    unsigned long long parsed = strtoull(value, &end, 10);
+    if (end == value || *end != '\0' || parsed == 0 ||
+        parsed > UINT32_MAX) {
+      FATAL("Invalid SYMAFL_SINGLE_PASS_CAPACITY=%s", value);
+    }
+    capacity = (uint32_t)parsed;
+  }
+
+  data->single_pass_size = symafl_single_pass_size(capacity);
+  data->single_pass_union_name =
+      alloc_printf("/symafl-single-pass-union-%d", getpid());
+  data->single_pass_trace_name =
+      alloc_printf("/symafl-single-pass-events-%d", getpid());
+  data->single_pass_union_fd = shm_open(data->single_pass_union_name,
+      O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+  if (data->single_pass_union_fd < 0 ||
+      ftruncate(data->single_pass_union_fd, uniontable_size)) {
+    PFATAL("Failed to create single-pass union table");
+  }
+  data->single_pass_label_info = (dfsan_label_info *)mmap(
+      nullptr, uniontable_size, PROT_READ, MAP_SHARED,
+      data->single_pass_union_fd, 0);
+  if (data->single_pass_label_info == MAP_FAILED) {
+    data->single_pass_label_info = nullptr;
+    PFATAL("Failed to map single-pass union table");
+  }
+
+  data->single_pass_trace_fd = shm_open(data->single_pass_trace_name,
+      O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
+  if (data->single_pass_trace_fd < 0 ||
+      ftruncate(data->single_pass_trace_fd, data->single_pass_size)) {
+    PFATAL("Failed to create single-pass event buffer");
+  }
+  data->single_pass_control = (symafl_single_pass_control *)mmap(
+      nullptr, data->single_pass_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+      data->single_pass_trace_fd, 0);
+  if (data->single_pass_control == MAP_FAILED) {
+    data->single_pass_control = nullptr;
+    PFATAL("Failed to map single-pass event buffer");
+  }
+  memset(data->single_pass_control, 0, data->single_pass_size);
+  data->single_pass_control->magic = SYMAFL_SINGLE_PASS_MAGIC;
+  data->single_pass_control->version = SYMAFL_SINGLE_PASS_VERSION;
+  data->single_pass_control->event_capacity = capacity;
+
+  int pipefd[2];
+  if (pipe(pipefd)) PFATAL("Failed to create forkserver full-trace pipe");
+  data->full_stream_read_fd = pipefd[0];
+  data->full_stream_write_fd = pipefd[1];
+  int flags = fcntl(data->full_stream_read_fd, F_GETFL);
+  if (flags < 0 || fcntl(data->full_stream_read_fd, F_SETFL,
+                         flags | O_NONBLOCK)) {
+    PFATAL("Failed to configure forkserver full-trace pipe");
+  }
+  data->afl->fsrv.sym_trace_fd = data->full_stream_read_fd;
+
+  const char *old_options = getenv("TAINT_OPTIONS");
+  char *pipe_option = alloc_printf(":pipe_fd=%d", data->full_stream_write_fd);
+  char *options = alloc_printf(
+      "%s%sshm_name=%s:shm_size=%zu:single_pass_name=%s:single_pass_size=%zu"
+      "%s",
+      old_options ? old_options : "", old_options && *old_options ? ":" : "",
+      data->single_pass_union_name, uniontable_size,
+      data->single_pass_trace_name, data->single_pass_size,
+      pipe_option ? pipe_option : "");
+  if (setenv("TAINT_OPTIONS", options, 1)) {
+    if (pipe_option) ck_free(pipe_option);
+    ck_free(options);
+    PFATAL("Failed to configure single-pass TAINT_OPTIONS");
+  }
+  if (pipe_option) ck_free(pipe_option);
+  ck_free(options);
+  __dfsan_label_info = data->single_pass_label_info;
+  fprintf(stderr, "[pcbt] forkserver trace control enabled (capacity=%u)\n",
+          capacity);
+}
+
 /// no splice input
 extern "C" void afl_custom_splice_optout(my_mutator_t *data) {
   (void)(data);
@@ -133,69 +227,37 @@ extern "C" void afl_custom_splice_optout(my_mutator_t *data) {
 extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   (void)(seed);
 
-  struct stat st;
   my_mutator_t *data = new my_mutator_t(afl);
   if (!data) {
     FATAL("afl_custom_init alloc");
     return NULL;
   }
 
-  if (getenv("SYMSAN_TRACE_BOUNDS")) {
-    TraceBounds = 1;
+  // PCBT has two distinct execution phases. The initial target must be the
+  // concolic binary; after the tree is exhausted AFL++ restarts its
+  // forkserver with the concrete binary and rebuilds coverage from the queue.
+  const char *concolic = getenv("SYMAFL_CONCOLIC_TARGET");
+  const char *concrete = getenv("SYMAFL_CONCRETE_TARGET");
+  if (!concolic || !*concolic || !concrete || !*concrete) {
+    FATAL("PCBT mode requires SYMAFL_CONCOLIC_TARGET and "
+          "SYMAFL_CONCRETE_TARGET");
   }
-  if (getenv("SYMSAN_DONT_EXIT_ON_MEMERROR")) {
-    ExitOnMemError = 0;
+  if (access(concolic, X_OK) || access(concrete, X_OK)) {
+    PFATAL("PCBT target is not executable");
   }
-  if (getenv("SYMSAN_SOLVE_UB")) {
-    TraceBounds = 1;  // solve undefined depends on trace bounds
-    SolveUB = 1;
-  }
-  if (getenv("SYMSAN_FORCE_STDIN")) {
-    ForceStdin = 1;
-  }
+  data->afl->pcbt_mode = 1;
+  data->afl->pcbt_concrete_target = ck_strdup((u8 *)concrete);
 
-  if (!(data->symsan_bin = getenv("SYMSAN_TARGET"))) {
-    FATAL(
-        "SYMSAN_TARGET not defined, this should point to the full path of "
-        "the symsan compiled binary.");
+  if (const char *mode = getenv("SYMAFL_TRACE_MODE")) {
+    if (!strcmp(mode, "suffix")) {
+      data->trace_mode = TraceMode::Suffix;
+    } else if (!strcmp(mode, "single-pass")) {
+      data->trace_mode = TraceMode::SinglePass;
+    } else if (strcmp(mode, "full")) {
+      WARNF("Unknown SYMAFL_TRACE_MODE=%s; using full\n", mode);
+    }
   }
-
-  if (!(data->out_dir = getenv("SYMSAN_OUTPUT_DIR"))) {
-    data->out_dir = alloc_printf("%s/symsan", afl->out_dir);
-  }
-
-  if (stat(data->out_dir, &st) && mkdir(data->out_dir, 0755)) {
-    PFATAL("Could not create the output directory %s", data->out_dir);
-  }
-
-  // setup output file (input for traced runs)
-  char *out_file;
-  if (afl->file_extension) {
-    out_file = alloc_printf("%s/.cur_input.%s", data->out_dir, afl->file_extension);
-  } else {
-    out_file = alloc_printf("%s/.cur_input", data->out_dir);
-  }
-  if (data->out_dir[0] == '/') {
-    data->out_file = out_file;
-  } else {
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, (size_t)sizeof(cwd)) == NULL) { PFATAL("getcwd() failed"); }
-    data->out_file = alloc_printf("%s/%s", cwd, out_file);
-    ck_free(out_file);
-  }
-
-  data->out_fd = open(data->out_file, O_RDWR | O_CREAT | O_TRUNC, 0644);
-  if (data->out_fd < 0) {
-    PFATAL("Failed to create output file %s: %s\n", data->out_file,
-           strerror(errno));
-  }
-
-  // setup symsan launcher (shared union table)
-  __dfsan_label_info = (dfsan_label_info *)symsan_init(data->symsan_bin,
-                                                       uniontable_size);
-  if (__dfsan_label_info == (void *)-1) {
-    FATAL("Failed to init symsan launcher: %s\n", strerror(errno));
-  }
+  init_forkserver_capture(data);
 
   if (getenv("SYMAFL_NO_SCREEN")) {
     data->screening = false;
@@ -203,10 +265,6 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   if (const char *rl = getenv("SYMAFL_RCNT_LIMIT")) {
     data->rlimit = (uint32_t)atoi(rl);
   }
-  if (const char *tto = getenv("SYMAFL_TRACE_TIMEOUT_MS")) {
-    TraceTimeoutMs = (uint32_t)atoi(tto);
-  }
-
   return data;
 }
 
@@ -216,7 +274,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "[pcbt] traces=%llu nodes=%llu depth=%llu conflicts=%llu "
           "failed=%llu timeouts=%llu memerr=%llu screened=%llu "
           "admitted=%llu vetoed=%llu saturated=%llu "
-          "selfcheck_fail=%llu\n",
+          "selfcheck_fail=%llu single_pass=%llu single_pass_overflow=%llu\n",
           (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
           (unsigned long long)t.max_depth,
           (unsigned long long)t.num_conflicts,
@@ -227,236 +285,210 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->admitted,
           (unsigned long long)data->vetoed,
           (unsigned long long)(data->screening ? 0 : 1),
-          (unsigned long long)data->selfcheck_fail);
-  symsan_destroy();
+          (unsigned long long)data->selfcheck_fail,
+          (unsigned long long)data->single_pass_captures,
+          (unsigned long long)data->single_pass_overflows);
   delete data;
 }
 
-// One-time launcher setup (deferred: afl->argv/fsrv are not ready at
-// init, and queue_new_entry already fires during pivot_inputs before the
-// target argv is parsed). Returns false while afl->argv is unavailable.
-static bool setup_launcher_once(my_mutator_t *data) {
-  if (likely(data->argv != NULL)) return true;
-  if (data->afl->argv == NULL) return false;
 
-  int argc = 0;
-  while (data->afl->argv[argc]) { argc++; }
-  data->argv = (char **)calloc(argc + 1, sizeof(char *));
-  if (!data->argv) {
-    FATAL("Failed to alloc argv\n");
-  }
-  for (int i = 0; i < argc; i++) {
-    if (strstr(data->afl->argv[i], (char *)data->afl->tmp_dir)) {
-      DEBUGF("Replacing %s with %s\n", data->afl->argv[i], data->out_file);
-      data->argv[i] = data->out_file;
-    } else {
-      data->argv[i] = data->afl->argv[i];
+static void disarm_capture(my_mutator_t *data) {
+  symafl_single_pass_control *control = data->single_pass_control;
+  __atomic_store_n(&control->armed, 0, __ATOMIC_RELEASE);
+  __atomic_store_n(&control->mode, SYMAFL_TRACE_OFF, __ATOMIC_RELEASE);
+  data->single_pass_armed = false;
+}
+
+static void arm_full_capture(my_mutator_t *data) {
+  symafl_single_pass_control *control = data->single_pass_control;
+  __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&control->mode, SYMAFL_TRACE_FULL_STREAM, __ATOMIC_RELEASE);
+  __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
+  data->single_pass_armed = true;
+}
+
+static void arm_suffix_capture(my_mutator_t *data, pcbt::Node *node,
+                               uint8_t dir) {
+  symafl_single_pass_control *control = data->single_pass_control;
+  __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
+  control->skip_depth = node->depth;
+  __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_SHM, __ATOMIC_RELEASE);
+  __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
+  data->last_node = node;
+  data->last_dir = dir;
+  data->single_pass_armed = true;
+}
+
+static bool decode_full_stream(const u8 *wire, size_t wire_size,
+                               std::vector<pcbt::Event> *events) {
+  size_t offset = 0;
+  while (offset < wire_size) {
+    if (wire_size - offset < sizeof(pipe_msg)) return false;
+    pipe_msg msg;
+    memcpy(&msg, wire + offset, sizeof(msg));
+    offset += sizeof(msg);
+    if (msg.msg_type == cond_type) {
+      if (msg.label != 0 && msg.label != kInitializingLabel) {
+        if (msg.label >= MAX_LABEL) return false;
+        events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0)});
+      }
+      continue;
     }
+    size_t trailer = 0;
+    if (msg.msg_type == gep_type) {
+      trailer = sizeof(gep_msg);
+    } else if (msg.msg_type == memcmp_type && msg.flags) {
+      trailer = sizeof(memcmp_msg) + (size_t)msg.result;
+    } else if (msg.msg_type == gv_type) {
+      trailer = (size_t)msg.result;
+    }
+    if (trailer > wire_size - offset) return false;
+    offset += trailer;
   }
-  data->argv[argc] = NULL;
-  symsan_set_input(data->afl->fsrv.use_stdin ? "stdin" : data->out_file);
-  symsan_set_args(argc, data->argv);
-  symsan_set_debug(DEBUG);
-  symsan_set_bounds_check(TraceBounds);
-  symsan_set_exit_on_memerror(ExitOnMemError);
-  symsan_set_solve_ub(SolveUB);
-  symsan_set_force_stdin(ForceStdin);
   return true;
 }
 
-/// Run one traced execution of `buf` and insert the branch-event stream
-/// into the PCBT.
-static void trace_and_insert(my_mutator_t *data, const u8 *buf,
-                             size_t buf_size, const char *fname) {
-  if (!setup_launcher_once(data)) return;
-
-  // write the input for the traced run
-  lseek(data->out_fd, 0, SEEK_SET);
-  ck_write(data->out_fd, buf, buf_size, data->out_file);
-  fsync(data->out_fd);
-  if (ftruncate(data->out_fd, buf_size)) {
-    WARNF("Failed to truncate output file: %s\n", strerror(errno));
-    data->failed_runs += 1;
-    return;
+static void selfcheck(my_mutator_t *data, const u8 *buf, size_t buf_size) {
+  if (!buf || !buf_size) return;
+  pcbt::Node *node = nullptr;
+  uint8_t dir = 0;
+  if (data->tree.CheckInput(buf, (uint32_t)buf_size, &node, &dir,
+                            data->rlimit)) {
+    data->selfcheck_fail += 1;
   }
+}
 
-  u32 timeout = TraceTimeoutMs ? TraceTimeoutMs
-                               : std::min(MIN_TIMEOUT, data->afl->fsrv.exec_tmout);
-
-  struct timeval t0, t1, t2;
-  gettimeofday(&t0, NULL);
-  FILE *dump = getenv("SYMAFL_TRACE_DUMP")
-                   ? fopen(getenv("SYMAFL_TRACE_DUMP"), "a") : nullptr;
-  int ret = symsan_run(data->out_fd);
-  if (ret < 0) {
-    WARNF("Failed to start symsan bin: %s\n", strerror(errno));
-    data->failed_runs += 1;
-    return;
-  } else if (ret > 0) {
-    WARNF("symsan_run failed %d\n", ret);
-    data->failed_runs += 1;
-    return;
-  }
-  data->traced_runs += 1;
-
+static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
+                               size_t buf_size, const char *fname) {
   std::vector<pcbt::Event> events;
   events.reserve(4096);
-
-  pipe_msg msg;
-  gep_msg gmsg;
-  memcmp_msg *mmsg;
-  dfsan_label_info *info;
-  size_t msg_size;
-  u32 num_msgs = 0;
-  bool timedout = false;
-  struct timeval start, end;
-  gettimeofday(&start, NULL);
-
-  while (symsan_read_event(&msg, sizeof(msg), timeout) == sizeof(msg)) {
-    switch (msg.msg_type) {
-      case cond_type:
-        if (dump) {
-          fprintf(dump, "cond cid=%x label=%u r=%llu\n", msg.id, msg.label,
-                  (unsigned long long)msg.result);
-          fflush(dump);
-        }
-        if (unlikely(msg.label == 0 || msg.label == kInitializingLabel)) {
-          break;  // concrete branch / uninitialized: not a tree node
-        }
-        events.push_back({msg.id, msg.label, (uint8_t)(msg.result != 0)});
-        break;
-      case gep_type:
-        // symbolic address: consume the trailer, not a tree node (v2)
-        if (symsan_read_event(&gmsg, sizeof(gmsg), 0) != sizeof(gmsg)) {
-          WARNF("Failed to receive gep msg: %s\n", strerror(errno));
-        }
-        break;
-      case memcmp_type:
-        if (msg.label == 0 || msg.label >= MAX_LABEL) break;
-        info = get_label_info(msg.label);
-        if (info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) break;
-        msg_size = sizeof(memcmp_msg) + msg.result;
-        mmsg = (memcmp_msg *)malloc(msg_size);
-        if (symsan_read_event(mmsg, msg_size, 0) != msg_size) {
-          WARNF("Failed to receive memcmp msg: %s\n", strerror(errno));
-          free(mmsg);
-          break;
-        }
-        free(mmsg);  // content not needed for the tree (v2)
-        break;
-      case memerr_type:
-        data->memerr_events += 1;
-        WARNF("Memory error detected @%p, type = %d\n", (void *)msg.addr,
-              msg.flags);
-        break;
-      default:
-        break;
-    }
-    // naive deadloop detection
-    num_msgs += 1;
-    if (unlikely((num_msgs & 0xffffe000) != 0)) {
-      gettimeofday(&end, NULL);
-      if ((end.tv_sec - start.tv_sec) * 10 > timeout) {
-        WARNF("Possible deadloop, break\n");
-        timedout = true;
-        break;
-      }
-    }
-  }
-
-  if (timedout) {
-    symsan_terminate();
-    data->trace_timeouts += 1;
-    return;  // discard truncated traces (v1 replay-mismatch semantics)
-  }
-
-  if (dump) fclose(dump);
-  gettimeofday(&t1, NULL);
-  int xstatus = 0;
-  if (symsan_get_exit_status(&xstatus) == 0 &&
-      !(WIFEXITED(xstatus) && WEXITSTATUS(xstatus) <= 1)) {
+  afl_forkserver_t *fsrv = &data->afl->fsrv;
+  if (!decode_full_stream(fsrv->sym_trace_buf, fsrv->sym_trace_len, &events)) {
+    WARNF("invalid full-stream trace for %s (%zu bytes)\n", fname,
+          fsrv->sym_trace_len);
     data->failed_runs += 1;
-    WARNF("traced child abnormal exit: status=0x%x (events=%zu)\n", xstatus,
-          events.size());
+    disarm_capture(data);
+    return false;
   }
+  uint32_t created = data->tree.InsertTrace(events, __dfsan_label_info,
+                                            MAX_LABEL);
+  data->traced_runs += 1;
+  fprintf(stderr, "[pcbt-trace] %s mode=full events=%zu created=%u\n",
+          fname, events.size(), created);
+  disarm_capture(data);
+  // A run without any symbolic conditions cannot be represented by the
+  // decision tree, so it has no meaningful PCBT self-check.
+  if (!events.empty()) selfcheck(data, buf, buf_size);
+  return true;
+}
 
-  uint32_t created = data->tree.InsertTrace(events, __dfsan_label_info, MAX_LABEL);
-  gettimeofday(&t2, NULL);
+static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
+                                  size_t buf_size, const char *fname) {
+  if (!data->single_pass_armed || !data->last_node) return false;
+  symafl_single_pass_control *control = data->single_pass_control;
+  uint32_t count = __atomic_load_n(&control->event_count, __ATOMIC_ACQUIRE);
+  bool overflow = __atomic_load_n(&control->overflow, __ATOMIC_ACQUIRE) ||
+                  count > control->event_capacity;
+  if (overflow) {
+    data->single_pass_overflows += 1;
+    WARNF("suffix capture overflow for %s; replaying through forkserver\n", fname);
+    disarm_capture(data);
+    return false;
+  }
+  std::vector<pcbt::Event> events;
+  events.reserve(count);
+  for (uint32_t i = 0; i < count; ++i) {
+    const symafl_single_pass_event &event = control->events[i];
+    if (event.label == 0 || event.label == kInitializingLabel ||
+        event.label >= MAX_LABEL) {
+      disarm_capture(data);
+      return false;
+    }
+    events.push_back({event.cid, event.label, event.result});
+  }
+  uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
+      events, data->single_pass_label_info, MAX_LABEL);
+  data->single_pass_captures += 1;
   fprintf(stderr,
-          "[pcbt-trace] %s events=%zu created=%u read_ms=%ld insert_ms=%ld xstatus=%#x\n",
-          fname, events.size(), created,
-          (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_usec - t0.tv_usec) / 1000,
-          (t2.tv_sec - t1.tv_sec) * 1000 + (t2.tv_usec - t1.tv_usec) / 1000,
-          xstatus);
-
-  // self-consistency check: the just-inserted input must be admitted by
-  // CheckInput (its path now exists and ends at a fresh frontier). A veto
-  // here means converter/evaluator semantics diverge from execution.
-  {
-    pcbt::Node *node = nullptr;
-    uint8_t dir = 0;
-    if (!data->tree.CheckInput(buf, (uint32_t)buf_size, &node, &dir,
-                               data->rlimit)) {
-      data->selfcheck_fail += 1;
-    }
-  }
+          "[pcbt-trace] %s mode=suffix skip=%u events=%zu created=%u\n",
+          fname, data->last_node->depth, events.size(), created);
+  disarm_capture(data);
+  selfcheck(data, buf, buf_size);
+  return true;
 }
 
-/// Read a queue file and trace+insert it (once per entry).
-static void trace_entry_file(my_mutator_t *data, const char *fname) {
-  if (data->traced_entries.count(fname)) return;  // already traced
-  if (data->afl->argv == NULL) return;  // launcher not ready (pivot_inputs)
+static bool replay_full_stream(my_mutator_t *data, const u8 *buf,
+                               size_t buf_size, const char *fname) {
+  arm_full_capture(data);
+  afl_fsrv_write_to_testcase(&data->afl->fsrv, const_cast<u8 *>(buf), buf_size);
+  fsrv_run_result_t result = afl_fsrv_run_target(&data->afl->fsrv,
+      data->afl->fsrv.exec_tmout, &data->afl->stop_soon);
+  if (result != FSRV_RUN_OK) {
+    WARNF("forkserver full replay failed for %s (%u)\n", fname, result);
+    data->failed_runs += 1;
+    disarm_capture(data);
+    return false;
+  }
+  return insert_full_stream(data, buf, buf_size, fname);
+}
 
-  data->traced_entries.insert(fname);
+static bool read_queue_file(const char *fname, std::vector<u8> *buf) {
   int fd = open(fname, O_RDONLY);
-  if (fd < 0) {
-    WARNF("Failed to open queue file %s: %s\n", fname, strerror(errno));
-    return;
-  }
   struct stat st;
-  if (fstat(fd, &st) || st.st_size <= 0 || st.st_size > MAX_FILE) {
-    fprintf(stderr, "[pcbt-trace] SKIP %s (fstat/size: %ld)\n", fname,
-            st.st_size);
-    close(fd);
-    return;
+  if (fd < 0 || fstat(fd, &st) || st.st_size <= 0 || st.st_size > MAX_FILE) {
+    if (fd >= 0) close(fd);
+    return false;
   }
-  std::vector<u8> buf(st.st_size);
-  ssize_t got = read(fd, buf.data(), buf.size());
+  buf->resize(st.st_size);
+  ssize_t got = read(fd, buf->data(), buf->size());
   close(fd);
-  if (got != (ssize_t)buf.size()) {
-    fprintf(stderr, "[pcbt-trace] SKIP %s (short read %zd/%zu)\n", fname, got,
-            buf.size());
-    return;
-  }
-
-  trace_and_insert(data, buf.data(), buf.size(), fname);
+  return got == (ssize_t)buf->size();
 }
 
-/// Bootstrap: AFL++ v4.31c uses weighted (alias-table) queue selection —
-/// slow but coverage-rich entries (exactly the ones that grow the tree)
-/// may never be selected, so queue-selection-driven tracing starves.
-/// Instead, on the first queue_get (argv is ready by then) we sweep the
-/// entire current queue (initial corpus + dry-run finds); entries arriving
-/// later are traced by queue_new_entry. Learning is thus coverage-driven,
-/// not selection-driven.
+extern "C" void afl_custom_post_run(my_mutator_t *data) {
+  if (data->bootstrap_done || !data->single_pass_armed) return;
+  uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
+                                  __ATOMIC_ACQUIRE);
+  if (mode == SYMAFL_TRACE_SUFFIX_SHM && data->last_node) {
+    (void)insert_suffix_capture(data, nullptr, 0, "bootstrap");
+  } else if (mode == SYMAFL_TRACE_FULL_STREAM) {
+    (void)insert_full_stream(data, nullptr, 0, "bootstrap");
+  }
+  data->last_node = nullptr;
+}
+
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
-  (void)(filename);
-  if (!data->bootstrap_done && data->afl->argv != NULL) {
-    data->bootstrap_done = true;
-    for (u32 i = 0; i < data->afl->queued_items; i++) {
-      trace_entry_file(data, (const char *)data->afl->queue_buf[i]->fname);
-    }
-  }
-  return 1;  // always allow fuzzing the entry
+  (void)filename;
+  data->bootstrap_done = true;
+  return 1;
 }
 
-/// Trace every coverage-gaining entry (v1's "gaining replay" analogue).
 extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                                          const u8 *filename_new_queue,
                                          const u8 *filename_orig_queue) {
-  (void)(filename_orig_queue);
-  data->last_gained = true;  // the last admitted candidate gained coverage
-  trace_entry_file(data, (const char *)filename_new_queue);
+  (void)filename_orig_queue;
+  if (!data->bootstrap_done || !data->single_pass_armed) return 0;
+  const char *fname = (const char *)filename_new_queue;
+  std::vector<u8> buf;
+  if (!read_queue_file(fname, &buf)) {
+    WARNF("cannot read coverage-gaining queue entry %s\n", fname);
+    disarm_capture(data);
+    return 0;
+  }
+  uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
+                                  __ATOMIC_ACQUIRE);
+  bool inserted = mode == SYMAFL_TRACE_SUFFIX_SHM
+      ? insert_suffix_capture(data, buf.data(), buf.size(), fname)
+      : mode == SYMAFL_TRACE_FULL_STREAM
+            ? insert_full_stream(data, buf.data(), buf.size(), fname)
+            : false;
+  if (!inserted) (void)replay_full_stream(data, buf.data(), buf.size(), fname);
+  data->last_gained = true;
+  data->traced_entries.insert(fname);
   return 0;
 }
 
@@ -468,6 +500,9 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   // rCnt bookkeeping for the previously admitted candidate
   if (data->last_node) {
     if (!data->last_gained) data->last_node->rCnt[data->last_dir] += 1;
+    if (data->single_pass_armed) {
+      disarm_capture(data);
+    }
     data->last_node = nullptr;
   }
 
@@ -483,25 +518,33 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                             data->rlimit)) {
     data->admitted += 1;
     data->vetoes_since_admit = 0;
-    if (node) {
+    data->last_gained = false;
+    // Before queue selection begins, there is no established PCBT frontier
+    // for the dry-run corpus. Capture those executions as full traces even
+    // when the steady-state mode is single-pass.
+    if (!data->bootstrap_done || data->trace_mode == TraceMode::Full || !node) {
       data->last_node = node;
       data->last_dir = dir;
-      data->last_gained = false;
+      arm_full_capture(data);
+    } else {
+      arm_suffix_capture(data, node, dir);
     }
     *out_buf = buf;
     return buf_size;
   }
 
   data->vetoed += 1;
-  // saturation watchdog: if the whole reachable frontier is rCnt-pruned,
-  // every candidate is vetoed and the fuzzer would stall. After 1M
-  // consecutive vetoes fall back to passthrough (plain AFL) and log it.
-  if (++data->vetoes_since_admit >= 1000000 && data->screening) {
+  ++data->vetoes_since_admit;
+  // A saturated PCBT is a phase boundary, not a local screening fallback.
+  // Let AFL++ perform the restart at its next scheduler boundary, where it
+  // can safely replace the forkserver and rebuild its coverage state.
+  if (data->tree.IsSaturated(data->rlimit)) {
     data->screening = false;
+    data->afl->pcbt_switch_pending = 1;
     if (!data->saturation_logged) {
       data->saturation_logged = true;
       fprintf(stderr,
-              "[pcbt] frontier saturated after %llu vetoes, screening off\n",
+              "[pcbt] tree saturated after %llu vetoes; switching to concrete\n",
               (unsigned long long)data->vetoed);
     }
   }
@@ -516,7 +559,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "traces=%llu nodes=%llu depth=%llu conflicts=%llu "
            "failed=%llu timeouts=%llu memerr=%llu "
            "screened=%llu admitted=%llu vetoed=%llu saturated=%llu "
-           "selfcheck_fail=%llu",
+           "selfcheck_fail=%llu single_pass=%llu single_pass_overflow=%llu",
            (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
            (unsigned long long)t.max_depth,
            (unsigned long long)t.num_conflicts,
@@ -527,6 +570,8 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)data->admitted,
            (unsigned long long)data->vetoed,
            (unsigned long long)(data->screening ? 0 : 1),
-           (unsigned long long)data->selfcheck_fail);
+           (unsigned long long)data->selfcheck_fail,
+           (unsigned long long)data->single_pass_captures,
+           (unsigned long long)data->single_pass_overflows);
   return buf;
 }

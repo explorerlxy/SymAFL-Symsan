@@ -20,7 +20,7 @@
 
 static inline void __send_ubi(dfsan_label label, uint64_t result,
                               uint32_t cid, void *addr) {
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   pipe_msg msg = {
@@ -211,7 +211,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
   AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",
       index, index_label, num_elems, elem_size, current_offset);
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   // send gep info, in two pieces
@@ -258,7 +258,7 @@ __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
   AOUT("tainted offset: %ld = %d, size: %u @%p\n",
        offset, offset_label, size, addr);
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   pipe_msg msg = {
@@ -287,7 +287,7 @@ __taint_add_constraint(dfsan_label label, uint8_t result) {
 
   AOUT("tainted add_constraint: %d, result: %u @%p\n", label, result, addr);
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   pipe_msg msg = {
@@ -324,7 +324,7 @@ __taint_minimize_label(dfsan_label label, u64 size, dfsan_label bounds) {
     }
   }
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   pipe_msg msg = {
@@ -371,7 +371,7 @@ __taint_trace_memcmp(dfsan_label label) {
 
   AOUT("tainted memcmp: %d, size: %d\n", label, info->size);
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   uint16_t has_content = 1;
@@ -418,7 +418,7 @@ __taint_trace_memerr(dfsan_label ptr_label, uptr ptr, dfsan_label size_label,
   if (ptr_label == 0 && size_label == 0)
     return;
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   uint64_t r = 0;
@@ -450,4 +450,5 @@ extern "C" void InitializeSymSanSolver() {
   __session_id = flags().session_id;
   __pipe_fd = flags().pipe_fd;
   __control_pipe_fd = flags().control_pipe_fd;
+  InitializeSinglePassCapture();
 }

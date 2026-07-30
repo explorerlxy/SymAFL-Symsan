@@ -168,7 +168,7 @@ __taint_trace_loop(uint32_t bid, int depth) {
   }
 
   // send loop info
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   pipe_msg msg = {
@@ -194,7 +194,7 @@ __taint_trace_event_addr(dfsan_label label, uint32_t event_id, uint64_t info,
                          void* addr, uint32_t info2) {
   AOUT("event: %u %u %llu @%p\n", label, event_id, info, addr);
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   pipe_msg msg = {
@@ -219,7 +219,7 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_bb(uint32_t function_index, uint32_t bb_index) {
   AOUT("bb: %u %llu\n", function_index, bb_index);
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
     pipe_msg msg = {
@@ -240,7 +240,7 @@ extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_global_var(uint32_t obj_id, uint64_t offset, uint64_t size, void *gv) {
   AOUT("global var: obj_id=%u, offset=%lu, size: %lu @%p\n", obj_id, offset, size, gv);
 
-  if (__pipe_fd < 0)
+  if (!IsTraceStreamEnabled())
     return;
 
   pipe_msg msg = {
@@ -308,6 +308,8 @@ void RegisterSegFault () {
 }
 
 extern "C" void InitializeUCSanSolver() {
+
+  InitializeSinglePassCapture();
 
   RegisterSegFault();
 

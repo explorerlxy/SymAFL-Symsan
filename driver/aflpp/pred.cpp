@@ -166,8 +166,9 @@ Predicate RunConverter::conv(uint32_t label) {
   pred.root = convert(label, 0);
   pred.opaque = overflow_;
 
-  // compute the subtree evaluation order (ascending arena indices; children
-  // always precede parents) + the input-read set
+  // compute the input-read set (DFS over the subtree; no per-predicate
+  // order vector is stored — evaluation walks the arena prefix [0, root],
+  // which is valid post-order by label topology and costs the same)
   if (!pred.opaque) {
     std::unordered_set<uint32_t> seen;
     std::vector<uint32_t> stack = {pred.root};
@@ -176,16 +177,10 @@ Predicate RunConverter::conv(uint32_t label) {
       stack.pop_back();
       if (!seen.insert(i).second) continue;
       const PNode &nd = arena_->nodes[i];
-      if (nd.a != kNoChild) stack.push_back(nd.a);
-      if (nd.b != kNoChild) stack.push_back(nd.b);
-    }
-    pred.order.assign(seen.begin(), seen.end());
-    std::sort(pred.order.begin(), pred.order.end());
-    pred.reads.reserve(8);
-    for (uint32_t i : pred.order) {
-      const PNode &nd = arena_->nodes[i];
       if (nd.kind == PKind::Read)
         pred.reads.emplace_back((uint32_t)nd.value, nd.aux);
+      if (nd.a != kNoChild) stack.push_back(nd.a);
+      if (nd.b != kNoChild) stack.push_back(nd.b);
     }
     std::sort(pred.reads.begin(), pred.reads.end());
     pred.reads.erase(std::unique(pred.reads.begin(), pred.reads.end()),
@@ -209,13 +204,15 @@ bool eval_predicate(const Predicate &pred, const uint8_t *input, uint32_t len,
                     uint64_t *out) {
   if (pred.opaque || !pred.arena) return false;
   const auto &nodes = pred.arena->nodes;
-  const std::vector<uint32_t> &order = pred.order;
-  if (order.empty()) return false;
+  if (pred.root >= nodes.size()) return false;
 
   static thread_local std::vector<uint64_t> vals;
   if (vals.size() < nodes.size()) vals.resize(nodes.size());
 
-  for (uint32_t i : order) {
+  // arena prefix [0, root] is a valid post-order for the subtree
+  // (labels are topologically allocated: children always have smaller
+  // arena indices than their parents)
+  for (uint32_t i = 0; i <= pred.root; i++) {
     const PNode &nd = nodes[i];
     uint64_t a = nd.a != kNoChild ? vals[nd.a] : 0;
     uint64_t b = nd.b != kNoChild ? vals[nd.b] : 0;

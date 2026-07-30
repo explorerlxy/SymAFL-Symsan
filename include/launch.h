@@ -45,6 +45,10 @@ int symsan_set_trace_file_size(int enable);
 /// @brief set the force stdin mode for the target binary
 int symsan_set_force_stdin(int enable);
 
+/// @brief suppress pipe condition events through this symbolic depth.
+/// Pass -1 for a complete trace, or k to emit the suffix beginning at k + 1.
+int symsan_set_trace_skip_depth(int depth);
+
 /// @brief run the target binary with the input file descriptor
 /// @param fd: input file descriptor, only used if input is "stdin"
 /// @return < 0 on syscall error, > 0 on setup error, 0 on success

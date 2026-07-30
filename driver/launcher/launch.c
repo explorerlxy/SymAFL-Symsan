@@ -50,6 +50,7 @@ struct symsan_config {
   int exit_on_memerror;
   int trace_file_size;
   int force_stdin;
+  int trace_skip_depth;
 
   int dev_null_fd;
 
@@ -86,6 +87,7 @@ void* symsan_init(const char *symsan_bin, const size_t uniontable_size) {
   g_config.exit_on_memerror = 1;
   g_config.trace_file_size = 0;
   g_config.force_stdin = 0;
+  g_config.trace_skip_depth = -1;
   g_config.dev_null_fd = -1;
   g_config.exit_status = 0;
   g_config.is_killed = 0;
@@ -219,6 +221,12 @@ int symsan_set_force_stdin(int enable) {
 }
 
 __attribute__((visibility("default")))
+int symsan_set_trace_skip_depth(int depth) {
+  g_config.trace_skip_depth = depth;
+  return 0;
+}
+
+__attribute__((visibility("default")))
 int symsan_run(int fd) {
   if (fd < 0) {
     return SYMSAN_INVALID_ARGS;
@@ -259,11 +267,13 @@ int symsan_run(int fd) {
   // fds and configs could have been changed, so always set up new ones
   g_config.symsan_env = alloc_printf(
       "taint_file=\"%s\":shm_fd=%d:pipe_fd=%d:debug=%d:trace_bounds=%d:"
-      "solve_ub=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d",
+      "solve_ub=%d:exit_on_memerror=%d:trace_fsize=%d:force_stdin=%d:"
+      "trace_skip_depth=%d",
       g_config.input_file, g_config.shm_fd, g_config.pipefds[1],
       g_config.enable_debug, g_config.enable_bounds_check,
       g_config.enable_solve_ub, g_config.exit_on_memerror,
-      g_config.trace_file_size, g_config.force_stdin);
+      g_config.trace_file_size, g_config.force_stdin,
+      g_config.trace_skip_depth);
   if (g_config.symsan_env == NULL) {
     return SYMSAN_NO_MEMORY;
   }

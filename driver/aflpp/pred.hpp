@@ -51,9 +51,6 @@ struct Predicate {
   ArenaPtr arena;
   uint32_t root = 0;
   bool opaque = false;
-  // subtree indices in ascending arena order (children precede parents):
-  // the evaluation order for this predicate
-  std::vector<uint32_t> order;
   // input-read set of this predicate: sorted unique (offset, nbytes) pairs
   std::vector<std::pair<uint32_t, uint32_t>> reads;
 

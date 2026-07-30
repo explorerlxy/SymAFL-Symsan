@@ -35,6 +35,11 @@ extern uint32_t __session_id;
 extern int __pipe_fd;
 extern int __control_pipe_fd;
 
+// Maps the optional shared single-pass capture control block. Called by every
+// solver backend during runtime initialization.
+void InitializeSinglePassCapture();
+bool IsTraceStreamEnabled();
+
 // filter, defined in dfsan.cpp
 extern SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstack;
 

@@ -43,6 +43,13 @@ DFSAN_FLAG(int, shm_fd, -1, "shared union table.")
 DFSAN_FLAG(const char *, shm_name, "", "shared union table by key.")
 DFSAN_FLAG(size_t, shm_size, 0, "shared union table size.")
 DFSAN_FLAG(int, pipe_fd, -1, "communication pipe fd.")
+DFSAN_FLAG(int, trace_skip_depth, -1,
+           "SymAFL v2 suffix tracing: suppress pipe condition events through "
+           "this symbolic depth; -1 emits the complete trace.")
+DFSAN_FLAG(const char *, single_pass_name, "",
+           "SymAFL v2 single-pass capture shared event buffer.")
+DFSAN_FLAG(size_t, single_pass_size, 0,
+           "SymAFL v2 single-pass capture shared event buffer size.")
 DFSAN_FLAG(const char *, pipe_name, "", "communication pipe filename.")
 DFSAN_FLAG(int, control_pipe_fd, -1, "control pipe fd.")
 DFSAN_FLAG(const char *, control_pipe_name, "", "control pipe filename.")

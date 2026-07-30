@@ -51,6 +51,43 @@ struct dfsan_label_info {
   uint32_t hash;
 } __attribute__((aligned (8), packed));
 
+// Shared-memory protocol used by SymAFL's single-pass PCBT capture mode.
+// The custom mutator arms this control block before AFL executes a candidate;
+// the forkserver child appends only symbolic condition events after skip_depth.
+// AFL consumes it only after the child has exited, so the fixed-size event
+// array needs no locks on the consumer side.
+#define SYMAFL_SINGLE_PASS_MAGIC 0x53504331U  // "SPC1"
+#define SYMAFL_SINGLE_PASS_VERSION 2U
+
+#define SYMAFL_TRACE_OFF 0U
+#define SYMAFL_TRACE_FULL_STREAM 1U
+#define SYMAFL_TRACE_SUFFIX_SHM 2U
+
+struct symafl_single_pass_event {
+  uint32_t cid;
+  dfsan_label label;
+  uint8_t result;
+  uint8_t reserved[3];
+};
+
+struct symafl_single_pass_control {
+  uint32_t magic;
+  uint32_t version;
+  uint32_t mode;
+  uint32_t armed;
+  uint32_t skip_depth;
+  uint32_t event_capacity;
+  uint32_t event_count;
+  uint32_t overflow;
+  uint32_t reserved;
+  symafl_single_pass_event events[];
+};
+
+static inline size_t symafl_single_pass_size(size_t event_capacity) {
+  return sizeof(symafl_single_pass_control) +
+         event_capacity * sizeof(symafl_single_pass_event);
+}
+
 #ifndef PATH_MAX
 # define PATH_MAX 4096
 #endif
