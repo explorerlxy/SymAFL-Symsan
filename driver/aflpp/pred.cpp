@@ -193,6 +193,19 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
       fail(PredError::InvalidWidth);
       return kInvalidNode;
     }
+    // A constant operand (l == 0) whose value is in the application memory
+    // range is the memcmp target's address, not the target bytes.  The
+    // mutator runs in the parent process and cannot dereference it, so the
+    // predicate would compare against the wrong constant.  Mark it opaque
+    // for conservative admission instead of guessing.  Small constants
+    // (e.g., inline magic values) are still admitted.
+    const uint64_t app_lo = 0x700000000000ULL;
+    const uint64_t app_hi = 0x800000000000ULL;
+    if ((info->l1 == 0 && info->op1.i >= app_lo && info->op1.i < app_hi) ||
+        (info->l2 == 0 && info->op2.i >= app_lo && info->op2.i < app_hi)) {
+      fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
     uint16_t child_bits = static_cast<uint16_t>(info->size * 8);
     uint32_t a = conv_child(info->l1, info->op1.i, child_bits);
     uint32_t b = conv_child(info->l2, info->op2.i, child_bits);
