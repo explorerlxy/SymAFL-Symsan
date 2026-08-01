@@ -322,7 +322,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
     ret->set_name("read");
 #endif
     return true;
-  } else if (info->op == __dfsan::fmemcmp) {
+  } else if (__dfsan::is_fmemcmp(info->op)) {
     rgd::AstNode *s1 = ret->add_children();
     if (unlikely(s1 == nullptr)) {
       WARNF("failed to add children\n");
@@ -663,7 +663,7 @@ RGDAstParser::constraint_t RGDAstParser::parse_constraint(dfsan_label label) {
   dfsan_label_info *info = get_label_info(label);
   if (unlikely(((info->op & 0xff) != __dfsan::ICmp) &&
                ((info->op & 0xff) != __dfsan::FCmp) &&
-               (info->op != __dfsan::fmemcmp))) {
+               (!__dfsan::is_fmemcmp(info->op)))) {
     WARNF("invalid root node %u, non-comparison root op: %u\n", label, info->op);
     return nullptr;
   }
@@ -731,7 +731,7 @@ dfsan_label RGDAstParser::strip_zext(dfsan_label label) {
       return child;
     } else if ((info->op & 0xff) == __dfsan::ICmp ||
                (info->op & 0xff) == __dfsan::FCmp ||
-               info->op == __dfsan::fmemcmp) {
+               __dfsan::is_fmemcmp(info->op)) {
       // extending the result of icmp, fcmp or memcmp
       return child;
     }
@@ -1238,7 +1238,7 @@ int RGDAstParser::find_roots(dfsan_label label, AstNode *ret,
             node->set_boolvalue(eval_fcmp(info->op >> 8, info->op1.i, info->op2.i, opw));
             node->clear_children();
           }
-        } else if (info->op == __dfsan::fmemcmp) {
+        } else if (__dfsan::is_fmemcmp(info->op)) {
           // memcmp is also considered as a root node (relational comparison)
           if (unlikely(node->children_size() != 0)) {
             WARNF("memcmp should not have additional icmp");
@@ -1360,7 +1360,7 @@ bool RGDAstParser::scan_labels(dfsan_label label) {
       uint8_t nested = 0;
       nested += info->l1 == 0 ? 0 : nested_cmp_cache[info->l1];
       nested += info->l2 == 0 ? 0 : nested_cmp_cache[info->l2];
-      if (info->op == __dfsan::fmemcmp || (info->op & 0xff) == __dfsan::ICmp ||
+      if (__dfsan::is_fmemcmp(info->op) || (info->op & 0xff) == __dfsan::ICmp ||
           (info->op & 0xff) == __dfsan::FCmp)
         nested += 1;
       nested_cmp_cache.push_back(nested);

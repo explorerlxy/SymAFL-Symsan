@@ -301,8 +301,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   fprintf(stderr,
           "[pcbt-opaque] invalid_root=%llu invalid_label=%llu initializing_label=%llu "
           "invalid_width=%llu depth_limit=%llu bad_load=%llu bad_concat=%llu "
-          "unsupported_op=%llu unsupported_compare=%llu arena_limit=%llu "
-          "node_limit=%llu\n",
+          "unsupported_op=%llu unsupported_compare=%llu uncaptured_memcmp_operand=%llu "
+          "arena_limit=%llu node_limit=%llu\n",
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::InvalidRoot],
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::InvalidLabel],
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::InitializingLabel],
@@ -312,6 +312,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::BadConcat],
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::UnsupportedOp],
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::UnsupportedCompare],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::UncapturedMemcmpOperand],
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::ArenaLimit],
           (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::NodeLimit]);
   for (const auto &entry : t.opaque_by_op) {

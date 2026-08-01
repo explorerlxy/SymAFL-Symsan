@@ -375,9 +375,20 @@ __taint_trace_memcmp(dfsan_label label) {
     return;
 
   uint16_t has_content = 1;
-  // if both operands are symbolic, skip sending the content
-  if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) || info->size == 0)
+  // If fmemcmp materialized a constant operand, its op value no longer holds
+  // an address. Solver-side trailers can carry the saved bytes only when the
+  // complete comparison fits in that bounded representation.
+  if (is_fmemcmp(info->op)) {
+    bool concrete_op2 = info->l1 == CONST_LABEL &&
+                        fmemcmp_operand_captured(info->op, false);
+    bool concrete_op1 = info->l2 == CONST_LABEL &&
+                        fmemcmp_operand_captured(info->op, true);
+    has_content = info->size != 0 && info->size <= 8 &&
+                  (concrete_op1 || concrete_op2);
+  } else if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) ||
+             info->size == 0) {
     has_content = 0;
+  }
 
   pipe_msg msg = {
     .msg_type = memcmp_type,
@@ -399,9 +410,16 @@ __taint_trace_memcmp(dfsan_label label) {
   size_t msg_size = sizeof(memcmp_msg) + info->size;
   memcmp_msg *mmsg = (memcmp_msg*)__builtin_alloca(msg_size);
   mmsg->label = label;
-  // Copy concrete content: use op1 if l1 is concrete, else op2
-  void *concrete_ptr = (info->l1 == CONST_LABEL) ? (void*)info->op1.i : (void*)info->op2.i;
-  internal_memcpy(mmsg->content, concrete_ptr, info->size);
+  if (is_fmemcmp(info->op)) {
+    uint64_t concrete_bytes = info->l1 == CONST_LABEL ? info->op1.i
+                                                       : info->op2.i;
+    internal_memcpy(mmsg->content, &concrete_bytes, info->size);
+  } else {
+    // Copy concrete content: use op1 if l1 is concrete, else op2.
+    void *concrete_ptr = (info->l1 == CONST_LABEL)
+                             ? (void *)info->op1.i : (void *)info->op2.i;
+    internal_memcpy(mmsg->content, concrete_ptr, info->size);
+  }
   AOUT("sending memcmp content for label %d, size %u, msg_size=%lu\n", label, info->size, msg_size);
 
   // FIXME: assuming single writer so msg will arrive in the same order

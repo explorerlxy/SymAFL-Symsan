@@ -279,6 +279,24 @@ enum operators {
   LastOp    = last_llvm_op + 41, // 108
 };
 
+// fmemcmp keeps its base opcode in the low byte. The high bits record whether
+// the corresponding op value was materialized from a readable target address
+// into at most eight concrete bytes. A consumer must never treat an unmarked
+// constant operand as bytes: it is still an address in the target process.
+constexpr uint16_t kFmemcmpOperand1Captured = 1u << 14;
+constexpr uint16_t kFmemcmpOperand2Captured = 1u << 15;
+constexpr uint16_t kFmemcmpCaptureMask =
+    kFmemcmpOperand1Captured | kFmemcmpOperand2Captured;
+
+static inline bool is_fmemcmp(uint16_t op) {
+  return (op & 0xff) == fmemcmp;
+}
+
+static inline bool fmemcmp_operand_captured(uint16_t op, bool operand2) {
+  return (op & (operand2 ? kFmemcmpOperand2Captured
+                         : kFmemcmpOperand1Captured)) != 0;
+}
+
 // rounding-mode selector carried in op1 for fp_round, and used when lowering FP
 // arithmetic in the solver.  Values match z3::rounding_mode ordering.
 enum fp_rounding_mode {

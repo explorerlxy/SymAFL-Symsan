@@ -983,7 +983,7 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
       continue;
     }
     // higher-order
-    else if (info->op == __dfsan::fmemcmp) {
+    else if (__dfsan::is_fmemcmp(info->op)) {
       z3::expr op1 = (info->l1 >= CONST_OFFSET) ?
                      get_cached_expr(info->l1, input_deps) :
                      read_concrete(l, info->size); // memcmp size in bytes
@@ -2206,13 +2206,13 @@ z3::expr Z3AstParser::serialize(dfsan_label label, input_dep_set_t &deps) {
           // - memcmp/atoi/strcmp: fix using runtime value from ICmp
           // - indexOf operations: op1 repurposed for haystack pointer, skip validation
           bool is_special = false;
-          if (l1_op == __dfsan::fmemcmp || l1_op == __dfsan::fatoi || l1_op == __dfsan::fstrcmp) {
+          if (__dfsan::is_fmemcmp(l1_op) || l1_op == __dfsan::fatoi || l1_op == __dfsan::fstrcmp) {
             fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
                     info->l1, value_cache_[info->l1], (uint64_t)info->op1.i, l1_op);
             value_cache_[info->l1] = val1 = info->op1.i;
             is_special = true;
           }
-          if (l2_op == __dfsan::fmemcmp || l2_op == __dfsan::fatoi || l2_op == __dfsan::fstrcmp) {
+          if (__dfsan::is_fmemcmp(l2_op) || l2_op == __dfsan::fatoi || l2_op == __dfsan::fstrcmp) {
             fprintf(stderr, "DEBUG serialize ICmp: fixing up value_cache_[%u] from %lu to %lu (op=%u)\n",
                     info->l2, value_cache_[info->l2], (uint64_t)info->op2.i, l2_op);
             value_cache_[info->l2] = val2 = info->op2.i;

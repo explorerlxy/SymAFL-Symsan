@@ -48,6 +48,7 @@ enum class PredError : uint8_t {
   BadConcat,
   UnsupportedOp,
   UnsupportedCompare,
+  UncapturedMemcmpOperand,
   ArenaLimit,
   NodeLimit,
   Count,

@@ -242,9 +242,19 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return 0;
   }
   if (l1 > l2 && is_commutative(op)) {
-    // needs to swap both labels and concretes
+    // needs to swap both labels and concretes. fmemcmp capture bits follow
+    // their operand values, not their normalized label positions.
+    bool fmemcmp_op1_captured =
+        is_fmemcmp(op) && fmemcmp_operand_captured(op, false);
+    bool fmemcmp_op2_captured =
+        is_fmemcmp(op) && fmemcmp_operand_captured(op, true);
     Swap(l1, l2);
     Swap(op1, op2);
+    if (is_fmemcmp(op)) {
+      op &= ~kFmemcmpCaptureMask;
+      if (fmemcmp_op2_captured) op |= kFmemcmpOperand1Captured;
+      if (fmemcmp_op1_captured) op |= kFmemcmpOperand2Captured;
+    }
   }
   if (l1 == 0 && l2 < CONST_OFFSET &&
       op != fsize && op != __dfsan::Alloca)
@@ -272,11 +282,21 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   // - Alloca: uses op1/op2 for bounds tracking
   // - ICmp: records both operands for comparison
   // - Higher-order ops (>= fmemcmp): use op1/op2 for various purposes
-  if (op == __dfsan::fmemcmp) {
-    // fmemcmp special: copy up to 8 bytes of the data for i2s inference
-    uint16_t len = size > 8 ? 8 : size; // for fmemcmp, size is in bytes, not bits
-    if (l1 >= CONST_OFFSET) internal_memcpy(&op1, (void*)op1, len);
-    if (l2 >= CONST_OFFSET) internal_memcpy(&op2, (void*)op2, len);
+  if (is_fmemcmp(op)) {
+    // fmemcmp stores operand addresses initially. Materialize at most eight
+    // bytes only after the sanitizer runtime verifies the target range is
+    // readable; a failed probe leaves the address unmarked for conservative
+    // parent-side handling.
+    uint16_t len = size > 8 ? 8 : size;
+    op &= ~kFmemcmpCaptureMask;
+    if (len != 0 && op1 != 0 && IsAccessibleMemoryRange((uptr)op1, len)) {
+      internal_memcpy(&op1, (void *)op1, len);
+      op |= kFmemcmpOperand1Captured;
+    }
+    if (len != 0 && op2 != 0 && IsAccessibleMemoryRange((uptr)op2, len)) {
+      internal_memcpy(&op2, (void *)op2, len);
+      op |= kFmemcmpOperand2Captured;
+    }
   } else if ((op & 0xff) < __dfsan::fmemcmp &&
              op != __dfsan::Alloca &&
              op != __dfsan::PtrToInt &&

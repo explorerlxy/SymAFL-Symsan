@@ -73,7 +73,10 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
                             const std::vector<Event> &events,
                             const dfsan_label_info *table,
                             size_t table_labels) {
-  if (parent < kRoot || parent >= nodes_.size() || direction > 1) return 0;
+  if (parent < kRoot || parent >= nodes_.size() || direction > 1 ||
+      node(parent).child[direction] != kUnexplored) {
+    return 0;
+  }
   num_traces += 1;
   num_events += events.size();
 

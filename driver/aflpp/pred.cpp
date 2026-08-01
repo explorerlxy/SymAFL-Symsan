@@ -36,6 +36,7 @@ const char *pred_error_name(PredError error) {
     case PredError::BadConcat: return "bad_concat";
     case PredError::UnsupportedOp: return "unsupported_op";
     case PredError::UnsupportedCompare: return "unsupported_compare";
+    case PredError::UncapturedMemcmpOperand: return "uncaptured_memcmp_operand";
     case PredError::ArenaLimit: return "arena_limit";
     case PredError::NodeLimit: return "node_limit";
     case PredError::Count: break;
@@ -93,7 +94,7 @@ uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
   if (op == __dfsan::Extract || op_lo == Trunc ||
       op_lo == Neg || op_lo == Not || op_lo == ZExt || op_lo == SExt)
     return 1;
-  if (op == __dfsan::Concat || op == __dfsan::fmemcmp || op_lo == ICmp ||
+  if (op == __dfsan::Concat || is_fmemcmp(op) || op_lo == ICmp ||
       op_lo == Add || op_lo == Sub || op_lo == Mul || op_lo == UDiv ||
       op_lo == SDiv || op_lo == URem || op_lo == SRem || op_lo == Shl ||
       op_lo == LShr || op_lo == AShr || op_lo == And || op_lo == Or ||
@@ -188,22 +189,19 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
   // PCBT grammar can model exactly the byte range it records.  Its canonical
   // -1/0/+1 result preserves every comparison against zero (the only admitted
   // use; target preflight rejects other fmemcmp-derived predicates).
-  if (op == __dfsan::fmemcmp) {
+  if (is_fmemcmp(static_cast<uint16_t>(op))) {
     if (info->size == 0 || info->size > 8) {
       fail(PredError::InvalidWidth);
       return kInvalidNode;
     }
-    // A constant operand (l == 0) whose value is in the application memory
-    // range is the memcmp target's address, not the target bytes.  The
-    // mutator runs in the parent process and cannot dereference it, so the
-    // predicate would compare against the wrong constant.  Mark it opaque
-    // for conservative admission instead of guessing.  Small constants
-    // (e.g., inline magic values) are still admitted.
-    const uint64_t app_lo = 0x700000000000ULL;
-    const uint64_t app_hi = 0x800000000000ULL;
-    if ((info->l1 == 0 && info->op1.i >= app_lo && info->op1.i < app_hi) ||
-        (info->l2 == 0 && info->op2.i >= app_lo && info->op2.i < app_hi)) {
-      fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
+    // A constant fmemcmp operand starts as a target-process address. Accept it
+    // only when the child runtime explicitly marked its bytes as materialized;
+    // the parent must never infer bytes from an address range.
+    if ((info->l1 == 0 &&
+         !fmemcmp_operand_captured(info->op, false)) ||
+        (info->l2 == 0 &&
+         !fmemcmp_operand_captured(info->op, true))) {
+      fail(PredError::UncapturedMemcmpOperand, info->op);
       return kInvalidNode;
     }
     uint16_t child_bits = static_cast<uint16_t>(info->size * 8);
@@ -280,10 +278,10 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     // only when consumed immediately by a comparison with zero.
     const bool left_memcmp =
         info->l1 != 0 && info->l1 < table_labels_ &&
-        table_[info->l1].op == __dfsan::fmemcmp;
+        is_fmemcmp(table_[info->l1].op);
     const bool right_memcmp =
         info->l2 != 0 && info->l2 < table_labels_ &&
-        table_[info->l2].op == __dfsan::fmemcmp;
+        is_fmemcmp(table_[info->l2].op);
     if ((left_memcmp && (info->l2 != 0 || info->op2.i != 0)) ||
         (right_memcmp && (info->l1 != 0 || info->op1.i != 0))) {
       fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
