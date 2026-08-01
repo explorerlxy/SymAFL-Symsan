@@ -350,7 +350,7 @@ bool RGDAstParser::do_uta_rel(dfsan_label label, rgd::AstNode *ret,
       uint16_t remain = info->size % 8;
       uint64_t val = 0;
       for (uint16_t i = 0; i < chunks; i++) {
-        val = *(uint64_t*)&(itr->second.get()[i * 8]);
+        memcpy(&val, &(itr->second.get()[i * 8]), sizeof(val));
         constraint->input_args.push_back(std::make_pair(false, val));
         constraint->const_num += 1;
         DEBUGF("memcmp constant chunk %d = 0x%lx\n", i, val);

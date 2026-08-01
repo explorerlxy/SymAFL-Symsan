@@ -182,4 +182,101 @@ bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit) const {
   return true;
 }
 
+Tree::ReplayReport Tree::ReplayFullTrace(
+    const std::vector<Event> &events, const uint8_t *input,
+    uint32_t len) const {
+  ReplayReport r;
+
+  NodeRef cur = node(kRoot).child[0];
+  if (cur == kUnexplored) {
+    r.tree_empty = true;
+    return r;
+  }
+
+  EvalContext eval;
+  eval.Reset();
+  size_t i = 0;
+  for (; i < events.size(); ++i) {
+    const Event &ev = events[i];
+    if (ev.result > 1) {
+      r.error = ReplayError::InvalidEventResult;
+      r.event_index = i;
+      return r;
+    }
+    const Node &current = node(cur);
+    // CID check
+    if (current.cid != ev.cid) {
+      r.error = ReplayError::CidMismatch;
+      r.event_index = i;
+      r.expected_cid = current.cid;
+      r.observed_cid = ev.cid;
+      return r;
+    }
+    // Evaluate predicate
+    if (current.pred.opaque) {
+      r.event_index = i;
+      r.verified_events = i;  // events before this opaque one are verified
+      r.reached_frontier = true;
+      r.frontier_node = cur;
+      r.frontier_dir = ev.result;
+      r.opaque_admission = true;
+      return r;
+    }
+    uint64_t v = 0;
+    if (!eval_predicate(pred_arena_, current.pred, input, len, &v, &eval)) {
+      r.event_index = i;
+      r.verified_events = i;
+      r.reached_frontier = true;
+      r.frontier_node = cur;
+      r.frontier_dir = ev.result;
+      r.eval_failure = true;
+      return r;
+    }
+    uint8_t dir = v ? 1 : 0;
+    r.direction_checked = true;
+    if (dir != ev.result) {
+      r.error = ReplayError::DirectionMismatch;
+      r.event_index = i;
+      r.expected_cid = current.cid;
+      r.observed_cid = ev.cid;
+      r.evaluated_dir = dir;
+      r.observed_dir = ev.result;
+      return r;
+    }
+    NodeRef next = current.child[dir];
+    if (next == kTerminal) {
+      if (i + 1 < events.size()) {
+        // More events follow, but trace already consumed
+        r.error = ReplayError::AfterTerminal;
+        r.event_index = i + 1;
+        r.verified_events = i + 1;
+        return r;
+      }
+      // Last event ends exactly at a terminal edge: consistent.
+      r.event_index = i;
+      r.verified_events = i + 1;
+      r.reached_terminal = true;
+      return r;
+    }
+    if (next == kUnexplored) {
+      r.event_index = i;
+      r.verified_events = i + 1;  // this event passed all checks
+      r.reached_frontier = true;
+      r.frontier_node = cur;
+      r.frontier_dir = dir;
+      r.suffix_begin = i + 1;
+      return r;
+    }
+    cur = next;
+  }
+
+  // All events consumed without hitting terminal or frontier: the tree
+  // expects more conditions.  This can happen after the last event if
+  // cur.child[dir] points to another node (not kTerminal/Unexplored).
+  r.verified_events = i;
+  r.event_index = i;
+  r.error = ReplayError::TruncatedTrace;
+  return r;
+}
+
 }  // namespace pcbt

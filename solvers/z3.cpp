@@ -401,9 +401,22 @@ __taint_trace_memcmp(dfsan_label label) {
   if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) || info->size == 0)
     return;
 
+  if (is_fmemcmp(info->op)) {
+    // Tagged fmemcmp: constant operands carry up to eight materialized bytes
+    // in op1/op2, not target addresses.  Cache those bytes directly instead
+    // of dereferencing the value as a pointer.
+    if (info->size <= 8) {
+      uint64_t concrete_bytes = (info->l1 == CONST_LABEL) ? info->op1.i
+                                                          : info->op2.i;
+      __z3_parser->record_memcmp(label, (uint8_t *)&concrete_bytes,
+                                 info->size);
+    }
+    return;
+  }
+
   uint8_t *content_ptr = (info->l1 == CONST_LABEL) ? (uint8_t*)info->op1.i
                                                    : (uint8_t*)info->op2.i;
-  // Cache the concrete content for later solving, concrete oprand is always in op1
+  // Cache the concrete content for later solving, concrete operand is always in op1
   __z3_parser->record_memcmp(label, content_ptr, info->size);
 }
 

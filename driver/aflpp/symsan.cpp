@@ -125,6 +125,16 @@ struct my_mutator_t {
   bool saturation_logged = false;
   uint64_t single_pass_captures = 0;
   uint64_t single_pass_overflows = 0;
+
+  // replay checker (SYMAFL_REPLAY_CHECK=1)
+  bool replay_check = false;
+  uint64_t replay_checked = 0;
+  uint64_t replay_cid_mismatch = 0;
+  uint64_t replay_direction_mismatch = 0;
+  uint64_t replay_after_terminal = 0;
+  uint64_t replay_truncated = 0;
+  uint64_t replay_frontier_match = 0;
+  uint64_t replay_terminal_match = 0;
 };
 
 // Shared union table owned by the target forkserver.
@@ -255,6 +265,11 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   }
   init_forkserver_capture(data);
 
+  if (getenv("SYMAFL_REPLAY_CHECK")) {
+    data->replay_check = true;
+    fprintf(stderr, "[pcbt] replay check enabled: all admitted candidates "
+            "use full-pipe capture and trace replay validation\n");
+  }
   if (getenv("SYMAFL_NO_SCREEN")) {
     data->screening = false;
   }
@@ -298,6 +313,17 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.check_admit_frontier,
           (unsigned long long)t.check_veto_terminal,
           (unsigned long long)t.check_veto_rlimit);
+  fprintf(stderr,
+          "[pcbt-replay] checked=%llu cid_mismatch=%llu dir_mismatch=%llu "
+          "after_terminal=%llu truncated=%llu frontier_match=%llu "
+          "terminal_match=%llu\n",
+          (unsigned long long)data->replay_checked,
+          (unsigned long long)data->replay_cid_mismatch,
+          (unsigned long long)data->replay_direction_mismatch,
+          (unsigned long long)data->replay_after_terminal,
+          (unsigned long long)data->replay_truncated,
+          (unsigned long long)data->replay_frontier_match,
+          (unsigned long long)data->replay_terminal_match);
   fprintf(stderr,
           "[pcbt-opaque] invalid_root=%llu invalid_label=%llu initializing_label=%llu "
           "invalid_width=%llu depth_limit=%llu bad_load=%llu bad_concat=%llu "
@@ -411,11 +437,62 @@ static bool decode_pipe_events(my_mutator_t *data,
   return false;
 }
 
+static bool replay_check_trace(my_mutator_t *data,
+                               const std::vector<pcbt::Event> &events,
+                               const u8 *buf, size_t buf_size,
+                               const char *fname, bool is_suffix) {
+  if (!data->replay_check) return true;
+  if (events.empty()) return true;  // empty trace, nothing to check
+
+  data->replay_checked += 1;
+  auto report = data->tree.ReplayFullTrace(events, buf,
+                                           (uint32_t)buf_size);
+
+  if (report.error == pcbt::Tree::ReplayError::None) {
+    if (report.reached_terminal) data->replay_terminal_match += 1;
+    else if (report.reached_frontier) data->replay_frontier_match += 1;
+    return true;
+  }
+
+  // Log the mismatch
+  const char *err_name = "unknown";
+  switch (report.error) {
+    case pcbt::Tree::ReplayError::CidMismatch:
+      err_name = "cid_mismatch";
+      data->replay_cid_mismatch += 1;
+      break;
+    case pcbt::Tree::ReplayError::DirectionMismatch:
+      err_name = "direction_mismatch";
+      data->replay_direction_mismatch += 1;
+      break;
+    case pcbt::Tree::ReplayError::AfterTerminal:
+      err_name = "after_terminal";
+      data->replay_after_terminal += 1;
+      break;
+    case pcbt::Tree::ReplayError::TruncatedTrace:
+      err_name = "truncated";
+      data->replay_truncated += 1;
+      break;
+    default: break;
+  }
+  WARNF("[pcbt-replay] %s mismatch %s at event=%zu verified=%zu "
+        "expected_cid=%u observed_cid=%u eval_dir=%u obs_dir=%u %s\n",
+        fname, err_name, report.event_index, report.verified_events,
+        report.expected_cid, report.observed_cid,
+        report.evaluated_dir, report.observed_dir,
+        is_suffix ? "suffix" : "full");
+  return false;  // discard mismatched trace
+}
+
 static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
                                size_t buf_size, const char *fname) {
   std::vector<pcbt::Event> events;
   events.reserve(4096);
   if (!decode_pipe_events(data, &events, fname)) {
+    disarm_capture(data);
+    return false;
+  }
+  if (!replay_check_trace(data, events, buf, buf_size, fname, false)) {
     disarm_capture(data);
     return false;
   }
@@ -598,7 +675,10 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     // pipe-full. Thereafter a candidate has an established frontier and uses
     // SHM. The pipe is reserved for data that is known to be consumed: the
     // bootstrap trace or an overflow replay after AFL++ confirms a gain.
-    if (!data->bootstrap_done || node == pcbt::kUnexplored) {
+    // When replay_check is enabled, always use full-pipe so the complete
+    // trace can be compared against the current tree before insertion.
+    if (!data->bootstrap_done || data->replay_check ||
+        node == pcbt::kUnexplored) {
       data->last_node = node;
       data->last_dir = dir;
       arm_full_capture(data);

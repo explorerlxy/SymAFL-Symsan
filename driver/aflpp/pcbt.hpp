@@ -58,10 +58,42 @@ class Tree {
   bool CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                   uint8_t *out_dir, uint8_t rlimit);
 
+  // Const replay: walk the event vector from kRoot and compare CID order
+  // and predicate directions against the tree.  Never mutates any state.
+  // Returns a report describing structural agreement, mismatches, and the
+  // first diagnostic position.
+  enum class ReplayError : uint8_t {
+    None, CidMismatch, DirectionMismatch, AfterTerminal, TruncatedTrace,
+    InvalidEventResult,
+  };
+  struct ReplayReport {
+    ReplayError error = ReplayError::None;
+    size_t event_index = 0;          // first mismatch position
+    size_t verified_events = 0;      // number of events that matched
+    size_t suffix_begin = 0;         // first event beyond known prefix
+    uint32_t expected_cid = 0;
+    uint32_t observed_cid = 0;
+    uint8_t evaluated_dir = 0;
+    uint8_t observed_dir = 0;
+    bool direction_checked = false;
+    bool tree_empty = false;
+    bool opaque_admission = false;
+    bool eval_failure = false;
+    bool reached_terminal = false;
+    bool reached_frontier = false;
+    NodeRef frontier_node = kUnexplored;
+    uint8_t frontier_dir = 0;
+  };
+  ReplayReport ReplayFullTrace(const std::vector<Event> &events,
+                               const uint8_t *input, uint32_t len) const;
+
   bool IsSaturated(uint8_t rlimit) const;
   uint32_t depth(NodeRef ref) const { return node(ref).depth; }
   uint64_t num_pred_nodes() const { return pred_arena_.nodes.size(); }
   uint8_t &retry_count(NodeRef ref, uint8_t direction) {
+    return node(ref).rCnt[direction];
+  }
+  uint8_t retry_count(NodeRef ref, uint8_t direction) const {
     return node(ref).rCnt[direction];
   }
 
