@@ -2,6 +2,16 @@
 
 namespace pcbt {
 
+Tree::Tree() : nodes_(kRoot + 1) {
+  pred_arena_.nodes.reserve(4096);
+}
+
+NodeRef Tree::append(Node &&new_node) {
+  if (nodes_.size() == UINT32_MAX) return kUnexplored;
+  nodes_.push_back(std::move(new_node));
+  return (NodeRef)nodes_.size() - 1;
+}
+
 uint32_t Tree::InsertTrace(const std::vector<Event> &events,
                            const dfsan_label_info *table,
                            size_t table_labels) {
@@ -9,164 +19,162 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   num_traces += 1;
   num_events += events.size();
 
-  Node *parent = &root_;
-  uint8_t dir = 0;  // entry slot: the first decision node is root_.child[0]
-  uint64_t depth = 0;
-
-  // Walk the existing trie; stop at the first missing child (insert point)
-  // or bail out on a path conflict (cid mismatch at an existing node).
+  NodeRef parent = kRoot;
+  uint8_t dir = 0;
+  uint64_t trace_depth = 0;
   size_t i = 0;
-  for (; i < events.size(); i++) {
-    Node *nxt = parent->child[dir];
-    if (!nxt) {
-      if (parent->terminal[dir]) {
-        num_conflicts += 1;
-        return 0;
-      }
-      break;
-    }
-    if (nxt->cid != events[i].cid) {
+  for (; i < events.size(); ++i) {
+    NodeRef next = node(parent).child[dir];
+    if (next == kUnexplored) break;
+    if (next == kTerminal || node(next).cid != events[i].cid) {
       num_conflicts += 1;
       return 0;
     }
-    parent = nxt;
+    parent = next;
     dir = events[i].result ? 1 : 0;
-    depth += 1;
+    trace_depth += 1;
   }
 
-  // A complete replay that ends after an already-known node has explored its
-  // outgoing edge. If the edge already has a successor, preserve that richer
-  // path; deterministic targets do not produce both forms for one edge.
   if (i == events.size()) {
-    if (!parent->child[dir]) parent->terminal[dir] = true;
+    if (node(parent).child[dir] == kUnexplored) {
+      node(parent).child[dir] = kTerminal;
+    }
     return 0;
   }
 
-  // Append the remaining events as a fresh chain. All new predicates of
-  // this trace share one arena (maximal DAG reuse via label memoization).
-  RunConverter conv(table, table_labels);
+  RunConverter conv(table, table_labels, &pred_arena_);
   uint32_t created = 0;
-  for (; i < events.size(); i++) {
-    auto node = std::make_unique<Node>();
-    node->cid = events[i].cid;
-    node->id = next_id_++;
-    node->depth = parent == &root_ ? 1 : parent->depth + 1;
-    node->pred = conv.conv(events[i].label);
-    if (node->pred.opaque) num_opaque += 1;
-    Node *raw = node.get();
-    arena_.push_back(std::move(node));
-    parent->child[dir] = raw;
-    parent->terminal[dir] = false;
-    parent = raw;
+  for (; i < events.size(); ++i) {
+    Node new_node;
+    new_node.cid = events[i].cid;
+    new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
+    new_node.pred = conv.conv(events[i].label);
+    if (new_node.pred.opaque) {
+      num_opaque += 1;
+      opaque_by_error[static_cast<size_t>(new_node.pred.error)] += 1;
+      if (new_node.pred.error_op) opaque_by_op[new_node.pred.error_op] += 1;
+    }
+    NodeRef next = append(std::move(new_node));
+    if (next == kUnexplored) return created;
+    node(parent).child[dir] = next;
+    parent = next;
     dir = events[i].result ? 1 : 0;
     created += 1;
-    depth += 1;
+    trace_depth += 1;
   }
 
-  // The replay completed after the final symbolic condition. Record that its
-  // selected edge is explored even though it has no next symbolic node.
-  parent->terminal[dir] = true;
-
+  node(parent).child[dir] = kTerminal;
   num_nodes += created;
-  if (depth > max_depth) max_depth = depth;
+  if (trace_depth > max_depth) max_depth = trace_depth;
   return created;
 }
 
-uint32_t Tree::InsertSuffix(Node *parent, uint8_t direction,
+uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
                             const std::vector<Event> &events,
                             const dfsan_label_info *table,
                             size_t table_labels) {
-  if (!parent || direction > 1) return 0;
-
+  if (parent < kRoot || parent >= nodes_.size() || direction > 1) return 0;
   num_traces += 1;
   num_events += events.size();
 
-  // The caller owns the PCBT-prefix invariant. Do not replay or validate that
-  // prefix here: suffix insertion is the direct equivalent of InsertTrace.
   if (events.empty()) {
-    parent->terminal[direction] = true;
+    node(parent).child[direction] = kTerminal;
     return 0;
   }
 
-  RunConverter conv(table, table_labels);
+  RunConverter conv(table, table_labels, &pred_arena_);
   uint32_t created = 0;
   uint8_t dir = direction;
-  Node *cur = parent;
+  NodeRef cur = parent;
   for (const Event &event : events) {
-    auto node = std::make_unique<Node>();
-    node->cid = event.cid;
-    node->id = next_id_++;
-    node->depth = cur->depth + 1;
-    node->pred = conv.conv(event.label);
-    if (node->pred.opaque) num_opaque += 1;
-    Node *raw = node.get();
-    arena_.push_back(std::move(node));
-    cur->child[dir] = raw;
-    cur->terminal[dir] = false;
-    cur = raw;
+    Node new_node;
+    new_node.cid = event.cid;
+    new_node.depth = node(cur).depth + 1;
+    new_node.pred = conv.conv(event.label);
+    if (new_node.pred.opaque) {
+      num_opaque += 1;
+      opaque_by_error[static_cast<size_t>(new_node.pred.error)] += 1;
+      if (new_node.pred.error_op) opaque_by_op[new_node.pred.error_op] += 1;
+    }
+    NodeRef next = append(std::move(new_node));
+    if (next == kUnexplored) return created;
+    node(cur).child[dir] = next;
+    cur = next;
     dir = event.result ? 1 : 0;
     created += 1;
   }
 
-  cur->terminal[dir] = true;
+  node(cur).child[dir] = kTerminal;
   num_nodes += created;
-  if (cur->depth > max_depth) max_depth = cur->depth;
+  if (node(cur).depth > max_depth) max_depth = node(cur).depth;
   return created;
 }
 
-bool Tree::CheckInput(const uint8_t *input, uint32_t len, Node **out_node,
-                      uint8_t *out_dir, uint32_t rlimit) {
-  Node *cur = root_.child[0];
-  if (!cur) {
-    *out_node = nullptr;  // empty tree (bootstrap): admit all, no bookkeeping
+bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
+                      uint8_t *out_dir, uint8_t rlimit) {
+  NodeRef cur = node(kRoot).child[0];
+  if (cur == kUnexplored) {
+    *out_node = kUnexplored;
     *out_dir = 0;
+    check_admit_empty += 1;
     return true;
   }
 
+  EvalContext eval;
+  eval.Reset();
   while (true) {
-    uint8_t d;
-    if (!cur->pred.arena || cur->pred.opaque) {
-      // cannot evaluate this node: conservative admit (no bookkeeping)
-      *out_node = nullptr;
+    const Node &current = node(cur);
+    if (current.pred.opaque) {
+      *out_node = kUnexplored;
       *out_dir = 0;
+      check_admit_opaque += 1;
       return true;
     }
     uint64_t v = 0;
-    if (!eval_predicate(cur->pred, input, len, &v)) {
-      d = 0;  // undefined (read past input end): v1's conservative rule
-    } else {
-      d = v ? 1 : 0;
+    if (!eval_predicate(pred_arena_, current.pred, input, len, &v, &eval)) {
+      *out_node = kUnexplored;
+      *out_dir = 0;
+      check_admit_eval_failure += 1;
+      return true;
     }
-    Node *nxt = cur->child[d];
-    if (!nxt) {
-      if (cur->terminal[d]) {
-        *out_node = nullptr;
-        *out_dir = 0;
-        return false;
-      }
-      // frontier in direction d
+    uint8_t dir = v ? 1 : 0;
+    NodeRef next = current.child[dir];
+    if (next == kTerminal) {
+      *out_node = kUnexplored;
+      *out_dir = 0;
+      check_veto_terminal += 1;
+      return false;
+    }
+    if (next == kUnexplored) {
       *out_node = cur;
-      *out_dir = d;
-      return cur->rCnt[d] < rlimit;
+      *out_dir = dir;
+      if (current.rCnt[dir] < rlimit) {
+        check_admit_frontier += 1;
+        return true;
+      }
+      check_veto_rlimit += 1;
+      return false;
     }
-    cur = nxt;
+    cur = next;
   }
 }
 
-bool Tree::IsSaturated(uint32_t rlimit) const {
-  return root_.child[0] && IsSaturated(root_.child[0], rlimit);
+bool Tree::IsSaturated(uint8_t rlimit) const {
+  NodeRef entry = node(kRoot).child[0];
+  return entry != kUnexplored && IsSaturated(entry, rlimit);
 }
 
-bool Tree::IsSaturated(const Node *node, uint32_t rlimit) const {
-  if (!node || !node->pred.arena || node->pred.opaque) return false;
-
+bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit) const {
+  const Node &current = node(ref);
+  if (current.pred.opaque) return false;
   for (uint8_t direction = 0; direction != 2; ++direction) {
-    const Node *next = node->child[direction];
-    if (next) {
-      if (!IsSaturated(next, rlimit)) return false;
-    } else if (!node->terminal[direction] && node->rCnt[direction] < rlimit) {
-      return false;
+    NodeRef next = current.child[direction];
+    if (next == kTerminal) continue;
+    if (next == kUnexplored) {
+      if (current.rCnt[direction] < rlimit) return false;
+      continue;
     }
+    if (!IsSaturated(next, rlimit)) return false;
   }
   return true;
 }

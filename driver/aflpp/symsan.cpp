@@ -95,8 +95,8 @@ struct my_mutator_t {
 
   // screening state (post_process)
   bool screening = true;
-  uint32_t rlimit = 16;
-  pcbt::Node *last_node = nullptr;
+  uint8_t rlimit = 16;
+  pcbt::NodeRef last_node = pcbt::kUnexplored;
   uint8_t last_dir = 0;
   bool last_gained = true;
 
@@ -123,7 +123,6 @@ struct my_mutator_t {
   uint64_t vetoed = 0;
   uint64_t vetoes_since_admit = 0;
   bool saturation_logged = false;
-  uint64_t selfcheck_fail = 0;  // inserted input vetoed by its own tree
   uint64_t single_pass_captures = 0;
   uint64_t single_pass_overflows = 0;
 };
@@ -260,7 +259,12 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->screening = false;
   }
   if (const char *rl = getenv("SYMAFL_RCNT_LIMIT")) {
-    data->rlimit = (uint32_t)atoi(rl);
+    char *end = nullptr;
+    unsigned long parsed = strtoul(rl, &end, 10);
+    if (end == rl || *end != '\0' || parsed > UINT8_MAX) {
+      FATAL("Invalid SYMAFL_RCNT_LIMIT=%s (expected 0..255)", rl);
+    }
+    data->rlimit = (uint8_t)parsed;
   }
   return data;
 }
@@ -268,13 +272,17 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
 extern "C" void afl_custom_deinit(my_mutator_t *data) {
   const pcbt::Tree &t = data->tree;
   fprintf(stderr,
-          "[pcbt] traces=%llu nodes=%llu depth=%llu conflicts=%llu "
-          "failed=%llu timeouts=%llu memerr=%llu screened=%llu "
+          "[pcbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
+          "opaque=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
           "admitted=%llu vetoed=%llu saturated=%llu "
-          "selfcheck_fail=%llu single_pass=%llu single_pass_overflow=%llu\n",
+          "single_pass=%llu single_pass_overflow=%llu "
+          "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
+          "veto_terminal=%llu veto_rlimit=%llu\n",
           (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
+          (unsigned long long)t.num_pred_nodes(),
           (unsigned long long)t.max_depth,
           (unsigned long long)t.num_conflicts,
+          (unsigned long long)t.num_opaque,
           (unsigned long long)data->failed_runs,
           (unsigned long long)data->trace_timeouts,
           (unsigned long long)data->memerr_events,
@@ -282,9 +290,34 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->admitted,
           (unsigned long long)data->vetoed,
           (unsigned long long)(data->screening ? 0 : 1),
-          (unsigned long long)data->selfcheck_fail,
           (unsigned long long)data->single_pass_captures,
-          (unsigned long long)data->single_pass_overflows);
+          (unsigned long long)data->single_pass_overflows,
+          (unsigned long long)t.check_admit_empty,
+          (unsigned long long)t.check_admit_opaque,
+          (unsigned long long)t.check_admit_eval_failure,
+          (unsigned long long)t.check_admit_frontier,
+          (unsigned long long)t.check_veto_terminal,
+          (unsigned long long)t.check_veto_rlimit);
+  fprintf(stderr,
+          "[pcbt-opaque] invalid_root=%llu invalid_label=%llu initializing_label=%llu "
+          "invalid_width=%llu depth_limit=%llu bad_load=%llu bad_concat=%llu "
+          "unsupported_op=%llu unsupported_compare=%llu arena_limit=%llu "
+          "node_limit=%llu\n",
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::InvalidRoot],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::InvalidLabel],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::InitializingLabel],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::InvalidWidth],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::DepthLimit],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::BadLoad],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::BadConcat],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::UnsupportedOp],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::UnsupportedCompare],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::ArenaLimit],
+          (unsigned long long)t.opaque_by_error[(size_t)pcbt::PredError::NodeLimit]);
+  for (const auto &entry : t.opaque_by_op) {
+    fprintf(stderr, "[pcbt-opaque-op] op=%u count=%llu\n", entry.first,
+            (unsigned long long)entry.second);
+  }
   delete data;
 }
 
@@ -306,13 +339,13 @@ static void arm_full_capture(my_mutator_t *data) {
   data->single_pass_armed = true;
 }
 
-static void arm_suffix_capture(my_mutator_t *data, pcbt::Node *node,
+static void arm_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
                                uint8_t dir) {
   symafl_single_pass_control *control = data->single_pass_control;
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
-  control->skip_depth = node->depth;
+  control->skip_depth = data->tree.depth(node);
   __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_SHM, __ATOMIC_RELEASE);
   __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
   data->last_node = node;
@@ -320,13 +353,13 @@ static void arm_suffix_capture(my_mutator_t *data, pcbt::Node *node,
   data->single_pass_armed = true;
 }
 
-static void arm_pipe_suffix_capture(my_mutator_t *data, pcbt::Node *node,
+static void arm_pipe_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
                                     uint8_t dir) {
   symafl_single_pass_control *control = data->single_pass_control;
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
-  control->skip_depth = node->depth;
+  control->skip_depth = data->tree.depth(node);
   __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_PIPE,
                    __ATOMIC_RELEASE);
   __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
@@ -364,16 +397,6 @@ static bool decode_full_stream(const u8 *wire, size_t wire_size,
   return true;
 }
 
-static void selfcheck(my_mutator_t *data, const u8 *buf, size_t buf_size) {
-  if (!buf || !buf_size) return;
-  pcbt::Node *node = nullptr;
-  uint8_t dir = 0;
-  if (data->tree.CheckInput(buf, (uint32_t)buf_size, &node, &dir,
-                            data->rlimit)) {
-    data->selfcheck_fail += 1;
-  }
-}
-
 static bool decode_pipe_events(my_mutator_t *data,
                                std::vector<pcbt::Event> *events,
                                const char *fname) {
@@ -401,15 +424,14 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   fprintf(stderr, "[pcbt-trace] %s mode=full events=%zu created=%u\n",
           fname, events.size(), created);
   disarm_capture(data);
-  // A run without any symbolic conditions cannot be represented by the
-  // decision tree, so it has no meaningful PCBT self-check.
-  if (!events.empty()) selfcheck(data, buf, buf_size);
   return true;
 }
 
 static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
                                        size_t buf_size, const char *fname) {
-  if (!data->single_pass_armed || !data->last_node) return false;
+  if (!data->single_pass_armed || data->last_node == pcbt::kUnexplored) {
+    return false;
+  }
   std::vector<pcbt::Event> events;
   events.reserve(4096);
   if (!decode_pipe_events(data, &events, fname)) {
@@ -420,15 +442,16 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
       events, __dfsan_label_info, MAX_LABEL);
   fprintf(stderr,
           "[pcbt-trace] %s mode=pipe-suffix skip=%u events=%zu created=%u\n",
-          fname, data->last_node->depth, events.size(), created);
+          fname, data->tree.depth(data->last_node), events.size(), created);
   disarm_capture(data);
-  selfcheck(data, buf, buf_size);
   return true;
 }
 
 static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
                                   size_t buf_size, const char *fname) {
-  if (!data->single_pass_armed || !data->last_node) return false;
+  if (!data->single_pass_armed || data->last_node == pcbt::kUnexplored) {
+    return false;
+  }
   symafl_single_pass_control *control = data->single_pass_control;
   uint32_t count = __atomic_load_n(&control->event_count, __ATOMIC_ACQUIRE);
   bool overflow = __atomic_load_n(&control->overflow, __ATOMIC_ACQUIRE) ||
@@ -455,15 +478,14 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
   data->single_pass_captures += 1;
   fprintf(stderr,
           "[pcbt-trace] %s mode=suffix skip=%u events=%zu created=%u\n",
-          fname, data->last_node->depth, events.size(), created);
+          fname, data->tree.depth(data->last_node), events.size(), created);
   disarm_capture(data);
-  selfcheck(data, buf, buf_size);
   return true;
 }
 
 static bool replay_pipe_suffix(my_mutator_t *data, const u8 *buf,
                                size_t buf_size, const char *fname,
-                               pcbt::Node *node, uint8_t dir) {
+                               pcbt::NodeRef node, uint8_t dir) {
   arm_pipe_suffix_capture(data, node, dir);
   afl_fsrv_write_to_testcase(&data->afl->fsrv, const_cast<u8 *>(buf), buf_size);
   fsrv_run_result_t result = afl_fsrv_run_target(&data->afl->fsrv,
@@ -495,12 +517,13 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
   if (data->bootstrap_done || !data->single_pass_armed) return;
   uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
                                   __ATOMIC_ACQUIRE);
-  if (mode == SYMAFL_TRACE_SUFFIX_SHM && data->last_node) {
+  if (mode == SYMAFL_TRACE_SUFFIX_SHM &&
+      data->last_node != pcbt::kUnexplored) {
     (void)insert_suffix_capture(data, nullptr, 0, "bootstrap");
   } else if (mode == SYMAFL_TRACE_FULL_STREAM) {
     (void)insert_full_stream(data, nullptr, 0, "bootstrap");
   }
-  data->last_node = nullptr;
+  data->last_node = pcbt::kUnexplored;
 }
 
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
@@ -523,7 +546,7 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   }
   uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
                                   __ATOMIC_ACQUIRE);
-  pcbt::Node *node = data->last_node;
+  pcbt::NodeRef node = data->last_node;
   uint8_t dir = data->last_dir;
   bool inserted = mode == SYMAFL_TRACE_SUFFIX_SHM
       ? insert_suffix_capture(data, buf.data(), buf.size(), fname)
@@ -532,7 +555,7 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
             : mode == SYMAFL_TRACE_FULL_STREAM
                   ? insert_full_stream(data, buf.data(), buf.size(), fname)
                   : false;
-  if (!inserted && node) {
+  if (!inserted && node != pcbt::kUnexplored) {
     (void)replay_pipe_suffix(data, buf.data(), buf.size(), fname, node, dir);
   }
   data->last_gained = true;
@@ -546,12 +569,15 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
 extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                           size_t buf_size, u8 **out_buf) {
   // rCnt bookkeeping for the previously admitted candidate
-  if (data->last_node) {
-    if (!data->last_gained) data->last_node->rCnt[data->last_dir] += 1;
+  if (data->last_node != pcbt::kUnexplored) {
+    if (!data->last_gained) {
+      uint8_t &count = data->tree.retry_count(data->last_node, data->last_dir);
+      if (count != UINT8_MAX) count += 1;
+    }
     if (data->single_pass_armed) {
       disarm_capture(data);
     }
-    data->last_node = nullptr;
+    data->last_node = pcbt::kUnexplored;
   }
 
   if (!data->screening) {
@@ -560,7 +586,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   }
 
   data->screened += 1;
-  pcbt::Node *node = nullptr;
+  pcbt::NodeRef node = pcbt::kUnexplored;
   uint8_t dir = 0;
   if (data->tree.CheckInput(buf, (uint32_t)buf_size, &node, &dir,
                             data->rlimit)) {
@@ -571,7 +597,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     // pipe-full. Thereafter a candidate has an established frontier and uses
     // SHM. The pipe is reserved for data that is known to be consumed: the
     // bootstrap trace or an overflow replay after AFL++ confirms a gain.
-    if (!data->bootstrap_done || !node) {
+    if (!data->bootstrap_done || node == pcbt::kUnexplored) {
       data->last_node = node;
       data->last_dir = dir;
       arm_full_capture(data);
@@ -602,16 +628,20 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
 }
 
 extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
-  static char buf[512];
+  static char buf[768];
   const pcbt::Tree &t = data->tree;
   snprintf(buf, sizeof(buf),
-           "traces=%llu nodes=%llu depth=%llu conflicts=%llu "
+           "traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu opaque=%llu "
            "failed=%llu timeouts=%llu memerr=%llu "
            "screened=%llu admitted=%llu vetoed=%llu saturated=%llu "
-           "selfcheck_fail=%llu single_pass=%llu single_pass_overflow=%llu",
+           "single_pass=%llu single_pass_overflow=%llu "
+           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
+           "veto_terminal=%llu veto_rlimit=%llu",
            (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
+           (unsigned long long)t.num_pred_nodes(),
            (unsigned long long)t.max_depth,
            (unsigned long long)t.num_conflicts,
+           (unsigned long long)t.num_opaque,
            (unsigned long long)data->failed_runs,
            (unsigned long long)data->trace_timeouts,
            (unsigned long long)data->memerr_events,
@@ -619,8 +649,13 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)data->admitted,
            (unsigned long long)data->vetoed,
            (unsigned long long)(data->screening ? 0 : 1),
-           (unsigned long long)data->selfcheck_fail,
            (unsigned long long)data->single_pass_captures,
-           (unsigned long long)data->single_pass_overflows);
+           (unsigned long long)data->single_pass_overflows,
+           (unsigned long long)t.check_admit_empty,
+           (unsigned long long)t.check_admit_opaque,
+           (unsigned long long)t.check_admit_eval_failure,
+           (unsigned long long)t.check_admit_frontier,
+           (unsigned long long)t.check_veto_terminal,
+           (unsigned long long)t.check_veto_rlimit);
   return buf;
 }

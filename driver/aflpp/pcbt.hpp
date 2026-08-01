@@ -1,24 +1,14 @@
 // Path Constraint Binary Tree (PCBT) for SymAFL v2.
 //
-// A binary decision trie over symbolic-branch outcomes. Node N represents
-// one branch decision point (compile-time id `cid`, predicate over input
-// bytes); N->child[d] is the next decision node observed after outcome d.
-// The virtual root's child[0] is the entry slot: the first symbolic branch
-// of the program (deterministic targets always reach the same first
-// symbolic branch, so all traces enter through one node).
-//
-// An edge is either unexplored, points at the next symbolic node, or is a
-// terminal edge: it has been observed to complete without another symbolic
-// condition. `child[d] == nullptr && terminal[d]` denotes the latter.
-//
-// CheckInput: walk from the root evaluating each node's predicate against
-// the candidate's bytes; the first missing child on the evaluated
-// direction is a frontier — the candidate is admitted unless that
-// direction's low-value counter (rCnt) is saturated.
+// A binary decision trie over symbolic-branch outcomes. Nodes live in a
+// contiguous Tree-owned arena and refer to children by 32-bit NodeRef values:
+// 0 is unexplored and 1 is the single global terminal node. The virtual root
+// has no predicate; root.child[0] is the entry slot for the first condition.
 #pragma once
 
+#include <array>
 #include <cstdint>
-#include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "dfsan/dfsan.h"
@@ -26,14 +16,17 @@
 
 namespace pcbt {
 
+using NodeRef = uint32_t;
+constexpr NodeRef kUnexplored = 0;
+constexpr NodeRef kTerminal = 1;
+constexpr NodeRef kRoot = 2;
+
 struct Node {
-  uint32_t cid = 0;                     // compile-time branch id
-  Predicate pred;                       // branch predicate (arena view)
-  Node *child[2] = {nullptr, nullptr};  // child[d]: next decision after d
-  bool terminal[2] = {false, false};    // explored edge with no next node
-  uint32_t rCnt[2] = {0, 0};            // non-gaining admissions per direction
-  uint32_t id = 0;                      // stable node id
-  uint32_t depth = 0;                   // symbolic depth; root's children = 1
+  uint32_t cid = 0;  // compile-time branch id
+  Predicate pred;    // root view into Tree::pred_arena_
+  NodeRef child[2] = {kUnexplored, kUnexplored};
+  uint32_t depth = 0;                // root's children = 1
+  uint8_t rCnt[2] = {0, 0};          // non-gaining admissions per direction
 };
 
 struct Event {
@@ -44,37 +37,33 @@ struct Event {
 
 class Tree {
  public:
-  Tree() = default;
+  Tree();
 
   // Insert one full branch-event path. The union table must still hold this
-  // run's content (predicates are materialized inline). Returns the number
-  // of new nodes created (0 = nothing new / conflict / failure).
+  // run's content. Returns the number of new topology nodes created.
   uint32_t InsertTrace(const std::vector<Event> &events,
                        const dfsan_label_info *table,
                        size_t table_labels);
 
-  // Insert the event suffix known to follow parent->child[direction]. The
-  // caller has already established the PCBT prefix during screening, so this
-  // performs no root replay or prefix matching. An empty suffix marks that
-  // edge terminal.
-  uint32_t InsertSuffix(Node *parent, uint8_t direction,
+  // Insert the suffix known to follow parent.child[direction]. The caller has
+  // already established the PCBT prefix during screening, so this performs no
+  // root replay or prefix matching. An empty suffix records the terminal node.
+  uint32_t InsertSuffix(NodeRef parent, uint8_t direction,
                         const std::vector<Event> &events,
                         const dfsan_label_info *table, size_t table_labels);
 
-  // Screen a candidate. Returns true to admit; on admission *out_node /
-  // *out_dir identify the frontier (for rCnt bookkeeping and suffix skip
-  // depth via Node::depth). Terminal edges are already explored and vetoed.
-  // rlimit is the maximum non-gaining admissions per frontier direction.
-  bool CheckInput(const uint8_t *input, uint32_t len, Node **out_node,
-                  uint8_t *out_dir, uint32_t rlimit);
+  // Screen a candidate. On admission, *out_node / *out_dir identify an
+  // unexplored frontier for retry bookkeeping and suffix skip depth. Terminal
+  // edges are already explored and vetoed.
+  bool CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
+                  uint8_t *out_dir, uint8_t rlimit);
 
-  // True when every evaluable path through the current tree ends at an
-  // explored edge or an rCnt-pruned frontier. Opaque predicates deliberately
-  // keep screening alive: their inputs must remain conservatively admitted.
-  bool IsSaturated(uint32_t rlimit) const;
-
-  const Node *root() const { return &root_; }
-  Node *root() { return &root_; }
+  bool IsSaturated(uint8_t rlimit) const;
+  uint32_t depth(NodeRef ref) const { return node(ref).depth; }
+  uint64_t num_pred_nodes() const { return pred_arena_.nodes.size(); }
+  uint8_t &retry_count(NodeRef ref, uint8_t direction) {
+    return node(ref).rCnt[direction];
+  }
 
   // stats
   uint64_t num_nodes = 0;
@@ -83,13 +72,24 @@ class Tree {
   uint64_t num_conflicts = 0;
   uint64_t num_opaque = 0;
   uint64_t max_depth = 0;
+  uint64_t check_admit_empty = 0;
+  uint64_t check_admit_opaque = 0;
+  uint64_t check_admit_eval_failure = 0;
+  uint64_t check_admit_frontier = 0;
+  uint64_t check_veto_terminal = 0;
+  uint64_t check_veto_rlimit = 0;
+  std::array<uint64_t, kPredErrorCount> opaque_by_error{};
+  std::unordered_map<uint16_t, uint64_t> opaque_by_op;
 
  private:
-  Node root_;  // virtual root: no predicate; child[0] = entry slot
-  std::vector<std::unique_ptr<Node>> arena_;
-  uint32_t next_id_ = 1;
+  Node &node(NodeRef ref) { return nodes_[ref]; }
+  const Node &node(NodeRef ref) const { return nodes_[ref]; }
+  NodeRef append(Node &&node);
+  bool IsSaturated(NodeRef ref, uint8_t rlimit) const;
 
-  bool IsSaturated(const Node *node, uint32_t rlimit) const;
+  // Index 1 is a global terminal node; index 2 is the virtual root.
+  std::vector<Node> nodes_;
+  PredArena pred_arena_;
 };
 
 }  // namespace pcbt
