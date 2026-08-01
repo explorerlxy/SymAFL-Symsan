@@ -53,6 +53,29 @@
 
 using namespace __dfsan;
 
+// Lazily clear a freshly-allocated region's shadow instead of eagerly zeroing
+// it. The shadow mapping is mapped no-reserve (demand-zero), so a fresh
+// allocation's shadow pages are already zero and must not be faulted in.
+// MADV_DONTNEED releases any stale shadow pages left by a previous owner
+// without touching them, so the next access demand-faults zeros. Eager
+// memset of 4x the allocation size made liblzma's 64MB LZMA dictionary cost
+// ~256MB of shadow writes (~68K page faults, ~80ms) on every target child.
+static inline void clear_shadow_range(void *ptr, size_t bytes) {
+  if (!ptr || !bytes) return;
+  // shadow_for() is not page-aligned; MADV_DONTNEED requires a page-aligned
+  // range, so round to the enclosing pages before advising.
+  uptr page = GetPageSizeCached();
+  uptr start = (uptr)__dfsan::shadow_for(ptr);
+  uptr len = bytes * sizeof(dfsan_label);
+  uptr adv_start = RoundDownTo(start, page);
+  uptr adv_end = RoundUpTo(start + len, page);
+  if (madvise((void *)adv_start, adv_end - adv_start, MADV_DONTNEED) != 0) {
+    // Fallback for an unmapped or unsupported shadow tail: eager zeroing
+    // keeps the shadow correct, at the cost of faulting the pages.
+    internal_memset((void *)start, 0, len);
+  }
+}
+
 #define CALL_WEAK_INTERCEPTOR_HOOK(f, ...)                                     \
   do {                                                                         \
     if (f)                                                                     \
@@ -3640,7 +3663,7 @@ __dfsw_realloc(void *ptr, size_t new_size,
   *ret_label = 0;
 
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size);
+    clear_shadow_range(ret, new_size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, new_size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + new_size);
@@ -3684,7 +3707,7 @@ __dfsw___libc_realloc(void *ptr, size_t new_size,
   void *ret = malloc(new_size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size);
+    clear_shadow_range(ret, new_size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, new_size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + new_size);
@@ -3732,7 +3755,7 @@ void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
   void *ret = calloc(nmemb, new_size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
+    clear_shadow_range(ret, new_size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
@@ -3779,7 +3802,7 @@ void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
   }
   void *ret = calloc(nmemb, new_size);
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * new_size * nmemb);
+    clear_shadow_range(ret, new_size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, new_size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (new_size * nmemb));
@@ -3827,7 +3850,7 @@ void *__dfsw_calloc(size_t nmemb, size_t size,
   void *ret = calloc(nmemb, size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
+    clear_shadow_range(ret, size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (size * nmemb));
@@ -3851,7 +3874,7 @@ void *__dfsw___libc_calloc(size_t nmemb, size_t size,
   void *ret = calloc(nmemb, size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size * nmemb);
+    clear_shadow_range(ret, size * nmemb);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(nmemb_label, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + (size * nmemb));
@@ -3870,7 +3893,7 @@ void *__dfsw_malloc(size_t size, dfsan_label size_label,
   void *ret = malloc(size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -3888,7 +3911,7 @@ void *__dfsw___libc_malloc(size_t size, dfsan_label size_label,
   void *ret = malloc(size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -3907,7 +3930,7 @@ void *__dfsw_aligned_alloc(size_t alignment, size_t size,
   void *ret = aligned_alloc(alignment, size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -3926,7 +3949,7 @@ int __dfsw_posix_memalign(void **memptr, size_t alignment, size_t size,
   int ret = posix_memalign(memptr, alignment, size);
   *ret_label = 0;
   if (!ret && memptr && *memptr) {
-    internal_memset(shadow_for(*memptr), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(*memptr, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(*memptr) * 8,
           (uint64_t)(*memptr), (uint64_t)(*memptr) + size);
@@ -3943,7 +3966,7 @@ void *__dfsw_valloc(size_t size, dfsan_label size_label, dfsan_label *ret_label)
   void *ret = valloc(size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -3960,7 +3983,7 @@ void *__dfsw___libc_valloc(size_t size, dfsan_label size_label, dfsan_label *ret
   void *ret = valloc(size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -3978,7 +4001,7 @@ void *__dfsw_memalign(size_t alignment, size_t size, dfsan_label alignment_label
   void *ret = memalign(alignment, size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -3996,7 +4019,7 @@ void *__dfsw___libc_memalign(size_t alignment, size_t size, dfsan_label alignmen
   void *ret = memalign(alignment, size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -4013,7 +4036,7 @@ void *__dfsw_pvalloc(size_t size, dfsan_label size_label, dfsan_label *ret_label
   void *ret = pvalloc(size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
@@ -4030,7 +4053,7 @@ void *__dfsw___libc_pvalloc(size_t size, dfsan_label size_label, dfsan_label *re
   void *ret = pvalloc(size);
   *ret_label = 0;
   if (ret) {
-    internal_memset(shadow_for(ret), 0, sizeof(dfsan_label) * size);
+    clear_shadow_range(ret, size);
     if (flags().trace_bounds) {
       dfsan_label bound = dfsan_union(0, size_label, Alloca, sizeof(ret) * 8,
           (uint64_t)ret, (uint64_t)ret + size);
