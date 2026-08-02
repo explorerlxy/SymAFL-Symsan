@@ -21,20 +21,6 @@ struct ConvertFrame {
 };
 }  // namespace
 
-// Maximum input length a predicate needs to be fully defined: the highest
-// byte it reads. 0 for opaque/empty predicates. The PCBT treats the input
-// length as a first-class constraint: a candidate shorter than this cannot
-// be evaluated through the node, so it is screened in a shallower subtree.
-uint32_t pred_read_extent(const Predicate &pred) {
-  if (pred.opaque) return 0;
-  uint32_t max_byte = 0;
-  for (const auto &r : pred.reads) {
-    uint32_t extent = r.first + r.second;  // exclusive upper bound
-    if (extent > max_byte) max_byte = extent;
-  }
-  return max_byte;
-}
-
 void EvalContext::Reset() {
   stack_.clear();
   if (++generation_ == 0) {
@@ -203,14 +189,6 @@ uint32_t RunConverter::convert(uint32_t label) {
 
 uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
                                   uint32_t op_lo) {
-  // The input-length symbol created by __dfsw_fread on the tainted input.
-  // It has no children and evaluates to the candidate's actual length, so
-  // the PCBT can branch on length directly (different-length testcases take
-  // different subtrees) instead of embedding a per-run concrete length.
-  if (op == __dfsan::fsize) {
-    uint16_t bits = (info->size == 0 || info->size > 64) ? 64 : info->size;
-    return add(PKind::Len, bits, kNoChild, kNoChild, 0);
-  }
   // fmemcmp's size is a byte count, unlike ordinary label widths.  The DFSan
   // runtime copies up to eight concrete bytes into op1/op2, so this scalar
   // PCBT grammar can model exactly the byte range it records.  Its canonical
@@ -470,7 +448,6 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
           v |= (uint64_t)input[nd.value + k] << (8 * k);
         break;
       }
-      case PKind::Len: v = mask_bits((uint64_t)len, bits); break;
       case PKind::Const: v = mask_bits(nd.value, bits); break;
       case PKind::Add: v = mask_bits(a + b, bits); break;
       case PKind::Sub: v = mask_bits(a - b, bits); break;

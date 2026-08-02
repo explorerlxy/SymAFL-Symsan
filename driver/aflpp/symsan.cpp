@@ -377,7 +377,6 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "admitted=%llu vetoed=%llu saturated=%llu "
           "single_pass=%llu single_pass_overflow=%llu "
           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
-          "admit_too_short=%llu "
           "veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
           "replay_ns=%llu replay_calls=%llu\n",
@@ -399,7 +398,6 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.check_admit_opaque,
           (unsigned long long)t.check_admit_eval_failure,
           (unsigned long long)t.check_admit_frontier,
-          (unsigned long long)t.check_admit_too_short,
           (unsigned long long)t.check_veto_terminal,
           (unsigned long long)t.check_veto_rlimit,
           (unsigned long long)data->veto_probe_admitted,
@@ -851,8 +849,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "screened=%llu admitted=%llu vetoed=%llu saturated=%llu "
            "single_pass=%llu single_pass_overflow=%llu "
            "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
-           "admit_too_short=%llu "
-           "veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
+            "veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
            "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
            "replay_ns=%llu replay_calls=%llu",
            (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
@@ -873,8 +870,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)t.check_admit_opaque,
            (unsigned long long)t.check_admit_eval_failure,
            (unsigned long long)t.check_admit_frontier,
-           (unsigned long long)t.check_admit_too_short,
-           (unsigned long long)t.check_veto_terminal,
+            (unsigned long long)t.check_veto_terminal,
            (unsigned long long)t.check_veto_rlimit,
            (unsigned long long)data->veto_probe_admitted,
            (unsigned long long)data->veto_probe_gained,

@@ -3393,16 +3393,6 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
       for (size_t i = 0; i < ret * size; i++) {
         dfsan_set_label(get_label_for(fd, offset + i), (char *)ptr + i, 1);
       }
-      // SymAFL v2 (SYMAFL_TAINT_LENGTH=1): the byte count read from the
-      // tainted input is itself a symbolic state (the input length). Labeling
-      // the return value with a stable fsize symbol makes length-derived
-      // branches structural predicates so the PCBT can split testcases by
-      // length. Off by default: tainting the length also makes loop bounds
-      // over the input symbolic, which changes trace shape (regressed the
-      // pipe-stress fixture), so it is opt-in until the semantics settle.
-      if (size == 1 && getenv("SYMAFL_TAINT_LENGTH")) {
-        *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, 0, 0);
-      }
     } else {
       dfsan_set_label(0, ptr, ret * size);
     }
