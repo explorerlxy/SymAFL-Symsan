@@ -27,6 +27,11 @@ struct Node {
   NodeRef child[2] = {kUnexplored, kUnexplored};
   uint32_t depth = 0;                // root's children = 1
   uint8_t rCnt[2] = {0, 0};          // non-gaining admissions per direction
+  // Length bound: the predicate reads input bytes only up to min_len-1, so a
+  // candidate shorter than min_len cannot be evaluated through this node. The
+  // input length is a first-class constraint: a candidate whose length does
+  // not cover a node's reads is screened in a different (shallower) subtree.
+  uint32_t min_len = 0;
 };
 
 struct Event {
@@ -110,6 +115,7 @@ class Tree {
   uint64_t check_admit_frontier = 0;
   uint64_t check_veto_terminal = 0;
   uint64_t check_veto_rlimit = 0;
+  uint64_t check_admit_too_short = 0;  // candidate shorter than node's reads
   std::array<uint64_t, kPredErrorCount> opaque_by_error{};
   std::unordered_map<uint16_t, uint64_t> opaque_by_op;
 

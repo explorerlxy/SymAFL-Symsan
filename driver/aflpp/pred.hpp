@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -27,6 +28,7 @@ namespace pcbt {
 enum class PKind : uint8_t {
   Opaque = 0,
   Read,   // input bytes: value=byte offset, nbytes=bits/8 (little-endian)
+  Len,    // the input length (fsize symbol); eval resolves to candidate len
   Const,  // value=constant (masked to bits)
   Add, Sub, Mul, UDiv, SDiv, URem, SRem, Neg,
   Not, And, Or, Xor, Shl, LShr, AShr,
@@ -126,7 +128,13 @@ class EvalContext {
   void Reset();
 
  private:
-  std::unordered_map<uint32_t, uint64_t> values_;
+  // Flat value cache addressed by arena node index: stamps_[i] == generation_
+  // marks values_[i] valid for the current candidate input.  Reset() advances
+  // the generation so a slot surviving from an earlier input or from a
+  // rolled-back arena region is never read as valid.
+  std::vector<uint64_t> values_;
+  std::vector<uint32_t> stamps_;
+  uint32_t generation_ = 1;
   std::vector<std::pair<uint32_t, bool>> stack_;
   friend bool eval_predicate(const PredArena &, const Predicate &,
                              const uint8_t *, uint32_t, uint64_t *,
@@ -140,5 +148,11 @@ class EvalContext {
 bool eval_predicate(const PredArena &arena, const Predicate &pred,
                     const uint8_t *input, uint32_t len, uint64_t *out,
                     EvalContext *context = nullptr);
+
+// Maximum input length a predicate needs to be fully defined (highest byte
+// it reads; 0 for opaque/empty). The input length is a first-class PCBT
+// constraint: candidates shorter than a node's extent cannot be evaluated
+// through it and are screened in a shallower subtree.
+uint32_t pred_read_extent(const Predicate &pred);
 
 }  // namespace pcbt

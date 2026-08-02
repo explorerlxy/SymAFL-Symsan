@@ -49,6 +49,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     new_node.cid = events[i].cid;
     new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
     new_node.pred = conv.conv(events[i].label);
+    new_node.min_len = pred_read_extent(new_node.pred);
     if (new_node.pred.opaque) {
       num_opaque += 1;
       opaque_by_error[static_cast<size_t>(new_node.pred.error)] += 1;
@@ -94,6 +95,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     new_node.cid = event.cid;
     new_node.depth = node(cur).depth + 1;
     new_node.pred = conv.conv(event.label);
+    new_node.min_len = pred_read_extent(new_node.pred);
     if (new_node.pred.opaque) {
       num_opaque += 1;
       opaque_by_error[static_cast<size_t>(new_node.pred.error)] += 1;
@@ -127,6 +129,16 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
   eval.Reset();
   while (true) {
     const Node &current = node(cur);
+    // The input length is a first-class constraint: a candidate shorter than
+    // this node's predicate reads is in a different (shallower) subtree and
+    // cannot be screened through it. Admit conservatively instead of
+    // evaluating an out-of-range read.
+    if (current.min_len > len) {
+      *out_node = kUnexplored;
+      *out_dir = 0;
+      check_admit_too_short += 1;
+      return true;
+    }
     if (current.pred.opaque) {
       *out_node = kUnexplored;
       *out_dir = 0;

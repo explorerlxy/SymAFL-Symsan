@@ -1,6 +1,8 @@
 #include "pred.hpp"
 
 #include <algorithm>
+#include <functional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -19,9 +21,26 @@ struct ConvertFrame {
 };
 }  // namespace
 
+// Maximum input length a predicate needs to be fully defined: the highest
+// byte it reads. 0 for opaque/empty predicates. The PCBT treats the input
+// length as a first-class constraint: a candidate shorter than this cannot
+// be evaluated through the node, so it is screened in a shallower subtree.
+uint32_t pred_read_extent(const Predicate &pred) {
+  if (pred.opaque) return 0;
+  uint32_t max_byte = 0;
+  for (const auto &r : pred.reads) {
+    uint32_t extent = r.first + r.second;  // exclusive upper bound
+    if (extent > max_byte) max_byte = extent;
+  }
+  return max_byte;
+}
+
 void EvalContext::Reset() {
-  values_.clear();
   stack_.clear();
+  if (++generation_ == 0) {
+    std::fill(stamps_.begin(), stamps_.end(), 0);
+    generation_ = 1;
+  }
 }
 
 const char *pred_error_name(PredError error) {
@@ -184,6 +203,14 @@ uint32_t RunConverter::convert(uint32_t label) {
 
 uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
                                   uint32_t op_lo) {
+  // The input-length symbol created by __dfsw_fread on the tainted input.
+  // It has no children and evaluates to the candidate's actual length, so
+  // the PCBT can branch on length directly (different-length testcases take
+  // different subtrees) instead of embedding a per-run concrete length.
+  if (op == __dfsan::fsize) {
+    uint16_t bits = (info->size == 0 || info->size > 64) ? 64 : info->size;
+    return add(PKind::Len, bits, kNoChild, kNoChild, 0);
+  }
   // fmemcmp's size is a byte count, unlike ordinary label widths.  The DFSan
   // runtime copies up to eight concrete bytes into op1/op2, so this scalar
   // PCBT grammar can model exactly the byte range it records.  Its canonical
@@ -393,13 +420,22 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
     context = &local_context;
     context->Reset();
   }
+  // A post-order arena keeps every reachable child below its parent, so the
+  // whole root-reachable DAG fits in [0, pred.root]; size the cache once per
+  // root instead of growing per node.  The arrays only grow; Reset() changes
+  // generation_ rather than clearing them.
+  if (context->stamps_.size() <= pred.root) {
+    context->values_.resize(pred.root + 1, 0);
+    context->stamps_.resize(pred.root + 1, 0);
+  }
+  const uint32_t stamp = context->generation_;
   context->stack_.push_back({pred.root, false});
 
   while (!context->stack_.empty()) {
     auto frame = context->stack_.back();
     context->stack_.pop_back();
-    if (context->values_.find(frame.first) != context->values_.end()) continue;
     if (frame.first >= nodes.size()) return false;
+    if (context->stamps_[frame.first] == stamp) continue;
     const PNode &nd = nodes[frame.first];
     if (!frame.second) {
       context->stack_.push_back({frame.first, true});
@@ -410,14 +446,16 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
 
     uint64_t a = 0, b = 0;
     if (nd.a != kNoChild) {
-      auto it = context->values_.find(nd.a);
-      if (it == context->values_.end()) return false;
-      a = it->second;
+      if (nd.a >= context->stamps_.size() ||
+          context->stamps_[nd.a] != stamp)
+        return false;
+      a = context->values_[nd.a];
     }
     if (nd.b != kNoChild) {
-      auto it = context->values_.find(nd.b);
-      if (it == context->values_.end()) return false;
-      b = it->second;
+      if (nd.b >= context->stamps_.size() ||
+          context->stamps_[nd.b] != stamp)
+        return false;
+      b = context->values_[nd.b];
     }
     uint16_t bits = nd.bits;
     uint64_t v;
@@ -432,6 +470,7 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
           v |= (uint64_t)input[nd.value + k] << (8 * k);
         break;
       }
+      case PKind::Len: v = mask_bits((uint64_t)len, bits); break;
       case PKind::Const: v = mask_bits(nd.value, bits); break;
       case PKind::Add: v = mask_bits(a + b, bits); break;
       case PKind::Sub: v = mask_bits(a - b, bits); break;
@@ -513,11 +552,11 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
       case PKind::Sge: v = (sext_bits(a, bits) >= sext_bits(b, bits)); break;
       default: return false;
     }
-    context->values_.emplace(frame.first, v);
+    context->values_[frame.first] = v;
+    context->stamps_[frame.first] = stamp;
   }
-  auto root = context->values_.find(pred.root);
-  if (root == context->values_.end()) return false;
-  *out = root->second;
+  if (context->stamps_[pred.root] != stamp) return false;
+  *out = context->values_[pred.root];
   return true;
 }
 
