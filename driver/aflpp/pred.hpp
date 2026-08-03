@@ -70,6 +70,12 @@ struct PredArena {
   std::vector<PNode> nodes;  // post-order by label (children before parents)
 };
 
+// One byte of a string content label expanded for the scalar interpreter.
+struct StringByte {
+  uint32_t node;    // arena node evaluating this byte (PKind::Read)
+  uint32_t offset;  // input byte offset this Read samples
+};
+
 struct Predicate {
   uint32_t root = 0;
   bool opaque = false;
@@ -117,6 +123,24 @@ class RunConverter {
   uint8_t child_count(const dfsan_label_info *info, uint32_t op,
                       uint32_t op_lo) const;
   void fail(PredError error, uint16_t op = 0);
+
+  // String/FP byte-level lowering (goal 2). These expand a string-op label or
+  // an FP comparison into scalar bit-vector nodes, keeping the predicate
+  // input-dependent (never using the label's concrete op1/op2 as a constant).
+  bool string_bytes(dfsan_label content, size_t max_bytes,
+                    std::vector<StringByte> &out);
+  bool collect_byte_offsets(dfsan_label label, size_t cap,
+                            std::vector<uint64_t> &offs);
+  uint32_t convert_strlen_cmp(const dfsan_label_info *info, uint32_t op,
+                              const dfsan_label_info &strlen_info);
+  uint32_t convert_strchr_cmp(const dfsan_label_info *info, uint32_t op,
+                              const dfsan_label_info &chr_info);
+  uint32_t convert_strstr_cmp(const dfsan_label_info *info, uint32_t op,
+                              const dfsan_label_info &strstr_info);
+  uint32_t convert_fcmp(const dfsan_label_info *info, uint32_t op);
+  uint32_t fp_is_nan(uint32_t a, uint16_t w);
+  uint32_t fp_is_zero(uint32_t a, uint16_t w);
+  uint32_t fp_total_order(uint32_t a, uint16_t w);
 };
 
 // A context shares values across root evaluations for one candidate.  PCBT

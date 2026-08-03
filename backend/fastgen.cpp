@@ -176,11 +176,30 @@ __taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
-__taint_trace_indcall(dfsan_label label) {
+__taint_trace_indcall(dfsan_label label, uint64_t target, uint32_t cid) {
   if (label == 0)
     return;
 
-  AOUT("tainted indirect call target: %d\n", label);
+  void *addr = __builtin_return_address(0);
+
+  if (label == kInitializingLabel) {
+    AOUT("WARNING: uninitialized label %u @%p\n", label, addr);
+    if (flags().solve_ub) __send_ubi(label, target, cid, addr);
+    if (flags().exit_on_memerror) Die();
+    else return;
+  }
+
+  AOUT("tainted indirect call/indirectbr target: %d = 0x%llx cid 0x%x\n",
+       label, (unsigned long long)target, cid);
+
+  // SymAFL v2: pin the tainted jump target to its observed concrete address
+  // so the PCBT diverges when a mutated input reaches a different target.
+  if (flags().taint_trace_addr_cond) {
+    dfsan_label eq =
+        dfsan_union(label, 0, (bveq << 8) | ICmp, 64, target, target);
+    if (eq != 0 && eq != kInitializingLabel)
+      __taint_send_cond(eq, 1, 0, 0, cid, addr);
+  }
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -206,6 +225,26 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
     if (flags().solve_ub) __send_ubi(ptr_label, ptr, cid, addr);
     if (flags().exit_on_memerror) Die();
     else return;
+  }
+
+  // SymAFL v2: pin the tainted index to its observed concrete value so the
+  // PCBT diverges when a mutated input selects a different array element.
+  // Reuses cond_type + PKind::Equal (bveq); PCBT consumes it as an ordinary
+  // branch node (result is always 1 for the traced run). Emitted through
+  // __taint_send_cond (all transport modes), unlike the gep pipe frame which
+  // is suppressed under SUFFIX_SHM by IsTraceStreamEnabled().
+  if (flags().taint_trace_addr_cond) {
+    dfsan_label_info *idx_info = get_label_info(index_label);
+    uint16_t width = idx_info->size;
+    if (width != 0 && width <= 64) {
+      uint64_t k = (width == 64)
+                       ? (uint64_t)index
+                       : ((uint64_t)index & ((1ULL << width) - 1));
+      dfsan_label eq =
+          dfsan_union(index_label, 0, (bveq << 8) | ICmp, width, k, k);
+      if (eq != 0 && eq != kInitializingLabel)
+        __taint_send_cond(eq, 1, 0, 0, cid, addr);
+    }
   }
 
   AOUT("tainted GEP index: %ld = %d, ne: %ld, es: %ld, offset: %ld\n",

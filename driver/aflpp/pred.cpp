@@ -14,6 +14,11 @@ namespace {
 constexpr uint32_t kNoChild = UINT32_MAX;
 constexpr uint32_t kInvalidNode = UINT32_MAX;
 constexpr size_t kMaxPredicateNodes = 2'000'000;
+// Byte-level expansion caps for string-op lowering (goal 2).  Exceeding the
+// cap marks the predicate opaque (conservative admission) rather than blowing
+// the shared arena budget.
+constexpr size_t kMaxStrlenBytes = 256;
+constexpr size_t kMaxSearchBytes = 512;
 
 struct ConvertFrame {
   uint32_t label;
@@ -100,10 +105,10 @@ uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
       op_lo == Neg || op_lo == Not || op_lo == ZExt || op_lo == SExt)
     return 1;
   if (op == __dfsan::Concat || is_fmemcmp(op) || op_lo == ICmp ||
-      op_lo == Add || op_lo == Sub || op_lo == Mul || op_lo == UDiv ||
-      op_lo == SDiv || op_lo == URem || op_lo == SRem || op_lo == Shl ||
-      op_lo == LShr || op_lo == AShr || op_lo == And || op_lo == Or ||
-      op_lo == Xor)
+      op_lo == FCmp || op_lo == Add || op_lo == Sub || op_lo == Mul ||
+      op_lo == UDiv || op_lo == SDiv || op_lo == URem || op_lo == SRem ||
+      op_lo == Shl || op_lo == LShr || op_lo == AShr || op_lo == And ||
+      op_lo == Or || op_lo == Xor)
     return 2;
   return 0;
 }
@@ -147,6 +152,16 @@ uint32_t RunConverter::convert(uint32_t label) {
       }
       stack.push_back({frame.label, true});
       uint8_t count = child_count(info, op, op_lo);
+      // String-op vs constant comparisons (fstrlen/fstrchr/fstrstr) are
+      // expanded inline into byte reads; the string-op operand is NOT a child
+      // (converting it would hit UnsupportedOp and poison the whole root).
+      if (op_lo == ICmp && info->l2 == 0 && info->l1 != 0 &&
+          info->l1 < table_labels_) {
+        uint16_t so = table_[info->l1].op & 0xff;
+        if (so == __dfsan::fstrlen || so == __dfsan::fstrchr ||
+            so == __dfsan::fstrrchr || so == __dfsan::fstrstr)
+          count = 0;
+      }
       if (count == 2 && info->l2 != 0) stack.push_back({info->l2, false});
       if (count >= 1 && info->l1 != 0) stack.push_back({info->l1, false});
       continue;
@@ -292,6 +307,18 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
       fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
       return kInvalidNode;
     }
+    // String-op vs constant comparison: expand into byte reads so the scalar
+    // interpreter can evaluate it (strlen > n, strchr/strstr != NULL).
+    if (info->l1 != 0 && info->l1 < table_labels_ && info->l2 == 0) {
+      const dfsan_label_info &so = table_[info->l1];
+      uint16_t so_op = so.op & 0xff;
+      if (so_op == __dfsan::fstrlen)
+        return convert_strlen_cmp(info, op, so);
+      if (so_op == __dfsan::fstrchr || so_op == __dfsan::fstrrchr)
+        return convert_strchr_cmp(info, op, so);
+      if (so_op == __dfsan::fstrstr)
+        return convert_strstr_cmp(info, op, so);
+    }
     uint32_t p = op >> 8;
     switch (p) {
       case bveq: kind = PKind::Equal; break;
@@ -313,6 +340,14 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     return a == kInvalidNode || b == kInvalidNode
                ? kInvalidNode : add(kind, size, a, b);
   }
+  if (op_lo == FCmp) {
+    // Lower an FP comparison to an integer comparison over the IEEE-754 bit
+    // patterns.  The FCmp label's op1/op2 carry the operands' concrete bits
+    // (dfsan.cpp exempts FCmp from symbolic-operand zeroing); a symbolic
+    // Load/Concat operand converts normally, a constant operand becomes a
+    // Const of the literal's bits.
+    return convert_fcmp(info, op);
+  }
   if (unary) {
     uint32_t a = conv_child(info->l1, info->op1.i, size);
     return a == kInvalidNode ? kInvalidNode : add(kind, size, a, kNoChild);
@@ -327,6 +362,341 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
   // FP ops, string ops, Arg/Free, fmemcmp, GEP artifacts, ... : unsupported
   fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
   return kInvalidNode;
+}
+
+// Collect the input byte offsets covered by a string content label (in
+// collection order; string_bytes sorts them).  Supports raw input bytes,
+// Load (consecutive input bytes, byte count in l2), Concat, and fsubstr
+// prefix mode (op2==0, first op1 bytes).  fsubstr suffix (op2==1, symbolic
+// start) and non-input trees return false -> caller marks opaque.
+bool RunConverter::collect_byte_offsets(dfsan_label label, size_t cap,
+                                        std::vector<uint64_t> &offs) {
+  if (offs.size() >= cap) return true;
+  if (label == 0 || label >= table_labels_) return false;
+  const dfsan_label_info &info = table_[label];
+  uint32_t op = info.op;
+  uint32_t op_lo = op & 0xff;
+  if (op == 0) {
+    if (offs.size() < cap) offs.push_back(info.op1.i);
+    return true;
+  }
+  if (op_lo == Load) {
+    if (info.l1 == 0 || info.l1 >= table_labels_ || info.l2 == 0 ||
+        info.l2 > cap || table_[info.l1].op != 0)
+      return false;
+    uint64_t start = table_[info.l1].op1.i;
+    for (uint64_t i = 0; i < info.l2; ++i) {
+      if (offs.size() >= cap) return true;
+      offs.push_back(start + i);
+    }
+    return true;
+  }
+  if (op_lo == Concat) {
+    return collect_byte_offsets(info.l1, cap, offs) &&
+           collect_byte_offsets(info.l2, cap, offs);
+  }
+  if (op_lo == fsubstr && info.op2.i == 0) {
+    // prefix mode: first op1 bytes of the content
+    if (!collect_byte_offsets(info.l1, cap, offs)) return false;
+    if (offs.size() > (size_t)info.op1.i) offs.resize((size_t)info.op1.i);
+    return true;
+  }
+  return false;
+}
+
+// Expand a content label into an ordered byte list (string position i ==
+// out[i]).  Only consecutive input-byte spans are supported; anything else is
+// rejected so the caller marks the predicate opaque (conservative admission).
+bool RunConverter::string_bytes(dfsan_label content, size_t max_bytes,
+                                std::vector<StringByte> &out) {
+  std::vector<uint64_t> offs;
+  if (!collect_byte_offsets(content, max_bytes, offs)) return false;
+  if (offs.empty() || offs.size() > max_bytes) return false;
+  std::sort(offs.begin(), offs.end());
+  for (size_t i = 0; i < offs.size(); ++i) {
+    if (i > 0 && offs[i] != offs[i - 1] + 1) return false;
+    uint32_t nd = add(PKind::Read, 8, kNoChild, kNoChild, offs[i]);
+    if (nd == kInvalidNode) return false;
+    out.push_back({nd, (uint32_t)offs[i]});
+  }
+  return true;
+}
+
+// strlen(s) OP n, expanded into byte-nonzero constraints over the string's
+// content bytes.  `strlen_info` is the fstrlen label (l1=0, l2=content,
+// op1=null_from_input, op2=concrete length).
+uint32_t RunConverter::convert_strlen_cmp(const dfsan_label_info *info,
+                                          uint32_t op,
+                                          const dfsan_label_info &si) {
+  uint32_t p = op >> 8;
+  uint64_t n = info->op2.i;
+  if (n == 0 && (p == bvuge || p == bvsge)) return add_const(1, 8);
+  if (n == 0 && (p == bvult || p == bvslt)) return add_const(0, 8);
+  // Programmatic NUL (null_from_input == 0): the length is concrete.
+  if (si.op1.i == 0) {
+    uint32_t len = add_const(si.op2.i, info->size);
+    uint32_t cnst = add_const(n, info->size);
+    PKind k;
+    switch (p) {
+      case bveq: k = PKind::Equal; break;
+      case bvneq: k = PKind::Distinct; break;
+      case bvugt: k = PKind::Ugt; break;
+      case bvuge: k = PKind::Uge; break;
+      case bvult: k = PKind::Ult; break;
+      case bvule: k = PKind::Ule; break;
+      case bvsgt: k = PKind::Sgt; break;
+      case bvsge: k = PKind::Sge; break;
+      case bvslt: k = PKind::Slt; break;
+      case bvsle: k = PKind::Sle; break;
+      default:
+        fail(PredError::UnsupportedCompare);
+        return kInvalidNode;
+    }
+    return add(k, info->size, len, cnst);
+  }
+  if (n > kMaxStrlenBytes) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  std::vector<StringByte> bytes;
+  if (!string_bytes(si.l2, kMaxStrlenBytes, bytes)) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  //  len > n  : bytes 0..n   all nonzero          (n+1 reads)
+  //  len >= n : bytes 0..n-1 all nonzero          (n reads)
+  //  len < n  : some byte 0..n-1 is zero          (n reads)
+  //  len <= n : some byte 0..n   is zero          (n+1 reads)
+  //  len == n : bytes 0..n-1 nonzero && byte n zero (n+1 reads)
+  //  len != n : some byte 0..n-1 zero || byte n nonzero (n+1 reads)
+  bool need_n1 = (p == bvugt || p == bvule || p == bveq || p == bvneq);
+  uint64_t need = need_n1 ? n + 1 : n;
+  if (need == 0 || need > bytes.size()) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  std::vector<uint32_t> zero(need), nz(need);
+  for (uint64_t i = 0; i < need; ++i) {
+    uint32_t c0 = add_const(0, 8);
+    zero[i] = add(PKind::Equal, 8, bytes[i].node, c0);
+    nz[i] = add(PKind::Distinct, 8, bytes[i].node, c0);
+  }
+  uint64_t lo = 0, hi = 0;
+  bool use_nz = false;
+  uint32_t extra = kInvalidNode;
+  switch (p) {
+    case bvugt: case bvsgt: lo = 0; hi = n; use_nz = true; break;
+    case bvuge: case bvsge: lo = 0; hi = n - 1; use_nz = true; break;
+    case bvult: case bvslt: lo = 0; hi = n - 1; use_nz = false; break;
+    case bvule: case bvsle: lo = 0; hi = n; use_nz = false; break;
+    case bveq: lo = 0; hi = n - 1; use_nz = true; extra = zero[n]; break;
+    case bvneq: lo = 0; hi = n - 1; use_nz = false; extra = nz[n]; break;
+    default:
+      fail(PredError::UnsupportedCompare);
+      return kInvalidNode;
+  }
+  uint32_t acc = kInvalidNode;
+  for (uint64_t i = lo; i <= hi; ++i) {
+    uint32_t t = use_nz ? nz[i] : zero[i];
+    acc = (acc == kInvalidNode)
+              ? t
+              : (use_nz ? add(PKind::And, 8, acc, t)
+                        : add(PKind::Or, 8, acc, t));
+  }
+  if (acc != kInvalidNode && extra != kInvalidNode) {
+    acc = (p == bveq) ? add(PKind::And, 8, acc, extra)
+                      : add(PKind::Or, 8, acc, extra);
+  }
+  if (acc == kInvalidNode) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  return acc;
+}
+
+// strchr(s, c) != NULL / == NULL, expanded into an existence disjunction over
+// the content bytes.  `chr_info` is the fstrchr label (op2 low byte = needle).
+uint32_t RunConverter::convert_strchr_cmp(const dfsan_label_info *info,
+                                          uint32_t op,
+                                          const dfsan_label_info &ci) {
+  uint32_t p = op >> 8;
+  bool want_found = (p == bvneq);
+  bool want_miss = (p == bveq);
+  if (!want_found && !want_miss) {
+    fail(PredError::UnsupportedCompare);
+    return kInvalidNode;
+  }
+  if (ci.l2 != 0) {  // symbolic needle: collected but not scalar-solvable
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(ci.op));
+    return kInvalidNode;
+  }
+  uint8_t c = ci.op2.i & 0xff;
+  std::vector<StringByte> bytes;
+  if (!string_bytes(ci.l1, kMaxSearchBytes, bytes) || bytes.empty()) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(ci.op));
+    return kInvalidNode;
+  }
+  uint32_t cnode = add_const(c, 8);
+  uint32_t acc = kInvalidNode;
+  for (size_t i = 0; i < bytes.size(); ++i) {
+    uint32_t t = want_found
+                     ? add(PKind::Equal, 8, bytes[i].node, cnode)
+                     : add(PKind::Distinct, 8, bytes[i].node, cnode);
+    acc = (acc == kInvalidNode)
+              ? t
+              : (want_found ? add(PKind::Or, 8, acc, t)
+                            : add(PKind::And, 8, acc, t));
+  }
+  if (acc == kInvalidNode) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(ci.op));
+    return kInvalidNode;
+  }
+  return acc;
+}
+
+// strstr(h, needle) != NULL / == NULL.  The concrete needle bytes are packed
+// into the label's op2 by the runtime (dfsan_custom.cpp __dfsw_strstr).
+uint32_t RunConverter::convert_strstr_cmp(const dfsan_label_info *info,
+                                          uint32_t op,
+                                          const dfsan_label_info &si) {
+  uint32_t p = op >> 8;
+  bool want_found = (p == bvneq);
+  bool want_miss = (p == bveq);
+  if (!want_found && !want_miss) {
+    fail(PredError::UnsupportedCompare);
+    return kInvalidNode;
+  }
+  if (si.l2 != 0) {  // symbolic needle
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  uint32_t nlen = si.size;  // concrete needle byte count
+  uint64_t packed = si.op2.i;
+  if (nlen == 0 || nlen > 8) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  std::vector<StringByte> bytes;
+  if (!string_bytes(si.l1, kMaxSearchBytes, bytes)) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  if (bytes.size() < nlen) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  uint32_t needle[8];
+  for (uint32_t k = 0; k < nlen; ++k)
+    needle[k] = add_const((packed >> (8 * k)) & 0xff, 8);
+  size_t max_starts =
+      std::min<size_t>(bytes.size() - nlen + 1, kMaxSearchBytes);
+  uint32_t acc = kInvalidNode;
+  for (size_t s = 0; s < max_starts; ++s) {
+    uint32_t inner = kInvalidNode;
+    for (uint32_t k = 0; k < nlen; ++k) {
+      uint32_t t = want_found
+                       ? add(PKind::Equal, 8, bytes[s + k].node, needle[k])
+                       : add(PKind::Distinct, 8, bytes[s + k].node, needle[k]);
+      inner = (inner == kInvalidNode)
+                  ? t
+                  : (want_found ? add(PKind::And, 8, inner, t)
+                                : add(PKind::Or, 8, inner, t));
+    }
+    acc = (acc == kInvalidNode)
+              ? inner
+              : (want_found ? add(PKind::Or, 8, acc, inner)
+                            : add(PKind::And, 8, acc, inner));
+  }
+  if (acc == kInvalidNode) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
+  }
+  return acc;
+}
+
+// FP comparison lowered to integer comparison over IEEE-754 bit patterns
+// (total-order transform), matching LLVM FCmp semantics including NaN and ±0.
+uint32_t RunConverter::fp_is_nan(uint32_t a, uint16_t w) {
+  uint16_t mant_bits = w == 64 ? 52 : 23;
+  uint64_t exp_mask = w == 64 ? 0x7ff : 0xff;
+  uint64_t mant_mask = w == 64 ? 0xfffffffffffffull : 0x7fffffull;
+  uint32_t exp = add(PKind::And, w,
+                     add(PKind::LShr, w, a, add_const(mant_bits, w), 0),
+                     add_const(exp_mask, w));
+  uint32_t mant = add(PKind::And, w, a, add_const(mant_mask, w), 0);
+  return add(PKind::And, w, add(PKind::Equal, w, exp, add_const(exp_mask, w)),
+             add(PKind::Distinct, w, mant, add_const(0, w)));
+}
+
+uint32_t RunConverter::fp_is_zero(uint32_t a, uint16_t w) {
+  uint64_t lower = (1ull << (w - 1)) - 1;  // ~sign bit
+  return add(PKind::Equal, w, add(PKind::And, w, a, add_const(lower, w), 0),
+             add_const(0, w));
+}
+
+uint32_t RunConverter::fp_total_order(uint32_t a, uint16_t w) {
+  uint64_t signbit = 1ull << (w - 1);
+  uint32_t sign = add(PKind::LShr, w, a, add_const(w - 1, w), 0);
+  // mask = sign ? ~0 : signbit  (negatives flip all bits, positives set sign)
+  uint32_t mask = add(PKind::Or, w, add(PKind::Sub, w, add_const(0, w), sign),
+                      add_const(signbit, w));
+  return add(PKind::Xor, w, a, mask);
+}
+
+uint32_t RunConverter::convert_fcmp(const dfsan_label_info *info,
+                                    uint32_t op) {
+  uint32_t p = op >> 8;
+  if (p > 15) {
+    fail(PredError::UnsupportedCompare);
+    return kInvalidNode;
+  }
+  uint16_t w = info->size;
+  if (w != 32 && w != 64) {
+    fail(PredError::InvalidWidth);
+    return kInvalidNode;
+  }
+  // Symbolic operand (Load/Concat) converts normally; a constant operand uses
+  // the label's stored IEEE bits (the literal being compared against).
+  uint32_t a = conv_child(info->l1, info->op1.i, w);
+  uint32_t b = conv_child(info->l2, info->op2.i, w);
+  if (a == kInvalidNode || b == kInvalidNode) return kInvalidNode;
+  uint32_t nan_a = fp_is_nan(a, w), nan_b = fp_is_nan(b, w);
+  uint32_t zero_a = fp_is_zero(a, w), zero_b = fp_is_zero(b, w);
+  uint32_t to_a = fp_total_order(a, w), to_b = fp_total_order(b, w);
+  uint32_t ord = add(PKind::And, w, add(PKind::Not, w, nan_a, kNoChild),
+                     add(PKind::Not, w, nan_b, kNoChild));
+  uint32_t eq = add(PKind::Or, w, add(PKind::And, w, zero_a, zero_b),
+                    add(PKind::And, w, ord, add(PKind::Equal, w, a, b)));
+  uint32_t both_zero = add(PKind::And, w, zero_a, zero_b);
+  uint32_t nz = add(PKind::Not, w, both_zero, kNoChild);
+  uint32_t gt = add(PKind::And, w, ord,
+                    add(PKind::And, w, add(PKind::Ugt, w, to_a, to_b), nz));
+  uint32_t lt = add(PKind::And, w, ord,
+                    add(PKind::And, w, add(PKind::Ult, w, to_a, to_b), nz));
+  uint32_t ge = add(PKind::And, w, ord,
+                    add(PKind::Or, w, add(PKind::Ugt, w, to_a, to_b), eq));
+  uint32_t le = add(PKind::And, w, ord,
+                    add(PKind::Or, w, add(PKind::Ult, w, to_a, to_b), eq));
+  uint32_t uno = add(PKind::Not, w, ord, kNoChild);
+  switch (p) {
+    case 0:  return add_const(0, w);                                           // FALSE
+    case 1:  return eq;                                                        // OEQ
+    case 2:  return gt;                                                        // OGT
+    case 3:  return ge;                                                        // OGE
+    case 4:  return lt;                                                        // OLT
+    case 5:  return le;                                                        // OLE
+    case 6:  return add(PKind::And, w, ord, add(PKind::Not, w, eq, kNoChild)); // ONE
+    case 7:  return ord;                                                       // ORD
+    case 8:  return uno;                                                       // UNO
+    case 9:  return add(PKind::Or, w, uno, eq);                                // UEQ
+    case 10: return add(PKind::Or, w, uno, gt);                                // UGT
+    case 11: return add(PKind::Or, w, uno, ge);                                // UGE
+    case 12: return add(PKind::Or, w, uno, lt);                                // ULT
+    case 13: return add(PKind::Or, w, uno, le);                                // ULE
+    case 14: return add(PKind::Not, w, eq, kNoChild);                          // UNE
+    case 15: return add_const(1, w);                                           // TRUE
+    default: fail(PredError::UnsupportedCompare); return kInvalidNode;
+  }
 }
 
 Predicate RunConverter::conv(uint32_t label) {

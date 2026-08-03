@@ -576,7 +576,9 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   dfsan_label l2 = get_str_label_n(s2, s2_label, n, n_label);
 
   if (l1 == 0 && l2 == 0) {
-    *ret_label = 0;
+    // Both buffers concrete: the decision still depends on n when n is
+    // input-derived (comparison window). Keep the length's taint.
+    *ret_label = n_label;
     return ret;
   }
 
@@ -607,7 +609,9 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   dfsan_label l2 = get_str_label_n(s2, s2_label, n, n_label);
 
   if (l1 == 0 && l2 == 0) {
-    *ret_label = 0;
+    // Both buffers concrete: the decision still depends on n when n is
+    // input-derived (comparison window). Keep the length's taint.
+    *ret_label = n_label;
     return ret;
   }
 
@@ -651,8 +655,11 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;  // use concrete side for length
 
-    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+    // Small comparisons fit the scalar fmemcmp byte-capture grammar and are
+    // exactly solvable by the PCBT interpreter; larger ones stay on the Z3
+    // string-theory op (opaque to the scalar interpreter, admitted).
+    uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcmp;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
                                    (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
@@ -680,14 +687,12 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_prefixof(
   if (l1 == 0 && l2 == 0) {
     *ret_label = 0;
   } else {
-    // Determine length for memcmp_cache (use concrete side if one is fsubstr)
-    size_t n = strlen(str) + 1;
-    dfsan_label str_fsubstr = taint_get_str_content_label(str);
-    if (str_fsubstr != 0)
-      n = strlen(prefix) + 1;  // use concrete side for length
-
-    // Create label - fprefixof is commutative, dfsan_union will normalize
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fprefixof, n,
+    // The comparison length is the prefix length (the bytes prefixof matches).
+    size_t n = prefix_len;
+    // Small comparisons fit the scalar fmemcmp byte-capture grammar and are
+    // exactly solvable by the PCBT interpreter.
+    uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fprefixof;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
                                    (uint64_t)str, (uint64_t)prefix);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
@@ -716,14 +721,11 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_suffixof(
   if (l1 == 0 && l2 == 0) {
     *ret_label = 0;
   } else {
-    // Determine length for memcmp_cache
-    size_t n = strlen(str) + 1;
-    dfsan_label str_fsubstr = taint_get_str_content_label(str);
-    if (str_fsubstr != 0)
-      n = strlen(suffix) + 1;
-
-    // Create label
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fsuffixof, n,
+    // The comparison length is the suffix length (the bytes suffixof matches).
+    size_t n = suffix_len;
+    // Small comparisons fit the scalar fmemcmp byte-capture grammar.
+    uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fsuffixof;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
                                    (uint64_t)str, (uint64_t)suffix);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
@@ -813,8 +815,9 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
     if (s1_fsubstr != 0)
       n = strlen(s2) + 1;
 
-    // fstrcmp is commutative - dfsan_union will swap to put concrete in op1
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+    // Small comparisons fit the scalar fmemcmp byte-capture grammar.
+    uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcmp;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
                                    (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
@@ -847,7 +850,8 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
   dfsan_label l2 = get_str_label(s2, s2_label);
 
   if (l1 == 0 && l2 == 0) {
-    *ret_label = 0;
+    // Both buffers concrete: the comparison window n is input-derived.
+    *ret_label = n_label;
   } else {
     // Adjust n for shorter strings when one side is concrete
     if (l1 == 0 && strlen(s1) < (n - 1))
@@ -855,7 +859,9 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
     if (l2 == 0 && strlen(s2) < (n - 1))
       n = strlen(s2) + 1;
 
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+    // Small comparisons fit the scalar fmemcmp byte-capture grammar.
+    uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcmp;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
                                    (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
@@ -879,7 +885,8 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
   dfsan_label l2 = get_str_label(s2, s2_label);
 
   if (l1 == 0 && l2 == 0) {
-    *ret_label = 0;
+    // Both buffers concrete: the comparison window n is input-derived.
+    *ret_label = n_label;
   } else {
     // Adjust n for shorter strings when one side is concrete
     if (l1 == 0 && strlen(s1) < (n - 1))
@@ -887,7 +894,9 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
     if (l2 == 0 && strlen(s2) < (n - 1))
       n = strlen(s2) + 1;
 
-    dfsan_label cmp = dfsan_union(l1, l2, __dfsan::fstrcmp, n,
+    // Small comparisons fit the scalar fmemcmp byte-capture grammar.
+    uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcmp;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
                                    (uint64_t)s1, (uint64_t)s2);
     if (cmp) __taint_trace_memcmp(cmp);
     *ret_label = cmp;
@@ -1923,7 +1932,11 @@ double __dfsw_strtod(const char *nptr, char **endptr,
   if (endptr) {
     *endptr = tmp_endptr;
   }
-  *ret_label = 0; // TODO: implement
+  uptr len = (uptr)tmp_endptr - (uptr)nptr;
+  // TODO(fp_atof): full float parse model.  Approximate with the integer-parse
+  // model (fatoi) so value decisions on strtod/atof stay collected and
+  // input-dependent; the scalar PCBT interpreter keeps fatoi opaque (admit).
+  *ret_label = taint_strtol(nptr, len, sizeof(ret), 10);
   return ret;
 }
 
@@ -2348,12 +2361,21 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
-    // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
-    dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
-                                    content_len,
-                                    (uint64_t)haystack,
-                                    (uint64_t)needle);
+    // op2 = needle pointer, OR up to 8 packed concrete needle bytes when the
+    //       needle is concrete and short, so the scalar PCBT interpreter can
+    //       expand strstr(h, needle) into byte comparisons.  The Z3 string
+    //       solver reads a concrete needle from the memcmp cache, not op2.
+    // size = haystack length if haystack concrete, else needle length if
+    //        needle concrete, else 0
+    uint64_t packed_needle = (uint64_t)needle;
+    if (real_needle_label == 0 && needle_len > 0 && needle_len <= 8 &&
+        IsAccessibleMemoryRange((uptr)needle, needle_len)) {
+      packed_needle = 0;
+      internal_memcpy(&packed_needle, needle, needle_len);
+    }
+    dfsan_label label = dfsan_union(src_label, real_needle_label,
+                                    __dfsan::fstrstr, content_len,
+                                    (uint64_t)haystack, packed_needle);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {
@@ -2417,12 +2439,21 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strnstr(char *haystack, char *needle,
     // l1 = src_label (source - for chaining or content dependencies)
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
-    // op2 = needle pointer (for concrete content retrieval)
-    // size = haystack length if haystack concrete, else needle length if needle concrete, else 0
-    dfsan_label label = dfsan_union(src_label, real_needle_label, __dfsan::fstrstr,
-                                    content_len,
-                                    (uint64_t)haystack,
-                                    (uint64_t)needle);
+    // op2 = needle pointer, OR up to 8 packed concrete needle bytes when the
+    //       needle is concrete and short, so the scalar PCBT interpreter can
+    //       expand strstr(h, needle) into byte comparisons.  The Z3 string
+    //       solver reads a concrete needle from the memcmp cache, not op2.
+    // size = haystack length if haystack concrete, else needle length if
+    //        needle concrete, else 0
+    uint64_t packed_needle = (uint64_t)needle;
+    if (real_needle_label == 0 && needle_len > 0 && needle_len <= 8 &&
+        IsAccessibleMemoryRange((uptr)needle, needle_len)) {
+      packed_needle = 0;
+      internal_memcpy(&packed_needle, needle, needle_len);
+    }
+    dfsan_label label = dfsan_union(src_label, real_needle_label,
+                                    __dfsan::fstrstr, content_len,
+                                    (uint64_t)haystack, packed_needle);
 
     // Send concrete content (haystack or needle)
     if (content_len > 0 && label) {
@@ -3082,8 +3113,14 @@ static int scan_buffer(char *str, size_t size, const char *fmt,
               read_count = formatter.scan((float *)dst_ptr);
               write_size = sizeof(float);
             }
-            // No symbolic float model yet (strtod is a stub); clear shadow.
-            dfsan_set_label(0, dst_ptr, write_size);
+            // No symbolic float model yet (fp_atof); approximate with the
+            // integer-parse model (add_null=false: field embedded in a larger
+            // input) so value decisions are collected, not dropped.
+            dfsan_label l = taint_strtol(
+                formatter.str_cur(),
+                formatter.num_written_bytes(read_count),
+                write_size, 10, /*add_null=*/false);
+            dfsan_set_label(l, dst_ptr, write_size);
           }
           end_fmt = true;
           break;
@@ -4106,11 +4143,12 @@ void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
 #endif // USE_UCSAN_CUSTOM
 
 static dfsan_label taint_getc(int fd, off_t offset, int ret) {
+  dfsan_label label = 0;
   if (ret != EOF && taint_get_file(fd)) {
-    dfsan_label label = label = dfsan_union(get_label_for(fd, offset), CONST_LABEL, ZExt, 32, 0, 0);
+    label = dfsan_union(get_label_for(fd, offset), CONST_LABEL, ZExt, 32, 0, 0);
     AOUT("%d label is readed by fgetc\n", label);
   }
-  return 0;
+  return label;
 }
 
 #ifndef USE_UCSAN_CUSTOM

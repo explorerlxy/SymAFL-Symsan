@@ -618,6 +618,7 @@ struct TaintFunction {
 
   Value *getShadow(Value *V);
   void setShadow(Instruction *I, Value *Shadow);
+  Value *combineOperandShadows(CallBase &CB);
 
   /// Handle nosanitize __dfsw_* calls from UCSan:
   /// emit minimize hints for alloc size args and load retval TLS for non-void.
@@ -712,6 +713,7 @@ public:
   void visitAtomicRMWInst(AtomicRMWInst &I);
   void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I);
   void visitReturnInst(ReturnInst &RI);
+  void visitFreezeInst(FreezeInst &FI);
   void visitCallBase(CallBase &CB);
   void visitPHINode(PHINode &PN);
   void visitExtractElementInst(ExtractElementInst &I);
@@ -725,6 +727,7 @@ public:
   void visitMemTransferInst(MemTransferInst &I);
   void visitBranchInst(BranchInst &BR);
   void visitSwitchInst(SwitchInst &SW);
+  void visitIndirectBrInst(IndirectBrInst &IBR);
 
 private:
   //void visitCASOrRMW(Align InstAlignment, Instruction &I);
@@ -1037,7 +1040,7 @@ bool Taint::initializeModule(Module &M) {
   TaintTraceSelectFnTy = FunctionType::get(
       PrimitiveShadowTy, TaintTraceSelectArgs, false);
   TaintTraceIndirectCallFnTy = FunctionType::get(
-      Type::getVoidTy(*Ctx), { PrimitiveShadowTy }, false);
+      Type::getVoidTy(*Ctx), { PrimitiveShadowTy, Int64Ty, Int32Ty }, false);
   Type *TaintTraceGEPArgs[8] = { PrimitiveShadowTy, Int64Ty, PrimitiveShadowTy,
       Int64Ty, Int64Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceGEPFnTy = FunctionType::get(
@@ -1832,6 +1835,51 @@ void TaintFunction::setShadow(Instruction *I, Value *Shadow) {
   ValShadowMap[I] = Shadow;
 }
 
+// Union all non-void scalar argument shadows into the return shadow of a
+// `=functional` call (isalpha/isdigit/.../abs/fmod/...).  These wrappers are
+// concrete no-ops (WK_Functional drops taint), so the result must at least
+// stay input-dependent.  op1/op2 are pinned to zero: the union is a pure OR
+// over symbolic operand shadows (runtime "0 | x = x" simplification), never
+// a function-pointer constant.  Not combineShadows: that reads
+// Pos->getOperand(0) as the operand type, which for a CallBase is the callee.
+Value *TaintFunction::combineOperandShadows(CallBase &CB) {
+  Type *RetTy = CB.getType();
+  uint64_t size = RetTy->isVoidTy()
+                      ? 32
+                      : CB.getModule()->getDataLayout().getTypeSizeInBits(RetTy);
+  if (size == 0 || size > 64) size = 64;
+  Value *Shadow = TT.getZeroShadow(&CB);
+  IRBuilder<> IRB(&CB);
+  for (unsigned i = 0; i < CB.arg_size(); ++i) {
+    Value *Arg = CB.getArgOperand(i);
+    Type *AT = Arg->getType();
+    if (AT->isVoidTy() || AT->isMetadataTy() || AT->isVectorTy() ||
+        isa<ArrayType>(AT) || isa<StructType>(AT))
+      continue;  // aggregate/vector args: skip (scalar functional set)
+    Value *ArgShadow = getShadow(Arg);
+    if (TT.isZeroShadow(ArgShadow)) continue;
+    Value *Op1 = Arg;
+    if (AT->isHalfTy())
+      Op1 = IRB.CreateBitCast(Op1, TT.Int16Ty);
+    else if (AT->isFloatTy())
+      Op1 = IRB.CreateBitCast(Op1, TT.Int32Ty);
+    else if (AT->isDoubleTy())
+      Op1 = IRB.CreateBitCast(Op1, TT.Int64Ty);
+    else if (AT->isPointerTy())
+      Op1 = IRB.CreatePtrToInt(Op1, TT.Int64Ty);
+    CallInst *C = IRB.CreateCall(
+        TT.TaintUnionFn,
+        {Shadow, ArgShadow, ConstantInt::get(TT.Int16Ty, Instruction::Or),
+         ConstantInt::get(TT.Int16Ty, size), ConstantInt::get(TT.Int64Ty, 0),
+         ConstantInt::get(TT.Int64Ty, 0)});
+    C->addRetAttr(Attribute::ZExt);
+    C->addParamAttr(0, Attribute::ZExt);
+    C->addParamAttr(1, Attribute::ZExt);
+    Shadow = C;
+  }
+  return Shadow;
+}
+
 bool TaintFunction::handleUCSanCall(CallInst *CI, Instruction *Next) {
   Function *Callee = CI->getCalledFunction();
   if (!Callee)
@@ -1963,13 +2011,17 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
 
   // filter types
   Type *Ty = Pos->getOperand(0)->getType();
+  bool IsVector = false;
+  Type *ElemTy = nullptr;
   if (Ty->isFloatingPointTy()) {
     // check for FP
     if (!ClTraceFP)
       return TT.getZeroShadow(Pos);
   } else if (Ty->isVectorTy()) {
-    // FIXME: vector type
-    return TT.getZeroShadow(Pos);
+    // Vectors collapse to one scalar shadow (getShadowTy -> PrimitiveShadowTy).
+    // Build the label at element width so it fits the 64-bit scalar grammar.
+    IsVector = true;
+    ElemTy = cast<VectorType>(Ty)->getElementType();
   } else if (!Ty->isIntegerTy() && !Ty->isPointerTy()) {
     // not FP and not vector and not int and not ptr?
     errs() << "Unknown type: " << *Pos << "\n";
@@ -1978,13 +2030,19 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
 
   // filter size
   auto &DL = Pos->getModule()->getDataLayout();
-  uint64_t size = DL.getTypeSizeInBits(Pos->getType());
-  // FIXME: do not handle type larger than 64-bit
-  if (size > 64) return TT.getZeroShadow(Pos);
+  uint64_t size = IsVector ? DL.getTypeSizeInBits(ElemTy)
+                           : DL.getTypeSizeInBits(Pos->getType());
+  // Wide types (>64-bit) and vectors are clamped to the 64-bit scalar grammar
+  // instead of dropping the label entirely (an over-approximation; direction
+  // mismatches are caught by ReplayFullTrace and the trace discarded).
+  if (size > 64) size = 64;
 
   IRBuilder<> IRB(Pos);
   if (CmpInst *CI = dyn_cast<CmpInst>(Pos)) { // for both icmp and fcmp
-    size = DL.getTypeSizeInBits(CI->getOperand(0)->getType());
+    Type *CmpTy = CI->getOperand(0)->getType();
+    size = IsVector ? DL.getTypeSizeInBits(
+                          cast<VectorType>(CmpTy)->getElementType())
+                    : DL.getTypeSizeInBits(CmpTy);
     // op should be predicate
     op |= (CI->getPredicate() << 8);
   }
@@ -1992,6 +2050,11 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   Value *Size = ConstantInt::get(TT.Int16Ty, size);
   Value *Op1 = Pos->getOperand(0);
   Ty = Op1->getType();
+  // a vector value carries a single collapsed shadow; compare via element 0.
+  if (Ty->isVectorTy()) {
+    Ty = cast<VectorType>(Ty)->getElementType();
+    Op1 = IRB.CreateExtractElement(Op1, ConstantInt::get(TT.Int32Ty, 0));
+  }
   // bitcast to integer before extending
   if (Ty->isHalfTy())
     Op1 = IRB.CreateBitCast(Op1, TT.Int16Ty);
@@ -2006,6 +2069,10 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   if (Pos->getNumOperands() > 1) {
     Op2 = Pos->getOperand(1);
     Ty = Op2->getType();
+    if (Ty->isVectorTy()) {
+      Ty = cast<VectorType>(Ty)->getElementType();
+      Op2 = IRB.CreateExtractElement(Op2, ConstantInt::get(TT.Int32Ty, 0));
+    }
     // bitcast to integer before extending
     if (Ty->isHalfTy())
       Op2 = IRB.CreateBitCast(Op2, TT.Int16Ty);
@@ -3569,6 +3636,21 @@ void TaintVisitor::visitSwitchInst(SwitchInst &SWI) {
   TF.visitSwitchInst(&SWI);
 }
 
+void TaintVisitor::visitIndirectBrInst(IndirectBrInst &IBR) {
+  // A tainted indirect-branch target (computed goto / jump table dispatch)
+  // means control flow itself depends on the input. Pin it to its observed
+  // concrete address via the same equality-constraint trace used for
+  // indirect calls, so the PCBT diverges when a mutated input changes target.
+  Value *Target = IBR.getAddress();
+  Value *Shadow = TF.getShadow(Target);
+  if (TF.TT.isZeroShadow(Shadow)) return;
+  IRBuilder<> IRB(&IBR);
+  Value *T = IRB.CreatePtrToInt(Target, TF.TT.Int64Ty);
+  ConstantInt *CID = ConstantInt::get(TF.TT.Int32Ty,
+                                      TF.TT.getInstructionId(&IBR));
+  IRB.CreateCall(TF.TT.TaintTraceIndirectCallFn, {Shadow, T, CID});
+}
+
 void TaintVisitor::visitLandingPadInst(LandingPadInst &LPI) {
   // We do not need to track data through LandingPadInst.
   //
@@ -3684,15 +3766,21 @@ void TaintVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
 }
 
 void TaintVisitor::visitExtractElementInst(ExtractElementInst &I) {
-  //FIXME:
+  // extractelement feeds the branch: propagate the vector's collapsed label.
+  TF.setShadow(&I, TF.getShadow(I.getVectorOperand()));
 }
 
 void TaintVisitor::visitInsertElementInst(InsertElementInst &I) {
-  //FIXME:
+  Value *VecShadow = TF.getShadow(I.getOperand(0));
+  Value *ElemShadow = TF.getShadow(I.getOperand(1));
+  TF.setShadow(&I, TF.combineShadows(VecShadow, ElemShadow,
+                                     Instruction::Or, &I));
 }
 
 void TaintVisitor::visitShuffleVectorInst(ShuffleVectorInst &I) {
-  //FIXME:
+  Value *A = TF.getShadow(I.getOperand(0));
+  Value *B = TF.getShadow(I.getOperand(1));
+  TF.setShadow(&I, TF.combineShadows(A, B, Instruction::Or, &I));
 }
 
 void TaintVisitor::visitExtractValueInst(ExtractValueInst &I) {
@@ -3893,6 +3981,11 @@ static bool isAMustTailRetVal(Value *RetVal) {
   return false;
 }
 
+void TaintVisitor::visitFreezeInst(FreezeInst &FI) {
+  // freeze is an identity: the shadow of the frozen value is unchanged.
+  TF.setShadow(&FI, TF.getShadow(FI.getOperand(0)));
+}
+
 void TaintVisitor::visitReturnInst(ReturnInst &RI) {
   Value *RV = RI.getReturnValue();
   if (!TF.IsNativeABI && RV) {
@@ -3980,8 +4073,11 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
   case Taint::WK_Functional:
     CB.setCalledFunction(F);
     TF.TT.buildExternWeakCheckIfNeeded(IRB, F);
-    //FIXME:
-    // visitOperandShadowInst(CS);
+    // The result of a `=functional` libc call is data-dependent on its
+    // arguments (isalpha(c), abs(x), fmod(a,b), ...).  Keep the return
+    // shadow input-dependent so branches on these values are collected.
+    if (!FT->getReturnType()->isVoidTy())
+      TF.setShadow(&CB, TF.combineOperandShadows(CB));
     return true;
   case Taint::WK_Memcmp: {
     // int memcmp(const void *s1, const void *s2, size_t n)
@@ -4681,8 +4777,12 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
   bool isUCSanCheckedIndirectCall = false;
   if (CB.getCalledFunction() == nullptr) {
     Value *Shadow = TF.getShadow(CB.getCalledOperand());
-    if (!TF.TT.isZeroShadow(Shadow))
-      IRB.CreateCall(TF.TT.TaintTraceIndirectCallFn, {Shadow});
+    if (!TF.TT.isZeroShadow(Shadow)) {
+      Value *Target = IRB.CreatePtrToInt(CB.getCalledOperand(), TF.TT.Int64Ty);
+      ConstantInt *CID = ConstantInt::get(TF.TT.Int32Ty,
+                                          TF.TT.getInstructionId(&CB));
+      IRB.CreateCall(TF.TT.TaintTraceIndirectCallFn, {Shadow, Target, CID});
+    }
 
     // Check if the function pointer is from UCSan (ucsan_check_pointer)
     Value *FPtr = CB.getCalledOperand()->stripPointerCasts();

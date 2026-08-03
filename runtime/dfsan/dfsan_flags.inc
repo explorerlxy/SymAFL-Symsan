@@ -66,3 +66,8 @@ DFSAN_FLAG(int, session_id, 0, "session/round id.")
 DFSAN_FLAG(bool, force_stdin, false, "force tainting stdin.")
 DFSAN_FLAG(bool, enum_gep, false, "enable GEP index enumeration.")
 DFSAN_FLAG(int, string_map_capacity, 256, "initial capacity for string label maps.")
+DFSAN_FLAG(bool, taint_trace_addr_cond, true,
+           "SymAFL v2: emit equality constraints for tainted pointer indexes "
+           "(GEP __taint_trace_gep) and tainted indirect-call/indirectbr "
+           "targets (__taint_trace_indcall), so the PCBT diverges when a "
+           "mutated input selects a different array element or jump target.")
