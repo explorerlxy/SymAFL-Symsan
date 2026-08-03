@@ -346,6 +346,10 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->profile_enabled = true;
     fprintf(stderr, "[pcbt] profiling enabled (SYMAFL_PROFILE=1)\n");
   }
+  if (getenv("SYMAFL_PCBT_DEBUG")) {
+    data->tree.set_debug(true);
+    fprintf(stderr, "[pcbt] predicate debug enabled (SYMAFL_PCBT_DEBUG=1)\n");
+  }
   if (const char *rl = getenv("SYMAFL_RCNT_LIMIT")) {
     char *end = nullptr;
     unsigned long parsed = strtoul(rl, &end, 10);
@@ -374,7 +378,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   fprintf(stderr,
           "[pcbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
           "opaque=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
-          "admitted=%llu vetoed=%llu saturated=%llu "
+          "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
           "single_pass=%llu single_pass_overflow=%llu "
           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
           "veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
@@ -391,6 +395,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->screened,
           (unsigned long long)data->admitted,
           (unsigned long long)data->vetoed,
+          (unsigned long long)data->traced_entries.size(),
           (unsigned long long)(data->screening ? 0 : 1),
           (unsigned long long)data->single_pass_captures,
           (unsigned long long)data->single_pass_overflows,
@@ -494,16 +499,20 @@ static void arm_pipe_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
 static bool decode_full_stream(const u8 *wire, size_t wire_size,
                                std::vector<pcbt::Event> *events) {
   size_t offset = 0;
+  size_t n_cond = 0, n_dropped_zero = 0, n_dropped_init = 0;
   while (offset < wire_size) {
     if (wire_size - offset < sizeof(pipe_msg)) return false;
     pipe_msg msg;
     memcpy(&msg, wire + offset, sizeof(msg));
     offset += sizeof(msg);
     if (msg.msg_type == cond_type) {
-      if (msg.label != 0 && msg.label != kInitializingLabel) {
-        if (msg.label >= MAX_LABEL) return false;
-        events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0)});
-      }
+      n_cond++;
+      if (msg.label == 0) { n_dropped_zero++; continue; }
+      if (msg.label == kInitializingLabel) { n_dropped_init++; continue; }
+      if (msg.label >= MAX_LABEL) return false;
+      uint8_t is_constraint = (msg.flags & F_CONSTRAINT) ? 1 : 0;
+      events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0),
+                         is_constraint});
       continue;
     }
     size_t trailer = 0;
@@ -517,6 +526,10 @@ static bool decode_full_stream(const u8 *wire, size_t wire_size,
     if (trailer > wire_size - offset) return false;
     offset += trailer;
   }
+  fprintf(stderr, "[pcbt-debug] decode: bytes=%zu cond=%zu dropped_zero=%zu "
+          "dropped_init=%zu kept=%zu\n",
+          wire_size, n_cond, n_dropped_zero, n_dropped_init,
+          events->size());
   return true;
 }
 
@@ -579,6 +592,37 @@ static bool replay_check_trace(my_mutator_t *data,
         report.expected_cid, report.observed_cid,
         report.evaluated_dir, report.observed_dir,
         is_suffix ? "suffix" : "full");
+  if (data->tree.debug() && report.event_index < events.size()) {
+    // The mismatching event's label structure in the current run's union
+    // table, plus the input bytes the stored predicate reads (DebugPredicate
+    // above already dumped the node's reads and DAG).
+    const pcbt::Event &ev = events[report.event_index];
+    fprintf(stderr, "[pcbt-dbg] event idx=%zu cid=%u label=%u result=%u "
+            "constraint=%u\n",
+            report.event_index, ev.cid, ev.label, ev.result, ev.constraint);
+    if (ev.label < MAX_LABEL && ev.label != 0 &&
+        ev.label != kInitializingLabel) {
+      const dfsan_label_info &li = __dfsan_label_info[ev.label];
+      fprintf(stderr, "[pcbt-dbg] event label_info op=%u size=%u l1=%u l2=%u "
+              "op1=%llu op2=%llu\n",
+              li.op, li.size, li.l1, li.l2,
+              (unsigned long long)li.op1.i, (unsigned long long)li.op2.i);
+      std::vector<uint32_t> queue = {li.l1, li.l2};
+      for (size_t q = 0; q < queue.size(); ++q) {
+        uint32_t child = queue[q];
+        if (child == 0 || child >= MAX_LABEL) continue;
+        const dfsan_label_info &ci = __dfsan_label_info[child];
+        fprintf(stderr, "[pcbt-dbg]   child label=%u op=%u size=%u l1=%u "
+                "l2=%u op1=%llu op2=%llu\n",
+                child, ci.op, ci.size, ci.l1, ci.l2,
+                (unsigned long long)ci.op1.i, (unsigned long long)ci.op2.i);
+        if (q < 4) {
+          queue.push_back(ci.l1);
+          queue.push_back(ci.l2);
+        }
+      }
+    }
+  }
   return false;  // discard mismatched trace
 }
 
@@ -653,7 +697,8 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
       disarm_capture(data);
       return false;
     }
-    events.push_back({event.cid, event.label, event.result});
+    uint8_t is_constraint = event.reserved[0] ? 1 : 0;
+    events.push_back({event.cid, event.label, event.result, is_constraint});
   }
   uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
       events, data->single_pass_label_info, MAX_LABEL);
@@ -697,6 +742,19 @@ static bool read_queue_file(const char *fname, std::vector<u8> *buf) {
   return got == (ssize_t)buf->size();
 }
 
+// The bootstrap input is AFL's .cur_input; replay validation needs its real
+// bytes and length (Len nodes evaluate against the candidate length, so a
+// null buffer / zero length mispredicts length-boundary predicates).
+static bool read_cur_input(my_mutator_t *data, std::vector<u8> *buf) {
+  if (!data->afl->out_dir) return false;
+  // AFL++ points out_dir at the per-fuzzer working directory (which ends in
+  // "/default" for a single fuzzer); .cur_input lives directly in it.
+  char *path = alloc_printf("%s/.cur_input", data->afl->out_dir);
+  bool ok = read_queue_file(path, buf);
+  ck_free(path);
+  return ok;
+}
+
 extern "C" void afl_custom_post_run(my_mutator_t *data) {
   if (data->bootstrap_done || !data->single_pass_armed) return;
   uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
@@ -705,7 +763,16 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
       data->last_node != pcbt::kUnexplored) {
     (void)insert_suffix_capture(data, nullptr, 0, "bootstrap");
   } else if (mode == SYMAFL_TRACE_FULL_STREAM) {
-    (void)insert_full_stream(data, nullptr, 0, "bootstrap");
+    std::vector<u8> buf;
+    if (read_cur_input(data, &buf)) {
+      (void)insert_full_stream(data, buf.data(), buf.size(), "bootstrap");
+    } else {
+      fprintf(stderr, "[pcbt] bootstrap cur_input unreadable (out_dir=%s); "
+              "replay with len=0\n",
+              data->afl->out_dir ? (const char *)data->afl->out_dir
+                                 : "(null)");
+      (void)insert_full_stream(data, nullptr, 0, "bootstrap");
+    }
   }
   data->last_node = pcbt::kUnexplored;
 }
@@ -846,7 +913,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
   snprintf(buf, sizeof(buf),
            "traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu opaque=%llu "
            "failed=%llu timeouts=%llu memerr=%llu "
-           "screened=%llu admitted=%llu vetoed=%llu saturated=%llu "
+           "screened=%llu admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
            "single_pass=%llu single_pass_overflow=%llu "
            "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
             "veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
@@ -863,6 +930,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)data->screened,
            (unsigned long long)data->admitted,
            (unsigned long long)data->vetoed,
+           (unsigned long long)data->traced_entries.size(),
            (unsigned long long)(data->screening ? 0 : 1),
            (unsigned long long)data->single_pass_captures,
            (unsigned long long)data->single_pass_overflows,

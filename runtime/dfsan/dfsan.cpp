@@ -257,7 +257,9 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     }
   }
   if (l1 == 0 && l2 < CONST_OFFSET &&
-      op != fsize && op != __dfsan::Alloca)
+      op != fsize && op != __dfsan::Alloca &&
+      op != __dfsan::flen_eof && op != __dfsan::flen_count &&
+      op != __dfsan::flen_count_neg1 && op != __dfsan::flen_count_elems)
     return 0;
   if (l1 == kInitializingLabel || l2 == kInitializingLabel)
     return kInitializingLabel;

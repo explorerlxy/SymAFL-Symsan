@@ -198,7 +198,7 @@ __taint_trace_indcall(dfsan_label label, uint64_t target, uint32_t cid) {
     dfsan_label eq =
         dfsan_union(label, 0, (bveq << 8) | ICmp, 64, target, target);
     if (eq != 0 && eq != kInitializingLabel)
-      __taint_send_cond(eq, 1, 0, 0, cid, addr);
+      __taint_send_cond(eq, 1, 0, ConstraintFlag, cid, addr);
   }
 }
 
@@ -243,7 +243,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
       dfsan_label eq =
           dfsan_union(index_label, 0, (bveq << 8) | ICmp, width, k, k);
       if (eq != 0 && eq != kInitializingLabel)
-        __taint_send_cond(eq, 1, 0, 0, cid, addr);
+        __taint_send_cond(eq, 1, 0, ConstraintFlag, cid, addr);
     }
   }
 

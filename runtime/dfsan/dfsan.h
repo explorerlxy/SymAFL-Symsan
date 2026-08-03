@@ -276,7 +276,22 @@ enum operators {
   fp_log10     = last_llvm_op + 38, // 105 log10
   fp_log1p     = last_llvm_op + 39, // 106 log1p/log1pf
   fp_pow       = last_llvm_op + 40, // 107 pow/powf
-  LastOp    = last_llvm_op + 41, // 108
+  // Input-length boundary ops (SymAFL v2 length-constraint collection).
+  // The value of every input read interface depends on the input length
+  // (whether byte k exists). These ops make that dependence a first-class
+  // label so length decisions become solvable cond events:
+  //   flen_eof:          getc-family EOF read at missing offset k (op1);
+  //                      missing byte evaluates as EOF (masked -1 at width).
+  //   flen_count:        short-read count; op1 = pre-read pos, op2 = requested
+  //                      bytes; EOF value = 0 (read()/fgets() convention).
+  //   flen_count_neg1:   getline-family count; EOF value = -1.
+  //   flen_count_elems:  fread-family count in ELEMENTS (ret is items, not
+  //                      bytes); op2 packs (item_size << 32) | nmemb.
+  flen_eof        = last_llvm_op + 41, // 108
+  flen_count      = last_llvm_op + 42, // 109
+  flen_count_neg1 = last_llvm_op + 43, // 110
+  flen_count_elems = last_llvm_op + 44, // 111
+  LastOp    = last_llvm_op + 45, // 112
 };
 
 // fmemcmp keeps its base opcode in the low byte. The high bits record whether
@@ -409,6 +424,11 @@ static const uint8_t TrueBranchLoopExit = 0x2;
 static const uint8_t FalseBranchLoopExit = 0x1;
 static const uint8_t LoopFlagMask = 0xF;
 static const uint8_t UndefinedCheck = 0x10;
+// Constraint events (tainted GEP index / indcall target pinned to their
+// observed concrete value): the recorded result is always 1; replay skips
+// direction validation for them (they are screening semantics, not real
+// branches). Must be above LoopFlagMask so send_cond's loop switch ignores it.
+static const uint8_t ConstraintFlag = 0x20;
 
 enum undefined_check_ids {
   ub_integer_overflow = 1,
@@ -432,6 +452,11 @@ enum undefined_check_ids {
 #define F_ADD_CONS   0x1
 #define F_LOOP_EXIT  0x2
 #define F_LOOP_LATCH 0x4
+// Constraint events (tainted GEP index == concrete, tainted indcall target
+// == concrete): the recorded result is always 1 (the constraint held for the
+// traced run). They are screening semantics, not real branches: replay must
+// skip direction validation for them.
+#define F_CONSTRAINT 0x8
 
 #define F_MEMERR_UAF  0x1
 #define F_MEMERR_OLB  0x2

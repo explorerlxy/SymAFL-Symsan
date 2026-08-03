@@ -1496,7 +1496,10 @@ __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
       for (ssize_t i = 0; i < ret; i++) {
         dfsan_set_label(get_label_for(fd, offset + i), (char *)buf + i, 1);
       }
-      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
+      // Length boundary: the count is min(count, len - offset), a pure
+      // function of the input length -> flen_count(pos, requested).
+      *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
+                               (uint64_t)offset, count);
     } else {
       dfsan_set_label(0, buf, ret);
     }
@@ -1519,7 +1522,9 @@ __dfsw_pread64(int fd, void *buf, size_t count, off_t offset,
       for (ssize_t i = 0; i < ret; i++) {
         dfsan_set_label(get_label_for(fd, offset + i), (char *)buf + i, 1);
       }
-      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
+      // Length boundary: the count is min(count, len - offset).
+      *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
+                               (uint64_t)offset, count);
     } else {
       dfsan_set_label(0, buf, ret);
     }
@@ -1544,9 +1549,10 @@ __dfsw_read(int fd, void *buf, size_t count,
       for(ssize_t i = 0; i < ret; i++) {
         dfsan_set_label(get_label_for(fd, offset + i), (char *)buf + i, 1);
       }
-      // for (size_t i = ret; i < count; i++)
-      //   dfsan_set_label(-1, (char *)buf + i, 1);
-      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
+      // Length boundary: the count is min(count, len - offset), a pure
+      // function of the input length -> flen_count(pos, requested).
+      *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
+                               (uint64_t)offset, count);
     } else {
       dfsan_set_label(0, buf, ret);
     }
@@ -3434,6 +3440,13 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
       dfsan_set_label(0, ptr, ret * size);
     }
   }
+  if (tfsize) {
+    // Length boundary: ret is the number of complete ELEMENTS read,
+    // min((len - offset) / size, nmemb). op2 packs (item_size << 32) | nmemb.
+    *ret_label = dfsan_union(0, 0, flen_count_elems, sizeof(ret) * 8,
+                             (uint64_t)offset,
+                             ((uint64_t)size << 32) | (uint64_t)nmemb);
+  }
   return ret;
 }
 
@@ -3476,13 +3489,16 @@ __dfsw_fread_unlocked(
       for (size_t i = 0; i < ret * size; i++) {
         dfsan_set_label(get_label_for(fd, offset + i), (char *)ptr + i, 1);
       }
-      // for (size_t i = ret * size; i < nmemb * size; i++) {
-      //   dfsan_set_label(-1, (char *)ptr + i, 1);
-      // }
-      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
     } else {
       dfsan_set_label(0, ptr, ret * size);
     }
+  }
+  if (tfsize) {
+    // Length boundary: ret is the number of complete ELEMENTS read.
+    // op2 packs (item_size << 32) | nmemb.
+    *ret_label = dfsan_union(0, 0, flen_count_elems, sizeof(ret) * 8,
+                             (uint64_t)offset,
+                             ((uint64_t)size << 32) | (uint64_t)nmemb);
   }
   return ret;
 }
@@ -3504,11 +3520,15 @@ __dfsw_getline(char **lineptr, size_t *n, FILE *stream,
         dfsan_set_label(get_label_for(fd, offset + i), addr, 1);
       }
       dfsan_set_label(0, (*lineptr) + ret, 1);
-      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
-      // FIXME: set the label for the ptr to track the buffer size
     } else {
       dfsan_set_label(0, *lineptr, ret + 1);
     }
+  }
+  if (taint_get_file(fd)) {
+    // Length boundary: getline returns -1 at EOF, else chars read.
+    // flen_count_neg1(pos, requested buffer capacity).
+    *ret_label = dfsan_union(0, 0, flen_count_neg1, sizeof(ret) * 8,
+                             (uint64_t)offset, *n ? *n : 0);
   }
   return ret;
 }
@@ -3529,13 +3549,16 @@ __dfsw_getdelim(char **lineptr, size_t *n, int delim, FILE *stream,
       for(ssize_t i = 0; i < ret; i++) {
         void *addr = (*lineptr) + i;
         dfsan_set_label(get_label_for(fd, offset + i), addr, 1);
-        // FIXME: set the label for the ptr to track the buffer size
       }
       dfsan_set_label(0, (*lineptr) + ret, 1);
-      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
     } else {
       dfsan_set_label(0, *lineptr, ret + 1);
     }
+  }
+  if (taint_get_file(fd)) {
+    // Length boundary: getdelim returns -1 at EOF, else chars read.
+    *ret_label = dfsan_union(0, 0, flen_count_neg1, sizeof(ret) * 8,
+                             (uint64_t)offset, *n ? *n : 0);
   }
   return ret;
 }
@@ -3556,11 +3579,14 @@ __dfsw___getdelim(char **lineptr, size_t *n, int delim, FILE *stream,
         dfsan_set_label(get_label_for(fd, offset + i), addr, 1);
       }
       dfsan_set_label(0, (*lineptr) + ret, 1);
-      // *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, offset, 0);
-      // FIXME: set the label for the ptr to track the buffer size
     } else {
       dfsan_set_label(0, *lineptr, ret + 1);
     }
+  }
+  if (taint_get_file(fd)) {
+    // Length boundary: __getdelim returns -1 at EOF, else chars read.
+    *ret_label = dfsan_union(0, 0, flen_count_neg1, sizeof(ret) * 8,
+                             (uint64_t)offset, *n ? *n : 0);
   }
   return ret;
 }
@@ -3573,7 +3599,13 @@ __dfsw_gets(char *str, dfsan_label str_label, dfsan_label *ret_label) {
   if (ret && taint_get_file(0)) {
     for (off_t i = 0; i <= strlen(ret); i++)
       dfsan_set_label(get_label_for(0, offset + i), ret + i, 1);
-    *ret_label = str_label;
+  }
+  if (taint_get_file(0)) {
+    // Length boundary: gets returns NULL at EOF. The internal fgets caps the
+    // read at sizeof(str) - 1 (note: sizeof(str) is a pointer here, a known
+    // pre-existing wrapper limitation).
+    *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
+                             (uint64_t)offset, sizeof(str) - 1);
   } else {
     *ret_label = 0;
   }
@@ -3629,15 +3661,20 @@ char *__dfsw_fgets(char *s, int size, FILE *stream, dfsan_label s_label,
         dfsan_set_label(get_label_for(fd, offset + i), buf, 1);
       }
       dfsan_set_label(0, s + strlen(ret), 1);
-      // for(int i = strlen(ret) + 1; i < size; i++) {
-      //   char *buf = s + i;
-      //   dfsan_set_label(-1, buf, 1);
-      // }
     } else {
       dfsan_set_label(0, s, strlen(ret) + 1);
     }
-    *ret_label = s_label;
-  } else *ret_label = 0;
+  }
+  if (taint_get_file(fd)) {
+    // Length boundary: fgets returns NULL at EOF. The pointer comparison
+    // `fgets(...) == NULL` must be a length decision, not a content compare
+    // (the previous s_label mislabeled the pointer with string content, so
+    // an empty line mispredicted). n = size - 1 (fgets keeps the NUL slot).
+    *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
+                             (uint64_t)offset, (uint64_t)size - 1);
+  } else {
+    *ret_label = 0;
+  }
   return ret;
 }
 
@@ -3659,17 +3696,89 @@ char *__dfsw_fgets_unlocked(char *s, int size, FILE *stream, dfsan_label s_label
         dfsan_set_label(get_label_for(fd, offset + i), buf, 1);
       }
       dfsan_set_label(0, s + strlen(ret), 1);
-      // for(int i = strlen(ret) + 1; i < size; i++) {
-      //   char *buf = s + i;
-      //   dfsan_set_label(-1, buf, 1);
-      // }
     } else {
       dfsan_set_label(0, s, strlen(ret) + 1);
     }
-    *ret_label = s_label;
+  }
+  if (taint_get_file(fd)) {
+    // Length boundary: fgets returns NULL at EOF; n = size - 1 (NUL slot).
+    *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
+                             (uint64_t)offset, (uint64_t)size - 1);
   } else {
     *ret_label = 0;
   }
+  return ret;
+}
+
+// fscanf/scanf: no libc-internal instrumentation, so the field reads are
+// invisible; v1 labels only the RETURN (items converted) as a length-boundary
+// count via the ftell delta. Field labels are a documented residual (the
+// sscanf scan_buffer approach is the full solution).
+static int taint_fscanf_count(int fd, off_t before, off_t after) {
+  return dfsan_union(0, 0, flen_count, 32, (uint64_t)before,
+                     (uint64_t)(after > before ? after - before : 0));
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_fscanf(FILE *stream, const char *format, dfsan_label stream_label,
+              dfsan_label format_label, dfsan_label *ret_label, ...) {
+  int fd = fileno(stream);
+  off_t before = ftell(stream);
+  va_list args;
+  va_start(args, ret_label);
+  int ret = vfscanf(stream, format, args);
+  va_end(args);
+  off_t after = ftell(stream);
+  *ret_label = taint_get_file(fd)
+                   ? taint_fscanf_count(fd, before, after)
+                   : 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw___isoc99_fscanf(FILE *stream, const char *format, dfsan_label stream_label,
+                       dfsan_label format_label, dfsan_label *ret_label, ...) {
+  int fd = fileno(stream);
+  off_t before = ftell(stream);
+  va_list args;
+  va_start(args, ret_label);
+  int ret = vfscanf(stream, format, args);
+  va_end(args);
+  off_t after = ftell(stream);
+  *ret_label = taint_get_file(fd)
+                   ? taint_fscanf_count(fd, before, after)
+                   : 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw___isoc23_fscanf(FILE *stream, const char *format, dfsan_label stream_label,
+                       dfsan_label format_label, dfsan_label *ret_label, ...) {
+  int fd = fileno(stream);
+  off_t before = ftell(stream);
+  va_list args;
+  va_start(args, ret_label);
+  int ret = vfscanf(stream, format, args);
+  va_end(args);
+  off_t after = ftell(stream);
+  *ret_label = taint_get_file(fd)
+                   ? taint_fscanf_count(fd, before, after)
+                   : 0;
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE int
+__dfsw_scanf(const char *format, dfsan_label format_label,
+             dfsan_label *ret_label, ...) {
+  off_t before = ftell(stdin);
+  va_list args;
+  va_start(args, ret_label);
+  int ret = vfscanf(stdin, format, args);
+  va_end(args);
+  off_t after = ftell(stdin);
+  *ret_label = taint_get_file(0)
+                   ? taint_fscanf_count(0, before, after)
+                   : 0;
   return ret;
 }
 
@@ -4144,9 +4253,16 @@ void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
 
 static dfsan_label taint_getc(int fd, off_t offset, int ret) {
   dfsan_label label = 0;
-  if (ret != EOF && taint_get_file(fd)) {
-    label = dfsan_union(get_label_for(fd, offset), CONST_LABEL, ZExt, 32, 0, 0);
-    AOUT("%d label is readed by fgetc\n", label);
+  if (taint_get_file(fd)) {
+    if (ret != EOF) {
+      label = dfsan_union(get_label_for(fd, offset), CONST_LABEL, ZExt, 32, 0, 0);
+      AOUT("%d label is readed by fgetc\n", label);
+    } else {
+      // Length boundary: reading at offset k past the end of the input.
+      // `c != EOF` becomes a solvable event (EofRead(k) evaluates to -1).
+      label = dfsan_union(0, 0, flen_eof, 32, (uint64_t)offset, 0);
+      AOUT("%d label is EOF-read at offset %ld\n", label, offset);
+    }
   }
   return label;
 }
@@ -4238,8 +4354,13 @@ __dfsw_mmap(void *start, size_t length, int prot, int flags, int fd,
                                                         : length;
       for (size_t i = 0; i < tainted_length; i++)
         dfsan_set_label(get_label_for(fd, offset + i), (char *)ret + i, 1);
+      // Bytes past the file end are length-boundary reads: label them
+      // flen_eof(k) (EofRead) instead of kInitializingLabel, which was
+      // silently dropped at every stage and left the decision uncollected.
       for (size_t i = tainted_length; i < length; i++)
-        dfsan_set_label(-1, (char *)ret + i, 1);
+        dfsan_set_label(dfsan_union(0, 0, flen_eof, 32,
+                                    (uint64_t)(offset + i), 0),
+                        (char *)ret + i, 1);
     } else {
       dfsan_set_label(0, ret, length);
     }
@@ -4267,12 +4388,19 @@ __dfsw_lseek(int fd, off_t offset, int whence, dfsan_label fd_label,
   off_t ret = lseek(fd, offset, whence);
   if (ret != (off_t)-1) {
     if (taint_get_file(fd)) {
-      taint_set_offset_label(offset_label);
-      if (offset_label) {
-        __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+      if (whence == SEEK_END && offset == 0) {
+        // `file_size = lseek(fd, 0, SEEK_END)` idiom: the result is the
+        // input length -> fsize label (Len predicate).
+        *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, 0, 0);
+        taint_set_offset_label(*ret_label);
+      } else {
+        taint_set_offset_label(offset_label);
+        if (offset_label) {
+          __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+        }
+        *ret_label = offset_label;
       }
-    }
-    *ret_label = offset_label;
+    } else *ret_label = 0;
   } else *ret_label = 0;
   return ret;
 }
@@ -4285,12 +4413,19 @@ __dfsw_lseek64(int fd, off64_t offset, int whence, dfsan_label fd_label,
   off64_t ret = lseek64(fd, offset, whence);
   if (ret != (off64_t)-1) {
     if (taint_get_file(fd)) {
-      taint_set_offset_label(offset_label);
-      if (offset_label) {
-        __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+      if (whence == SEEK_END && offset == 0) {
+        // `file_size = lseek(fd, 0, SEEK_END)` idiom: result is the input
+        // length -> fsize label (Len predicate).
+        *ret_label = dfsan_union(0, 0, fsize, sizeof(ret) * 8, 0, 0);
+        taint_set_offset_label(*ret_label);
+      } else {
+        taint_set_offset_label(offset_label);
+        if (offset_label) {
+          __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+        }
+        *ret_label = offset_label;
       }
-    }
-    *ret_label = offset_label;
+    } else *ret_label = 0;
   } else *ret_label = 0;
   return ret;
 }
@@ -4304,9 +4439,15 @@ __dfsw_fseek(FILE *stream, long offset, int whence, dfsan_label stream_label,
   int ret = fseek(stream, offset, whence);
   *ret_label = 0;
   if (ret == 0 && taint_get_file(fd)) {
-    taint_set_offset_label(offset_label);
-    if (offset_label) {
-      __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+    if (whence == SEEK_END && offset == 0) {
+      // Seek to end: the position (and a following ftell) is the input
+      // length -> fsize label (Len predicate).
+      taint_set_offset_label(dfsan_union(0, 0, fsize, 64, 0, 0));
+    } else {
+      taint_set_offset_label(offset_label);
+      if (offset_label) {
+        __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+      }
     }
   }
   return ret;
@@ -4320,9 +4461,13 @@ __dfsw_fseeko(FILE *stream, off_t offset, int whence, dfsan_label stream_label,
   int ret = fseeko(stream, offset, whence);
   *ret_label = 0;
   if (ret == 0 && taint_get_file(fd)) {
-    taint_set_offset_label(offset_label);
-    if (offset_label) {
-      __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+    if (whence == SEEK_END && offset == 0) {
+      taint_set_offset_label(dfsan_union(0, 0, fsize, 64, 0, 0));
+    } else {
+      taint_set_offset_label(offset_label);
+      if (offset_label) {
+        __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+      }
     }
   }
   return ret;
@@ -4337,11 +4482,39 @@ __dfsw_fseeko64(FILE *stream, off64_t offset, int whence, dfsan_label stream_lab
   int ret = fseeko64(stream, offset, whence);
   *ret_label = 0;
   if (ret == 0 && taint_get_file(fd)) {
-    taint_set_offset_label(offset_label);
-    if (offset_label) {
-      __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+    if (whence == SEEK_END && offset == 0) {
+      taint_set_offset_label(dfsan_union(0, 0, fsize, 64, 0, 0));
+    } else {
+      taint_set_offset_label(offset_label);
+      if (offset_label) {
+        __taint_trace_offset(offset_label, offset, sizeof(offset) * 8);
+      }
     }
   }
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE long
+__dfsw_ftell(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
+  long ret = ftell(stream);
+  // The position label tracks the last symbolic seek (SEEK_END -> fsize);
+  // concrete positions (reads) carry no label in v1 (documented residual:
+  // per-fd symbolic pos tracking).
+  *ret_label = taint_get_offset_label();
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE off_t
+__dfsw_ftello(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
+  off_t ret = ftello(stream);
+  *ret_label = taint_get_offset_label();
+  return ret;
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE off64_t
+__dfsw_ftello64(FILE *stream, dfsan_label stream_label, dfsan_label *ret_label) {
+  off64_t ret = ftello64(stream);
+  *ret_label = taint_get_offset_label();
   return ret;
 }
 

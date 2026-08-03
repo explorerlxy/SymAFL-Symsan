@@ -284,7 +284,9 @@ fun:fputs=discard
 fun:fputs_unlocked=discard
 # fun:fseek=discard
 # fun:fseeko64=discard
-fun:ftell=discard
+fun:ftell=custom
+fun:ftello=custom
+fun:ftello64=custom
 fun:fwrite=discard
 fun:getenv=discard
 fun:getuid=discard
@@ -514,6 +516,10 @@ fun:snprintf=custom
 fun:sscanf=custom
 fun:__isoc99_sscanf=custom
 fun:__isoc23_sscanf=custom
+fun:fscanf=custom
+fun:__isoc99_fscanf=custom
+fun:__isoc23_fscanf=custom
+fun:scanf=custom
 
 # TODO: custom
 fun:asprintf=discard

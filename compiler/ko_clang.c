@@ -266,6 +266,12 @@ static void add_taint_pass() {
     cc_params[cc_par_cnt++] = "-taint-trace-float-pointer=false";
   }
 
+  // Mismatch diagnostics: emit a cid -> source map for every condition id.
+  if (getenv("KO_EMIT_CID_MAP")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] = "-taint-emit-cid-map=true";
+  }
+
   if (getenv("KO_NO_TRACE_BOUND")) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] = "-taint-trace-bound=false";

@@ -20,6 +20,13 @@ constexpr size_t kMaxPredicateNodes = 2'000'000;
 constexpr size_t kMaxStrlenBytes = 256;
 constexpr size_t kMaxSearchBytes = 512;
 
+// Length-boundary count ops (flen_count family). They share the Count-family
+// node lowering; flen_eof and fsize are handled separately.
+static inline bool is_flen_count_op(uint16_t op_lo) {
+  return op_lo == __dfsan::flen_count || op_lo == __dfsan::flen_count_neg1 ||
+         op_lo == __dfsan::flen_count_elems;
+}
+
 struct ConvertFrame {
   uint32_t label;
   bool expanded;
@@ -110,6 +117,10 @@ uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
       op_lo == Shl || op_lo == LShr || op_lo == AShr || op_lo == And ||
       op_lo == Or || op_lo == Xor)
     return 2;
+  if (op == __dfsan::fsize || op == __dfsan::flen_eof ||
+      op == __dfsan::flen_count || op == __dfsan::flen_count_neg1 ||
+      op == __dfsan::flen_count_elems)
+    return 0;
   return 0;
 }
 
@@ -335,6 +346,28 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
         fail(PredError::UnsupportedCompare);
         return kInvalidNode;
     }
+    // A flen_count-family label compared against a *symbolic* operand: the
+    // count's clamp must follow the candidate's request (a length-derived
+    // expression such as `remaining`), not the trace-time constant recorded
+    // in the label. Splice the other side into the Count clamp.
+    const bool left_flen =
+        info->l1 != 0 && info->l1 < table_labels_ &&
+        is_flen_count_op(table_[info->l1].op & 0xff);
+    const bool right_flen =
+        info->l2 != 0 && info->l2 < table_labels_ &&
+        is_flen_count_op(table_[info->l2].op & 0xff);
+    if (left_flen && !right_flen && info->l2 != 0) {
+      uint32_t other = conv_child(info->l2, info->op2.i, size);
+      uint32_t count = build_flen_count(table_[info->l1], size, other);
+      if (count == kInvalidNode || other == kInvalidNode) return kInvalidNode;
+      return add(kind, size, count, other);
+    }
+    if (right_flen && !left_flen && info->l1 != 0) {
+      uint32_t other = conv_child(info->l1, info->op1.i, size);
+      uint32_t count = build_flen_count(table_[info->l2], size, other);
+      if (count == kInvalidNode || other == kInvalidNode) return kInvalidNode;
+      return add(kind, size, other, count);
+    }
     uint32_t a = conv_child(info->l1, info->op1.i, size);
     uint32_t b = conv_child(info->l2, info->op2.i, size);
     return a == kInvalidNode || b == kInvalidNode
@@ -348,6 +381,19 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     // Const of the literal's bits.
     return convert_fcmp(info, op);
   }
+  if (op_lo == ZExt) {
+    // A zero-extended single input byte is the getc-family read structure:
+    // a missing byte is EOF (masked -1 at the width), matching `c != EOF`
+    // evaluated at 32-bit. Lower to EofRead so short candidates route from
+    // byte nodes into the length nodes instead of mispredicting 0xFF != -1.
+    uint32_t a = conv_child(info->l1, info->op1.i, size);
+    if (a == kInvalidNode) return kInvalidNode;
+    const PNode &child_node = arena_->nodes[a];
+    if (child_node.kind == PKind::Read && child_node.bits == 8)
+      return add(PKind::EofRead, static_cast<uint16_t>(info->size),
+                 kNoChild, kNoChild, child_node.value);
+    return add(PKind::ZExt, size, a, kNoChild);
+  }
   if (unary) {
     uint32_t a = conv_child(info->l1, info->op1.i, size);
     return a == kInvalidNode ? kInvalidNode : add(kind, size, a, kNoChild);
@@ -359,8 +405,40 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
                ? kInvalidNode : add(kind, size, a, b);
   }
 
+  // Input-length boundary ops (flen_* / fsize): length-aware leaf nodes.
+  // Their comparison semantics flow through the regular ICmp machinery
+  // (EofRead's missing value is EOF, Count-family is a pure len function).
+  if (op == __dfsan::fsize) {
+    // stat st_size / lseek SEEK_END: the input length itself.
+    return add(PKind::Len, 64, kNoChild, kNoChild, 0);
+  }
+  if (op == __dfsan::flen_eof) {
+    // getc-family EOF read at missing offset k: input[k] or EOF(-1).
+    return add(PKind::EofRead, static_cast<uint16_t>(info->size),
+               kNoChild, kNoChild, info->op1.i);
+  }
+  if (is_flen_count_op(op)) {
+    uint16_t bits = static_cast<uint16_t>(info->size);
+    uint32_t clamp = add_const(info->op2.i & 0xFFFFFFFFull, bits);
+    return build_flen_count(*info, bits, clamp);
+  }
+
   // FP ops, string ops, Arg/Free, fmemcmp, GEP artifacts, ... : unsupported
   fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
+  return kInvalidNode;
+}
+
+uint32_t RunConverter::build_flen_count(const dfsan_label_info &info,
+                                        uint16_t bits, uint32_t clamp) {
+  uint16_t op_lo = info.op & 0xff;
+  if (op_lo == __dfsan::flen_count)
+    return add(PKind::Count, bits, clamp, kNoChild, info.op1.i);
+  if (op_lo == __dfsan::flen_count_neg1)
+    return add(PKind::CountNeg1, bits, clamp, kNoChild, info.op1.i);
+  if (op_lo == __dfsan::flen_count_elems) {
+    uint32_t item = add_const(info.op2.i >> 32, 32);
+    return add(PKind::CountElems, bits, clamp, item, info.op1.i);
+  }
   return kInvalidNode;
 }
 
@@ -810,12 +888,51 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
     switch (nd.kind) {
       case PKind::Opaque: return false;
       case PKind::Read: {
+        // Length-boundary semantics: a byte past the candidate length is a
+        // missing byte and evaluates as EOF (masked -1 at the node width),
+        // matching the getc-family behavior. This routes short candidates
+        // from byte nodes into the EofRead/Count length nodes instead of
+        // failing the eval (conservative admission).
         uint32_t nbytes = nd.bits / 8;
-        if (nd.bits == 0 || nd.bits % 8 != 0 || nbytes > 8 ||
-            nd.value + nbytes > len) return false;
+        if (nd.bits == 0 || nd.bits % 8 != 0 || nbytes > 8) return false;
         v = 0;
-        for (uint32_t k = 0; k < nbytes; k++)
-          v |= (uint64_t)input[nd.value + k] << (8 * k);
+        for (uint32_t k = 0; k < nbytes; k++) {
+          if (nd.value + k < len) {
+            v |= (uint64_t)input[nd.value + k] << (8 * k);
+          } else {
+            v |= 0xFFull << (8 * k);
+          }
+        }
+        break;
+      }
+      case PKind::Len: v = mask_bits(len, bits); break;
+      case PKind::EofRead: {
+        // getc-family read: one byte at nd.value, zero-extended; a missing
+        // byte (offset >= len) is EOF (masked -1 at the node width).
+        if (nd.bits == 0 || nd.bits > 64) return false;
+        v = (nd.value < len) ? (uint64_t)input[nd.value] : mask_bits(~0ull, bits);
+        break;
+      }
+      case PKind::Count:
+      case PKind::CountNeg1:
+      case PKind::CountElems: {
+        if (nd.bits == 0 || nd.bits > 64) return false;
+        uint64_t pos = nd.value;
+        if (len <= pos) {
+          v = (nd.kind == PKind::CountNeg1) ? mask_bits(~0ull, bits) : 0;
+          break;
+        }
+        uint64_t avail = (uint64_t)len - pos;
+        if (nd.kind == PKind::CountElems) {
+          // b = item size; a = nmemb. ret is the number of complete elements.
+          // fread(ptr, 0, ...) reads nothing: zero elements.
+          if (b == 0) { v = 0; break; }
+          uint64_t elems = avail / b;
+          v = (a < elems) ? a : elems;
+        } else {
+          v = (a < avail) ? a : avail;
+        }
+        v = mask_bits(v, bits);
         break;
       }
       case PKind::Const: v = mask_bits(nd.value, bits); break;

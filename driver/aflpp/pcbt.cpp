@@ -2,8 +2,85 @@
 
 namespace pcbt {
 
+namespace {
+const char *pkind_name(PKind kind) {
+  switch (kind) {
+    case PKind::Opaque: return "opaque";
+    case PKind::Read: return "read";
+    case PKind::Const: return "const";
+    case PKind::Add: return "add";
+    case PKind::Sub: return "sub";
+    case PKind::Mul: return "mul";
+    case PKind::UDiv: return "udiv";
+    case PKind::SDiv: return "sdiv";
+    case PKind::URem: return "urem";
+    case PKind::SRem: return "srem";
+    case PKind::Neg: return "neg";
+    case PKind::Not: return "not";
+    case PKind::And: return "and";
+    case PKind::Or: return "or";
+    case PKind::Xor: return "xor";
+    case PKind::Shl: return "shl";
+    case PKind::LShr: return "lshr";
+    case PKind::AShr: return "ashr";
+    case PKind::Equal: return "eq";
+    case PKind::Distinct: return "ne";
+    case PKind::Ult: return "ult";
+    case PKind::Ule: return "ule";
+    case PKind::Ugt: return "ugt";
+    case PKind::Uge: return "uge";
+    case PKind::Slt: return "slt";
+    case PKind::Sle: return "sle";
+    case PKind::Sgt: return "sgt";
+    case PKind::Sge: return "sge";
+    case PKind::ZExt: return "zext";
+    case PKind::SExt: return "sext";
+    case PKind::Extract: return "extract";
+    case PKind::Concat: return "concat";
+    case PKind::Memcmp: return "memcmp";
+    case PKind::Len: return "len";
+    case PKind::EofRead: return "eofread";
+    case PKind::Count: return "count";
+    case PKind::CountNeg1: return "countneg1";
+    case PKind::CountElems: return "countelems";
+  }
+  return "?";
+}
+}  // namespace
+
 Tree::Tree() : nodes_(kRoot + 1) {
   pred_arena_.nodes.reserve(4096);
+}
+
+void Tree::DebugPredicate(NodeRef ref, const uint8_t *input,
+                          uint32_t len) const {
+  if (ref == kUnexplored || ref == kTerminal || ref == kRoot) return;
+  const Node &n = node(ref);
+  fprintf(stderr, "[pcbt-dbg] node=%u cid=%u depth=%u opaque=%d\n",
+          ref, n.cid, n.depth, n.pred.opaque ? 1 : 0);
+  if (n.pred.opaque) return;
+  fprintf(stderr, "[pcbt-dbg] reads:");
+  for (const auto &r : n.pred.reads) {
+    fprintf(stderr, " %u+%u=[", r.first, r.second);
+    for (uint32_t k = 0; k < r.second && r.first + k < len; k++)
+      fprintf(stderr, "%02x", input[r.first + k]);
+    fprintf(stderr, "]");
+  }
+  fprintf(stderr, "\n");
+  std::vector<uint32_t> stack;
+  if (n.pred.root < pred_arena_.nodes.size())
+    stack.push_back(n.pred.root);
+  while (!stack.empty()) {
+    uint32_t idx = stack.back();
+    stack.pop_back();
+    if (idx >= pred_arena_.nodes.size()) continue;
+    const PNode &p = pred_arena_.nodes[idx];
+    fprintf(stderr, "[pcbt-dbg]   %u %s bits=%u value=%llu a=%u b=%u\n",
+            idx, pkind_name(p.kind), p.bits, (unsigned long long)p.value,
+            p.a, p.b);
+    if (p.a != UINT32_MAX) stack.push_back(p.a);
+    if (p.b != UINT32_MAX) stack.push_back(p.b);
+  }
 }
 
 NodeRef Tree::append(Node &&new_node) {
@@ -206,11 +283,44 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     const Node &current = node(cur);
     // CID check
     if (current.cid != ev.cid) {
+      if (debug_) DebugPredicate(cur, input, len);
       r.error = ReplayError::CidMismatch;
       r.event_index = i;
       r.expected_cid = current.cid;
       r.observed_cid = ev.cid;
       return r;
+    }
+    // Constraint events (tainted GEP index / indcall target == concrete)
+    // record result always 1: the constraint held for the traced run. The
+    // stored predicate is screening semantics (evaluates 0 for candidates
+    // whose index differs), so direction validation would be a false
+    // positive. Follow the recorded direction; the next event's CID check
+    // still guards the path.
+    if (ev.constraint) {
+      NodeRef next = current.child[ev.result ? 1 : 0];
+      if (next == kTerminal) {
+        if (i + 1 < events.size()) {
+          r.error = ReplayError::AfterTerminal;
+          r.event_index = i + 1;
+          r.verified_events = i + 1;
+          return r;
+        }
+        r.event_index = i;
+        r.verified_events = i + 1;
+        r.reached_terminal = true;
+        return r;
+      }
+      if (next == kUnexplored) {
+        r.event_index = i;
+        r.verified_events = i + 1;
+        r.reached_frontier = true;
+        r.frontier_node = cur;
+        r.frontier_dir = ev.result ? 1 : 0;
+        r.suffix_begin = i + 1;
+        return r;
+      }
+      cur = next;
+      continue;
     }
     // Evaluate predicate
     if (current.pred.opaque) {
@@ -235,6 +345,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     uint8_t dir = v ? 1 : 0;
     r.direction_checked = true;
     if (dir != ev.result) {
+      if (debug_) DebugPredicate(cur, input, len);
       r.error = ReplayError::DirectionMismatch;
       r.event_index = i;
       r.expected_cid = current.cid;
@@ -276,6 +387,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
   r.verified_events = i;
   r.event_index = i;
   r.error = ReplayError::TruncatedTrace;
+  if (debug_) DebugPredicate(cur, input, len);
   return r;
 }
 

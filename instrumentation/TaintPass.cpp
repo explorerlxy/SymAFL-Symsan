@@ -15,6 +15,7 @@
 //#include "defs.h"
 #include "UCSanSummary.h"
 
+#include <cstdio>
 #include <optional>
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -220,6 +221,13 @@ static cl::opt<bool> ClSolveUB(
 static cl::opt<bool> ClTraceAnnotatedBB(
     "taint-trace-annotated-bb",
     cl::desc("Only trace annotated basic blocks."),
+    cl::Hidden, cl::init(false));
+
+// SYMSAN specific flags, emit a cid -> source map to stderr (mismatch
+// diagnostics: resolve replay dir_mismatch cids to branch sites)
+static cl::opt<bool> ClEmitCidMap(
+    "taint-emit-cid-map",
+    cl::desc("Emit [cid-map] cid source lines for every condition id."),
     cl::Hidden, cl::init(false));
 
 // SYMSAN specific flags, if runs with UCSan
@@ -897,7 +905,13 @@ uint32_t Taint::getInstructionId(Instruction *Inst) {
     SourceInfo += "unamed:" + std::to_string(unamed++);
   }
 
-  return djbHash(SourceInfo);
+  uint32_t cid = djbHash(SourceInfo);
+  // Mismatch diagnostics: emit a cid -> source map (SYMAFL_EMIT_CID_MAP=1)
+  // so replay dir_mismatch cids can be resolved to branch sites.
+  if (ClEmitCidMap) {
+    fprintf(stderr, "[cid-map] %u %s\n", cid, SourceInfo.c_str());
+  }
+  return cid;
 }
 
 void Taint::addContextRecording(Function &F) {

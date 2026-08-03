@@ -33,6 +33,16 @@ enum class PKind : uint8_t {
   Not, And, Or, Xor, Shl, LShr, AShr,
   Equal, Distinct, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge,
   ZExt, SExt, Extract, Concat, Memcmp,
+  // Input-length boundary nodes (flen_* labels). `len` is the eval-time
+  // candidate length; a missing byte evaluates as EOF (masked -1 at width).
+  Len,      // leaf: value ignored; eval = mask_bits(len, bits)
+  EofRead,  // leaf: value=byte offset; eval = offset < len ? input[offset]
+            //        (zero-extended) : mask_bits(-1, bits)
+  Count,    // value=pre-read pos, a=Const(requested bytes); eval =
+            //        len <= pos ? 0 : min(len - pos, n)
+  CountNeg1, // same as Count, but EOF value is -1 (getline family)
+  CountElems, // value=pre-read pos, a=Const(nmemb), b=Const(item size);
+              // eval = len <= pos ? 0 : min((len - pos) / size, nmemb)
 };
 
 // A conversion failure is never a predicate result.  It is retained as
@@ -138,6 +148,12 @@ class RunConverter {
   uint32_t convert_strstr_cmp(const dfsan_label_info *info, uint32_t op,
                               const dfsan_label_info &strstr_info);
   uint32_t convert_fcmp(const dfsan_label_info *info, uint32_t op);
+
+  // Length-boundary lowering (flen_* ops). Builds a Count-family node with
+  // the given clamp expression (the label's constant request, or a spliced
+  // symbolic request from the comparison's other side).
+  uint32_t build_flen_count(const dfsan_label_info &info, uint16_t bits,
+                            uint32_t clamp);
   uint32_t fp_is_nan(uint32_t a, uint16_t w);
   uint32_t fp_is_zero(uint32_t a, uint16_t w);
   uint32_t fp_total_order(uint32_t a, uint16_t w);

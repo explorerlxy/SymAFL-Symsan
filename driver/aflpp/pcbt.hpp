@@ -33,6 +33,9 @@ struct Event {
   uint32_t cid;
   uint32_t label;  // AST label in the *current* union table (per-run)
   uint8_t result;  // concrete branch outcome (0/1)
+  // Constraint events (tainted GEP index / indcall target == concrete) have
+  // result always 1 and skip direction validation during replay.
+  uint8_t constraint = 0;
 };
 
 class Tree {
@@ -97,6 +100,13 @@ class Tree {
     return node(ref).rCnt[direction];
   }
 
+  // Mismatch diagnostics (SYMAFL_PCBT_DEBUG): dump the stored predicate at a
+  // node (DAG + reads + the input bytes they reference) to stderr. Tree
+  // members only; used by ReplayFullTrace's mismatch branches.
+  void set_debug(bool enabled) { debug_ = enabled; }
+  bool debug() const { return debug_; }
+  void DebugPredicate(NodeRef ref, const uint8_t *input, uint32_t len) const;
+
   // stats
   uint64_t num_nodes = 0;
   uint64_t num_traces = 0;
@@ -118,6 +128,7 @@ class Tree {
   const Node &node(NodeRef ref) const { return nodes_[ref]; }
   NodeRef append(Node &&node);
   bool IsSaturated(NodeRef ref, uint8_t rlimit) const;
+  bool debug_ = false;
 
   // Index 1 is a global terminal node; index 2 is the virtual root.
   std::vector<Node> nodes_;

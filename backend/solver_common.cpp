@@ -107,7 +107,9 @@ void __taint_send_cond(dfsan_label label, uint8_t result,
       __atomic_store_n(&__single_pass->overflow, 1, __ATOMIC_RELEASE);
       return;
     }
-    __single_pass->events[index] = {cid, label, result, {0, 0, 0}};
+    uint8_t constraint = (loop_flag & ConstraintFlag) ? 1 : 0;
+    __single_pass->events[index] = {cid, label, result,
+                                    {constraint, 0, 0}};
     return;
   }
 
@@ -136,6 +138,7 @@ void __taint_send_cond(dfsan_label label, uint8_t result,
 
   uint16_t flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
+  if (loop_flag & ConstraintFlag) flags |= F_CONSTRAINT;
 
   // set the loop flags according to branching results
   switch (loop_flag) {
