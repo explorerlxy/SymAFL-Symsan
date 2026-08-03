@@ -155,6 +155,53 @@ struct my_mutator_t {
   uint64_t veto_probe_admitted = 0;
   uint64_t veto_probe_gained = 0;
   bool last_was_probe = false;
+
+  // Probe/screening diagnostic (SYMAFL_PROBE_DIAG=1): probes arm suffix
+  // capture at the veto depth, so we can classify what the vetoed population
+  // actually does past the terminal prefix: an empty suffix means the
+  // decision trace really terminates there (bitmap gains are event-free
+  // divergence, structural); a nonempty suffix means the tree's terminal
+  // judgment was wrong (screening defect, fixable). Admitted runs are also
+  // measured: how many execute a decision-bearing suffix past the frontier
+  // without any bitmap gain (tree gain without coverage gain).
+  bool probe_diag = false;
+  uint64_t diag_probe_suffix_empty = 0;    // veto: no decisions past terminal
+  uint64_t diag_probe_suffix_nonempty = 0; // veto: decisions past terminal
+  uint64_t diag_probe_suffix_overflow = 0;
+  uint64_t diag_probe_suffix_events = 0;
+  uint64_t diag_admit_suffix_empty = 0;    // admit: no decisions past frontier
+  uint64_t diag_admit_suffix_nonempty = 0; // admit: decisions past frontier
+  uint64_t diag_admit_suffix_overflow = 0;
+  uint64_t diag_admit_suffix_events = 0;
+  // Veto depth buckets (16-deep buckets, >=256 in the last one).
+  uint64_t diag_veto_depth[17] = {};
+  uint32_t last_veto_depth = 0;
+  // Saturation via probe-gain windows (SYMAFL_SAT_WINDOW / SYMAFL_SAT_MIN_GAINS,
+  // default off): once a window of probe outcomes yields fewer than
+  // sat_min_gains coverage gains, the vetoed population no longer carries
+  // exploitable event-free divergence and the tree's screening marginal value
+  // is exhausted; the run switches to the concrete target (baseline speed).
+  uint64_t sat_window = 0;
+  uint64_t sat_min_gains = 0;
+  uint64_t sat_consec = 0;        // consecutive low-gain windows required
+  uint64_t sat_probe_total = 0;   // probes observed since last check
+  uint64_t sat_probe_gained = 0;  // gains among them
+  uint64_t sat_low_windows = 0;   // consecutive windows below min_gains
+  // Hard concolic-phase deadline (SYMAFL_CONCOLIC_SECONDS=N): switch to the
+  // concrete target after N seconds of screening, independent of probe-gain
+  // windows, so the phase transition is reproducible across runs. The
+  // adaptive window can still trigger an earlier switch.
+  uint64_t concolic_deadline = 0;
+  time_t phase_start = 0;
+  // Per-probe linkage: whether the executed probe had a decision-bearing
+  // suffix past the veto depth (screening defect class) and its input length.
+  bool last_probe_suffix_nonempty = false;
+  bool last_probe_suffix_overflow = false;
+  uint32_t last_probe_len = 0;
+  uint64_t probe_gained_nonempty = 0;
+  uint64_t probe_gained_empty = 0;
+  uint64_t probe_gained_overflow = 0;
+  uint64_t diag_probe_details = 0;  // printed nonempty-probe details
 };
 
 // Shared union table owned by the target forkserver.
@@ -208,10 +255,10 @@ class ProfileSegment {
 
 static bool check_input_timed(my_mutator_t *data, const u8 *buf,
                               uint32_t buf_size, pcbt::NodeRef *node,
-                              uint8_t *dir) {
+                              uint8_t *dir, uint32_t *veto_depth = nullptr) {
   uint64_t start = profile_start(data);
   bool admitted = data->tree.CheckInput(buf, buf_size, node, dir,
-                                        data->rlimit);
+                                        data->rlimit, veto_depth);
   profile_stop(data, start, &data->profile_check_ns,
                &data->profile_check_calls);
   return admitted;
@@ -370,6 +417,44 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
             "vetoed candidate to measure incorrect-veto rate\n",
             (unsigned long long)parsed);
   }
+  if (getenv("SYMAFL_PROBE_DIAG")) {
+    data->probe_diag = true;
+    fprintf(stderr, "[pcbt] probe diagnostic enabled (SYMAFL_PROBE_DIAG=1)\n");
+  }
+  if (const char *cd = getenv("SYMAFL_CONCOLIC_SECONDS")) {
+    char *end = nullptr;
+    unsigned long long parsed = strtoull(cd, &end, 10);
+    if (end == cd || *end != '\0' || parsed == 0) {
+      FATAL("Invalid SYMAFL_CONCOLIC_SECONDS=%s", cd);
+    }
+    data->concolic_deadline = parsed;
+    fprintf(stderr, "[pcbt] concolic phase deadline: %llus\n",
+            (unsigned long long)parsed);
+  }
+  if (const char *sw = getenv("SYMAFL_SAT_WINDOW")) {
+    char *end = nullptr;
+    unsigned long long parsed = strtoull(sw, &end, 10);
+    if (end == sw || *end != '\0' || parsed == 0) {
+      FATAL("Invalid SYMAFL_SAT_WINDOW=%s", sw);
+    }
+    data->sat_window = parsed;
+    const char *mg = getenv("SYMAFL_SAT_MIN_GAINS");
+    if (!mg) {
+      FATAL("SYMAFL_SAT_WINDOW requires SYMAFL_SAT_MIN_GAINS");
+    }
+    char *mgend = nullptr;
+    unsigned long long mgparsed = strtoull(mg, &mgend, 10);
+    if (mgend == mg || *mgend != '\0') {
+      FATAL("Invalid SYMAFL_SAT_MIN_GAINS=%s", mg);
+    }
+    data->sat_min_gains = mgparsed;
+    const char *sc = getenv("SYMAFL_SAT_CONSEC");
+    data->sat_consec = sc ? strtoull(sc, nullptr, 10) : 1;
+    fprintf(stderr, "[pcbt] probe-gain saturation window enabled: "
+            "window=%llu min_gains=%llu consec=%llu\n",
+            (unsigned long long)parsed, (unsigned long long)mgparsed,
+            (unsigned long long)data->sat_consec);
+  }
   return data;
 }
 
@@ -445,6 +530,30 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   for (const auto &entry : t.opaque_by_op) {
     fprintf(stderr, "[pcbt-opaque-op] op=%u count=%llu\n", entry.first,
             (unsigned long long)entry.second);
+  }
+  if (data->probe_diag) {
+    fprintf(stderr,
+            "[pcbt-diag] probe_suffix_empty=%llu probe_suffix_nonempty=%llu "
+            "probe_suffix_overflow=%llu probe_suffix_events=%llu "
+            "admit_suffix_empty=%llu admit_suffix_nonempty=%llu "
+            "admit_suffix_overflow=%llu admit_suffix_events=%llu "
+            "probe_gained_nonempty=%llu probe_gained_empty=%llu "
+            "probe_gained_overflow=%llu veto_depth_buckets=",
+            (unsigned long long)data->diag_probe_suffix_empty,
+            (unsigned long long)data->diag_probe_suffix_nonempty,
+            (unsigned long long)data->diag_probe_suffix_overflow,
+            (unsigned long long)data->diag_probe_suffix_events,
+            (unsigned long long)data->diag_admit_suffix_empty,
+            (unsigned long long)data->diag_admit_suffix_nonempty,
+            (unsigned long long)data->diag_admit_suffix_overflow,
+            (unsigned long long)data->diag_admit_suffix_events,
+            (unsigned long long)data->probe_gained_nonempty,
+            (unsigned long long)data->probe_gained_empty,
+            (unsigned long long)data->probe_gained_overflow);
+    for (size_t i = 0; i < 17; ++i) {
+      fprintf(stderr, "%llu%s", (unsigned long long)data->diag_veto_depth[i],
+              i + 1 < 17 ? "," : "\n");
+    }
   }
   delete data;
 }
@@ -785,8 +894,91 @@ static bool read_cur_input(my_mutator_t *data, std::vector<u8> *buf) {
   return ok;
 }
 
+static void classify_suffix(my_mutator_t *data, uint64_t *empty,
+                            uint64_t *nonempty, uint64_t *overflow,
+                            uint64_t *events_sum) {
+  symafl_single_pass_control *control = data->single_pass_control;
+  uint32_t count = __atomic_load_n(&control->event_count, __ATOMIC_ACQUIRE);
+  bool over = __atomic_load_n(&control->overflow, __ATOMIC_ACQUIRE) ||
+              count > control->event_capacity;
+  if (over) {
+    *overflow += 1;
+  } else if (count > 0) {
+    *nonempty += 1;
+    *events_sum += count;
+  } else {
+    *empty += 1;
+  }
+}
+
 extern "C" void afl_custom_post_run(my_mutator_t *data) {
-  if (data->bootstrap_done || !data->single_pass_armed) return;
+  // Probe diagnostic: classify what a sampled vetoed candidate executed past
+  // the known terminal prefix. Nonempty suffix = screening defect (the tree
+  // claimed the decision trace terminates, but it does not).
+  if (data->last_was_probe && data->probe_diag && data->single_pass_armed) {
+    symafl_single_pass_control *control = data->single_pass_control;
+    uint32_t count = __atomic_load_n(&control->event_count, __ATOMIC_ACQUIRE);
+    bool over = __atomic_load_n(&control->overflow, __ATOMIC_ACQUIRE) ||
+                count > control->event_capacity;
+    if (over) {
+      data->diag_probe_suffix_overflow += 1;
+      data->last_probe_suffix_overflow = true;
+    } else if (count > 0) {
+      data->diag_probe_suffix_nonempty += 1;
+      data->diag_probe_suffix_events += count;
+      data->last_probe_suffix_nonempty = true;
+      if (data->diag_probe_details < 30) {
+        data->diag_probe_details += 1;
+        fprintf(stderr,
+                "[pcbt-diag] probe-detail len=%u veto_depth=%u suffix=%u "
+                "events:",
+                data->last_probe_len, data->last_veto_depth, count);
+        uint32_t shown = count < 4 ? count : 4;
+        for (uint32_t k = 0; k < shown; ++k) {
+          const symafl_single_pass_event &ev = control->events[k];
+          fprintf(stderr, " cid=%u label=%u res=%u cnt=%u",
+                  ev.cid, ev.label, ev.result, ev.count);
+        }
+        fprintf(stderr, "\n");
+      }
+    } else {
+      data->diag_probe_suffix_empty += 1;
+    }
+    disarm_capture(data);
+    return;
+  }
+  if (data->bootstrap_done) {
+    // Admitted-run diagnostic: does the frontier suffix carry decisions
+    // (tree gain) even when the run gains no bitmap coverage?
+    if (data->probe_diag && data->single_pass_armed &&
+        data->last_node != pcbt::kUnexplored) {
+      classify_suffix(data, &data->diag_admit_suffix_empty,
+                      &data->diag_admit_suffix_nonempty,
+                      &data->diag_admit_suffix_overflow,
+                      &data->diag_admit_suffix_events);
+    }
+    // Tree learning: every admitted execution that carried a decision
+    // suffix past the frontier contributes it to the tree, not just
+    // coverage-gaining ones. The tree's decision coverage then tracks the
+    // executed population (instead of ~1/90 of it), so frontier judgments
+    // sharpen and the admit channel can carry a larger share of the
+    // execution budget. Mark the frontier consumed so queue_new_entry's
+    // duplicate insert (coverage-gaining case) is a no-op and never
+    // triggers an overflow replay.
+    if (data->single_pass_armed && data->last_node != pcbt::kUnexplored) {
+      uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
+                                      __ATOMIC_ACQUIRE);
+      if (mode == SYMAFL_TRACE_SUFFIX_SHM) {
+        uint64_t before = data->tree.num_traces;
+        (void)insert_suffix_capture(data, nullptr, 0, "admit-run");
+        if (data->tree.num_traces > before) {
+          data->last_node = pcbt::kUnexplored;
+        }
+      }
+    }
+    return;
+  }
+  if (!data->single_pass_armed) return;
   uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
                                   __ATOMIC_ACQUIRE);
   if (mode == SYMAFL_TRACE_SUFFIX_SHM &&
@@ -810,6 +1002,9 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   (void)filename;
   data->bootstrap_done = true;
+  if (data->concolic_deadline && !data->phase_start) {
+    data->phase_start = time(nullptr);
+  }
   return 1;
 }
 
@@ -821,10 +1016,23 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   if (data->last_was_probe) {
     data->last_was_probe = false;
     data->veto_probe_gained += 1;
+    if (data->sat_window) data->sat_probe_gained += 1;
+    if (data->probe_diag) {
+      if (data->last_probe_suffix_nonempty) data->probe_gained_nonempty += 1;
+      else if (data->last_probe_suffix_overflow) data->probe_gained_overflow += 1;
+      else data->probe_gained_empty += 1;
+    }
+    data->last_probe_suffix_overflow = false;
     data->last_gained = true;
     return 0;
   }
-  if (!data->bootstrap_done || !data->single_pass_armed) return 0;
+  // Seeds and post-saturation concrete-phase gains are not PCBT admissions.
+  if (!data->bootstrap_done || !data->screening) return 0;
+  data->traced_entries.insert((const char *)filename_new_queue);
+  // post_run already learned this admitted run's suffix into the tree (all
+  // admitted runs learn now, not just coverage-gaining ones), so there is
+  // nothing left to capture for it.
+  if (!data->single_pass_armed) return 0;
   const char *fname = (const char *)filename_new_queue;
   std::vector<u8> buf;
   if (!read_queue_file(fname, &buf)) {
@@ -847,7 +1055,6 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     (void)replay_pipe_suffix(data, buf.data(), buf.size(), fname, node, dir);
   }
   data->last_gained = true;
-  data->traced_entries.insert(fname);
   return 0;
 }
 
@@ -881,7 +1088,8 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   data->screened += 1;
   pcbt::NodeRef node = pcbt::kUnexplored;
   uint8_t dir = 0;
-  if (check_input_timed(data, buf, (uint32_t)buf_size, &node, &dir)) {
+  if (check_input_timed(data, buf, (uint32_t)buf_size, &node, &dir,
+                        &data->last_veto_depth)) {
     data->admitted += 1;
     data->vetoes_since_admit = 0;
     data->last_gained = false;
@@ -905,10 +1113,18 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
 
   data->vetoed += 1;
   ++data->vetoes_since_admit;
+  if (data->probe_diag) {
+    // Veto depth histogram (16-deep buckets; >=256 in the last).
+    uint32_t d = data->last_veto_depth;
+    size_t b = d / 16;
+    if (b > 16) b = 16;
+    data->diag_veto_depth[b] += 1;
+  }
   // Veto probe: execute a sampled vetoed candidate to measure whether the
   // screening is incorrectly vetoing would-be coverage-gaining inputs. The
   // probe does not arm capture, so it never grows the tree; its coverage gain
-  // (if any) is counted in veto_probe_gained.
+  // (if any) is counted in veto_probe_gained. With SYMAFL_PROBE_DIAG it arms
+  // suffix capture at the veto depth so post_run can classify the suffix.
   if (data->veto_probe_every &&
       ++data->veto_probe_count >= data->veto_probe_every) {
     data->veto_probe_count = 0;
@@ -916,9 +1132,103 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     data->last_was_probe = true;
     data->last_gained = false;
     data->last_node = pcbt::kUnexplored;
+    data->last_probe_suffix_nonempty = false;
+    data->last_probe_len = (uint32_t)buf_size;
+    if (data->sat_window) data->sat_probe_total += 1;
     if (data->single_pass_armed) disarm_capture(data);
+    if (data->probe_diag && data->last_veto_depth > 0) {
+      symafl_single_pass_control *control = data->single_pass_control;
+      __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
+      __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
+      control->skip_depth = data->last_veto_depth;
+      __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_SHM,
+                       __ATOMIC_RELEASE);
+      __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
+      data->single_pass_armed = true;
+    }
     *out_buf = buf;
     return buf_size;
+  }
+  // Hard deadline: reproducible concolic-phase length. phase_start is
+  // initialized on the first check (queue_get may not run before the first
+  // screened candidate, e.g. when the initial queue handling path differs),
+  // so a deadline of N means N seconds after screening begins.
+  if (data->concolic_deadline && !data->saturation_logged) {
+    time_t now = time(nullptr);
+    if (data->phase_start == 0) {
+      data->phase_start = now;
+    } else if ((uint64_t)(now - data->phase_start) >=
+               data->concolic_deadline) {
+    data->saturation_logged = true;
+    fprintf(stderr,
+            "[pcbt-concolic-phase] screened=%llu admitted=%llu "
+            "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
+            "probe_gained=%llu admit_frontier=%llu veto_terminal=%llu "
+            "traces=%llu nodes=%llu depth=%llu\n",
+            (unsigned long long)data->screened,
+            (unsigned long long)data->admitted,
+            (unsigned long long)data->vetoed,
+            (unsigned long long)data->traced_entries.size(),
+            (unsigned long long)data->veto_probe_admitted,
+            (unsigned long long)data->veto_probe_gained,
+            (unsigned long long)data->tree.check_admit_frontier,
+            (unsigned long long)data->tree.check_veto_terminal,
+            (unsigned long long)data->tree.num_traces,
+            (unsigned long long)data->tree.num_nodes,
+            (unsigned long long)data->tree.max_depth);
+    fprintf(stderr,
+            "[pcbt] concolic phase deadline (%llus) reached; "
+            "switching to concrete\n",
+            (unsigned long long)data->concolic_deadline);
+    data->screening = false;
+    data->afl->pcbt_switch_pending = 1;
+    }
+  }
+  // Probe-gain saturation: the vetoed population stopped paying out.
+  if (data->sat_window && data->sat_probe_total >= data->sat_window) {
+    bool sat = data->sat_probe_gained < data->sat_min_gains;
+    if (!data->saturation_logged) {
+      fprintf(stderr,
+              "[pcbt] sat window: probes=%llu gains=%llu min=%llu -> %s\n",
+              (unsigned long long)data->sat_probe_total,
+              (unsigned long long)data->sat_probe_gained,
+              (unsigned long long)data->sat_min_gains,
+              sat ? "saturated" : "unsaturated");
+    }
+    data->sat_probe_total = 0;
+    data->sat_probe_gained = 0;
+    data->sat_low_windows = sat ? data->sat_low_windows + 1 : 0;
+    if (sat && data->sat_low_windows >= data->sat_consec) {
+      if (!data->saturation_logged) {
+        data->saturation_logged = true;
+        fprintf(stderr,
+                "[pcbt-concolic-phase] screened=%llu admitted=%llu "
+                "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
+                "probe_gained=%llu admit_frontier=%llu veto_terminal=%llu "
+                "traces=%llu nodes=%llu depth=%llu\n",
+                (unsigned long long)data->screened,
+                (unsigned long long)data->admitted,
+                (unsigned long long)data->vetoed,
+                (unsigned long long)data->traced_entries.size(),
+                (unsigned long long)data->veto_probe_admitted,
+                (unsigned long long)data->veto_probe_gained,
+                (unsigned long long)data->tree.check_admit_frontier,
+                (unsigned long long)data->tree.check_veto_terminal,
+                (unsigned long long)data->tree.num_traces,
+                (unsigned long long)data->tree.num_nodes,
+                (unsigned long long)data->tree.max_depth);
+        fprintf(stderr,
+                "[pcbt] probe-gain saturation after %llu vetoes "
+                "(window=%llu gains=%llu consec=%llu); switching to concrete\n",
+                (unsigned long long)data->vetoed,
+                (unsigned long long)data->sat_window,
+                (unsigned long long)data->sat_min_gains,
+                (unsigned long long)data->sat_low_windows);
+      }
+      data->screening = false;
+      data->afl->pcbt_switch_pending = 1;
+    }
   }
   // A saturated PCBT is a phase boundary, not a local screening fallback.
   // Let AFL++ perform the restart at its next scheduler boundary, where it

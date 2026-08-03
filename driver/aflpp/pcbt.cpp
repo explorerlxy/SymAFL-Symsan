@@ -220,7 +220,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
 }
 
 bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
-                      uint8_t *out_dir, uint8_t rlimit) {
+                      uint8_t *out_dir, uint8_t rlimit,
+                      uint32_t *out_veto_depth) {
   NodeRef cur = node(kRoot).child[0];
   if (cur == kUnexplored) {
     *out_node = kUnexplored;
@@ -251,6 +252,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
     if (next == kTerminal) {
       *out_node = kUnexplored;
       *out_dir = 0;
+      if (out_veto_depth) *out_veto_depth = current.depth;
       check_veto_terminal += 1;
       return false;
     }
@@ -261,6 +263,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
         check_admit_frontier += 1;
         return true;
       }
+      if (out_veto_depth) *out_veto_depth = current.depth;
       check_veto_rlimit += 1;
       return false;
     }

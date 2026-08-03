@@ -63,7 +63,8 @@ class Tree {
   // unexplored frontier for retry bookkeeping and suffix skip depth. Terminal
   // edges are already explored and vetoed.
   bool CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
-                  uint8_t *out_dir, uint8_t rlimit);
+                  uint8_t *out_dir, uint8_t rlimit,
+                  uint32_t *out_veto_depth = nullptr);
 
   // Const replay: walk the event vector from kRoot and compare CID order
   // and predicate directions against the tree.  Never mutates any state.
