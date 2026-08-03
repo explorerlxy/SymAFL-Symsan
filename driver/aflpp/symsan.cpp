@@ -512,7 +512,20 @@ static bool decode_full_stream(const u8 *wire, size_t wire_size,
       if (msg.label >= MAX_LABEL) return false;
       uint8_t is_constraint = (msg.flags & F_CONSTRAINT) ? 1 : 0;
       events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0),
-                         is_constraint});
+                         is_constraint, 1});
+      continue;
+    }
+    if (msg.msg_type == fold_type) {
+      // Fold frame: `count` consecutive conditions with the same cid/result
+      // and a byte-advancing Read-family shape. The mutator expands it when
+      // inserting (no synthetic labels exist for the intermediate events).
+      n_cond++;
+      if (msg.count < 2 || msg.count > SYMAFL_MAX_FOLD_COUNT) return false;
+      if (msg.label == 0) { n_dropped_zero++; continue; }
+      if (msg.label == kInitializingLabel) { n_dropped_init++; continue; }
+      if (msg.label >= MAX_LABEL) return false;
+      events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0), 0,
+                         (uint16_t)msg.count});
       continue;
     }
     size_t trailer = 0;
@@ -643,8 +656,11 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   uint32_t created = data->tree.InsertTrace(events, __dfsan_label_info,
                                             MAX_LABEL);
   data->traced_runs += 1;
-  fprintf(stderr, "[pcbt-trace] %s mode=full events=%zu created=%u\n",
-          fname, events.size(), created);
+  uint64_t expanded = 0;
+  for (const pcbt::Event &ev : events) expanded += ev.count;
+  fprintf(stderr, "[pcbt-trace] %s mode=full events=%zu expanded=%llu "
+          "created=%u\n", fname, events.size(),
+          (unsigned long long)expanded, created);
   disarm_capture(data);
   return true;
 }
@@ -664,9 +680,13 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
   }
   uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
       events, __dfsan_label_info, MAX_LABEL);
+  uint64_t expanded = 0;
+  for (const pcbt::Event &ev : events) expanded += ev.count;
   fprintf(stderr,
-          "[pcbt-trace] %s mode=pipe-suffix skip=%u events=%zu created=%u\n",
-          fname, data->tree.depth(data->last_node), events.size(), created);
+          "[pcbt-trace] %s mode=pipe-suffix skip=%u events=%zu expanded=%llu "
+          "created=%u\n",
+          fname, data->tree.depth(data->last_node), events.size(),
+          (unsigned long long)expanded, created);
   disarm_capture(data);
   return true;
 }
@@ -697,15 +717,25 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
       disarm_capture(data);
       return false;
     }
-    uint8_t is_constraint = event.reserved[0] ? 1 : 0;
-    events.push_back({event.cid, event.label, event.result, is_constraint});
+    if (event.count != 0 && (event.count < 2 ||
+                             event.count > SYMAFL_MAX_FOLD_COUNT)) {
+      disarm_capture(data);
+      return false;
+    }
+    uint16_t fold = event.count != 0 ? event.count : 1;
+    events.push_back({event.cid, event.label, event.result,
+                      event.constraint, fold});
   }
   uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
       events, data->single_pass_label_info, MAX_LABEL);
   data->single_pass_captures += 1;
+  uint64_t expanded = 0;
+  for (const pcbt::Event &ev : events) expanded += ev.count;
   fprintf(stderr,
-          "[pcbt-trace] %s mode=suffix skip=%u events=%zu created=%u\n",
-          fname, data->tree.depth(data->last_node), events.size(), created);
+          "[pcbt-trace] %s mode=suffix skip=%u events=%zu expanded=%llu "
+          "created=%u\n",
+          fname, data->tree.depth(data->last_node), events.size(),
+          (unsigned long long)expanded, created);
   disarm_capture(data);
   return true;
 }

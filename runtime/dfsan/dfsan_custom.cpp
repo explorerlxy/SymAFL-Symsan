@@ -258,6 +258,11 @@ static inline dfsan_label get_label_for(int fd, off_t offset) {
   if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
     return dfsan_create_label((uint64_t)fd, (uint64_t)(current_stdin_offset++), 1);
   // if fd is a tainted file, the label should have been pre-allocated
+  // Inputs larger than the pre-allocated range (max(init size, taint_max_len))
+  // would map to labels without a valid label_info: create them on demand so
+  // downstream shadow inspection (e.g. the PCBT fold classifier) stays valid.
+  else if ((off_t)offset >= tainted.size)
+    return dfsan_create_label((uint64_t)fd, (uint64_t)offset, 1);
   else return (offset + CONST_OFFSET);
 }
 

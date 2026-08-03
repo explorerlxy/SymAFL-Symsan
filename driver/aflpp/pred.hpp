@@ -113,6 +113,16 @@ class RunConverter {
   // Convert the subtree at `label`; returns a Predicate view into the
   // shared arena (possibly marked opaque).
   Predicate conv(uint32_t label);
+
+  // Expand a fold frame into the predicates for logical events [start, count):
+  // conv(first_label) builds the template, then each further predicate clones
+  // the DAG with the single Read/EofRead leaf offset advanced by one byte
+  // (getc loops). Predicates without a Read/EofRead leaf (flen_count loop
+  // bounds) clone verbatim. A failed template yields opaque predicates for the
+  // whole range and returns false. Clones never touch label_map_ (no synthetic
+  // labels exist in the child's union table).
+  bool expand_fold(uint32_t first_label, uint16_t count, uint16_t start,
+                   std::vector<Predicate> *out);
  private:
   const dfsan_label_info *table_;
   size_t table_labels_;

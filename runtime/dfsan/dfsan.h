@@ -57,7 +57,13 @@ struct dfsan_label_info {
 // suffix-only pipe replay after an SHM overflow. `skip_depth` is the number
 // of symbolic condition events already represented by the PCBT prefix.
 #define SYMAFL_SINGLE_PASS_MAGIC 0x53504331U  // "SPC1"
-#define SYMAFL_SINGLE_PASS_VERSION 2U
+#define SYMAFL_SINGLE_PASS_VERSION 3U
+
+// A single fold frame stands for `count` consecutive condition events that
+// share the same cid, the same result and an identical predicate structure
+// whose only Read/EofRead leaf advances by one byte per event (getc loops,
+// `i < n` loop bounds). The mutator expands it back into `count` tree nodes.
+#define SYMAFL_MAX_FOLD_COUNT 65535U
 
 #define SYMAFL_TRACE_OFF 0U
 #define SYMAFL_TRACE_FULL_STREAM 1U
@@ -68,7 +74,9 @@ struct symafl_single_pass_event {
   uint32_t cid;
   dfsan_label label;
   uint8_t result;
-  uint8_t reserved[3];
+  uint8_t constraint;
+  uint16_t count;  // 0 = single event; else fold frame of `count` events
+  uint8_t pad;
 };
 
 struct symafl_single_pass_control {
@@ -152,6 +160,11 @@ dfsan_label taint_get_base_input_label(dfsan_label label);
 off_t get_utmp_offset(void);
 void set_utmp_offset(off_t offset);
 int is_utmp_taint(void);
+
+// Flushes any pending PCBT fold frames (fold_type pipe msgs / SHM fold
+// events). Called by dfsan_fini at child exit so the tail of a foldable
+// event sequence is not lost. Defined in solver_common.cpp.
+void __dfsan_flush_trace_fold();
 
 // taint source socket
 void taint_set_socket(const void *addr, unsigned addrlen, int fd);
@@ -291,7 +304,13 @@ enum operators {
   flen_count      = last_llvm_op + 42, // 109
   flen_count_neg1 = last_llvm_op + 43, // 110
   flen_count_elems = last_llvm_op + 44, // 111
-  LastOp    = last_llvm_op + 45, // 112
+  // Pointer-index merge (ClCombinePointerLabelsOnLoad): the load result of a
+  // constant table depends on the symbolic GEP index. Deliberately NOT a
+  // numeric Or (which the predicate converter would evaluate as a value):
+  // the converter maps this op to opaque (conservative admission), keeping
+  // the constraint collected without inventing a wrong branch result.
+  idx_merge       = last_llvm_op + 45, // 113
+  LastOp    = last_llvm_op + 46, // 114
 };
 
 // fmemcmp keeps its base opcode in the low byte. The high bits record whether
@@ -416,6 +435,9 @@ enum pipe_msg_type {
   event_type,
   gv_type,
   minimize_type,
+  // SymAFL PCBT: a fold frame stands for `count` consecutive condition
+  // events that share cid/result and a byte-advancing Read-family shape.
+  fold_type,
 };
 
 static const uint8_t TrueBranchLoopLatch = 0x8;
@@ -474,6 +496,9 @@ struct pipe_msg {
   uint32_t id;
   uint32_t label;
   uint64_t result;
+  // Fold frames (fold_type): number of condition events collapsed into this
+  // frame (>= 2). Single events carry 0.
+  uint32_t count;
 } __attribute__((packed));
 
 // additional info for gep

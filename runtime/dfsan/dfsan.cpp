@@ -207,7 +207,14 @@ static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
   uint32_t h3 = op;
   h3 = (h3 << 16) | size;
-  uint32_t hash = xxhash(h1, h2, h3);
+  // The concrete operand values participate in the bucket hash. Without them,
+  // labels that share one structure but differ only in op1/op2 (e.g. `i < n`
+  // loop bounds: the flen_count side is fixed, the constant side advances per
+  // iteration) all land in one bucket and lookup degrades to O(n).
+  h1 = xxhash(h1, h2, h3);
+  uint32_t h4 = (uint32_t)(op1 ^ (op1 >> 32));
+  uint32_t h5 = (uint32_t)(op2 ^ (op2 >> 32));
+  uint32_t hash = xxhash(h1, h4, h5);
 
   struct dfsan_label_info label_info = {
     .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2}, .op = op, .size = size,
@@ -377,7 +384,12 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
   uint32_t h3 = op;
   h3 = (h3 << 16) | size;
-  uint32_t hash = xxhash(h1, h2, h3);
+  // Concrete operand values participate in the bucket hash (see do_taint_union
+  // for why): per-iteration loop-bound labels must not collide in one bucket.
+  h1 = xxhash(h1, h2, h3);
+  uint32_t h4 = (uint32_t)(op1 ^ (op1 >> 32));
+  uint32_t h5 = (uint32_t)(op2 ^ (op2 >> 32));
+  uint32_t hash = xxhash(h1, h4, h5);
 
   struct dfsan_label_info label_info = {
     .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2}, .op = op, .size = size,
@@ -1926,6 +1938,9 @@ static void InitializePlatformEarly() {
 }
 
 static void dfsan_fini() {
+  // Flush pending PCBT fold frames (getc-loop event tails) before the trace
+  // pipe / SHM go away. Tolerates EPIPE (the reader may already be gone).
+  __dfsan_flush_trace_fold();
   if (internal_strcmp(flags().dump_labels_at_exit, "") != 0) {
     fd_t fd = OpenFile(flags().dump_labels_at_exit, WrOnly);
     if (fd == kInvalidFd) {

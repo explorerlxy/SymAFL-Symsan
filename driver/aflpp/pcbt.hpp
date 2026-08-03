@@ -36,6 +36,10 @@ struct Event {
   // Constraint events (tainted GEP index / indcall target == concrete) have
   // result always 1 and skip direction validation during replay.
   uint8_t constraint = 0;
+  // Fold frame: this event stands for `count` consecutive conditions that
+  // share cid/result and a byte-advancing Read-family shape (getc loops,
+  // flen_count loop bounds). 1 = plain event.
+  uint16_t count = 1;
 };
 
 class Tree {

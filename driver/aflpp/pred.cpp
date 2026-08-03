@@ -173,8 +173,15 @@ uint32_t RunConverter::convert(uint32_t label) {
             so == __dfsan::fstrrchr || so == __dfsan::fstrstr)
           count = 0;
       }
-      if (count == 2 && info->l2 != 0) stack.push_back({info->l2, false});
-      if (count >= 1 && info->l1 != 0) stack.push_back({info->l1, false});
+      if (count == 2) {
+        if (info->l2 != 0) stack.push_back({info->l2, false});
+        if (info->l1 != 0) stack.push_back({info->l1, false});
+      } else if (count == 1) {
+        // Commutative swapping in the runtime may leave a unary op's child
+        // in l2 (e.g. Not after Xor-1 swap).
+        if (info->l1 != 0) stack.push_back({info->l1, false});
+        else if (info->l2 != 0) stack.push_back({info->l2, false});
+      }
       continue;
     }
 
@@ -273,8 +280,11 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
   }
 
   if (op == __dfsan::Extract || op_lo == Trunc) {
+    // Commutative swapping in the runtime may leave a unary op's child in l2.
+    dfsan_label child = info->l1 ? info->l1 : info->l2;
+    uint64_t cval = info->l1 ? info->op1.i : info->op2.i;
     uint64_t off = (op == __dfsan::Extract) ? info->op2.i : 0;
-    uint32_t a = conv_child(info->l1, info->op1.i, 64);
+    uint32_t a = conv_child(child, cval, 64);
     return a == kInvalidNode ? kInvalidNode
                              : add(PKind::Extract, size, a, kNoChild, off);
   }
@@ -395,7 +405,10 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     return add(PKind::ZExt, size, a, kNoChild);
   }
   if (unary) {
-    uint32_t a = conv_child(info->l1, info->op1.i, size);
+    // Commutative swapping in the runtime may leave a unary op's child in l2.
+    dfsan_label child = info->l1 ? info->l1 : info->l2;
+    uint64_t cval = info->l1 ? info->op1.i : info->op2.i;
+    uint32_t a = conv_child(child, cval, size);
     return a == kInvalidNode ? kInvalidNode : add(kind, size, a, kNoChild);
   }
   if (binary) {
@@ -823,6 +836,126 @@ Predicate RunConverter::conv(uint32_t label) {
   pred.reads.erase(std::unique(pred.reads.begin(), pred.reads.end()),
                    pred.reads.end());
   return pred;
+}
+
+bool RunConverter::expand_fold(uint32_t first_label, uint16_t count,
+                               uint16_t start,
+                               std::vector<Predicate> *out) {
+  if (out == nullptr || start >= count) return false;
+  const size_t nodes_ck = arena_->nodes.size();
+  Predicate first = conv(first_label);
+  if (first.opaque) {
+    // conv already rolled back its own nodes on failure; resize is a
+    // no-op backstop for the memoized-root case.
+    arena_->nodes.resize(nodes_ck);
+    for (uint16_t k = start; k < count; ++k) {
+      Predicate p;
+      p.opaque = true;
+      p.error = first.error;
+      p.error_op = first.error_op;
+      out->push_back(p);
+    }
+    return false;
+  }
+
+  // Collect the template DAG in post-order (children before parents), each
+  // node once even if shared.
+  std::vector<uint32_t> post;
+  std::unordered_set<uint32_t> seen;
+  std::vector<std::pair<uint32_t, bool>> st = {{first.root, false}};
+  while (!st.empty()) {
+    auto [i, expanded] = st.back();
+    st.pop_back();
+    if (expanded) {
+      post.push_back(i);
+      continue;
+    }
+    if (!seen.insert(i).second) continue;
+    st.push_back({i, true});
+    const PNode &nd = arena_->nodes[i];
+    if (nd.b != kNoChild) st.push_back({nd.b, false});
+    if (nd.a != kNoChild) st.push_back({nd.a, false});
+  }
+
+  // Determine the fold dimension. Byte-advancing shapes (getc loops) advance
+  // the single Read/EofRead leaf; loop-bound shapes (`i < n` vs flen_count)
+  // advance the constant side (the loop counter), which converts to the sole
+  // Const child of the comparison root.
+  bool has_read_leaf = false;
+  for (uint32_t orig : post) {
+    const PNode &nd = arena_->nodes[orig];
+    if (nd.kind == PKind::Read || nd.kind == PKind::EofRead) {
+      has_read_leaf = true;
+      break;
+    }
+  }
+  uint32_t const_child = kNoChild;
+  if (!has_read_leaf) {
+    const PNode &root_nd = arena_->nodes[first.root];
+    for (uint32_t c : {root_nd.a, root_nd.b}) {
+      if (c != kNoChild && arena_->nodes[c].kind == PKind::Const) {
+        const_child = c;
+        break;
+      }
+    }
+  }
+
+  const size_t clone_ck = arena_->nodes.size();
+  predicate_start_ = clone_ck;
+  std::unordered_map<uint32_t, uint32_t> map;
+  for (uint16_t k = start; k < count; ++k) {
+    map.clear();
+    bool failed = false;
+    for (uint32_t orig : post) {
+      const PNode &nd = arena_->nodes[orig];
+      uint64_t value = nd.value;
+      if (k > 0 && (nd.kind == PKind::Read || nd.kind == PKind::EofRead))
+        value += k;
+      else if (k > 0 && orig == const_child)
+        value += k;
+      uint32_t na = nd.a == kNoChild ? kNoChild : map[nd.a];
+      uint32_t nb = nd.b == kNoChild ? kNoChild : map[nd.b];
+      uint32_t idx = add(nd.kind, nd.bits, na, nb, value);
+      if (idx == kInvalidNode) {
+        failed = true;
+        break;
+      }
+      map[orig] = idx;
+    }
+    if (failed) {
+      // Arena budget exhausted: roll back this fold's clones and mark the
+      // remaining predicates opaque (conservative admission).
+      arena_->nodes.resize(clone_ck);
+      for (uint16_t j = k; j < count; ++j) {
+        Predicate p;
+        p.opaque = true;
+        p.error = PredError::ArenaLimit;
+        out->push_back(p);
+      }
+      return false;
+    }
+    // Reads collection follows conv()'s rule: PKind::Read leaves only
+    // (EofRead/Count-family are length semantics, not input reads).
+    Predicate p;
+    p.root = map[first.root];
+    std::unordered_set<uint32_t> rseen;
+    std::vector<uint32_t> rstack = {p.root};
+    while (!rstack.empty()) {
+      uint32_t i = rstack.back();
+      rstack.pop_back();
+      if (!rseen.insert(i).second) continue;
+      const PNode &nd = arena_->nodes[i];
+      if (nd.kind == PKind::Read)
+        p.reads.emplace_back((uint32_t)nd.value, nd.bits / 8);
+      if (nd.a != kNoChild) rstack.push_back(nd.a);
+      if (nd.b != kNoChild) rstack.push_back(nd.b);
+    }
+    std::sort(p.reads.begin(), p.reads.end());
+    p.reads.erase(std::unique(p.reads.begin(), p.reads.end()),
+                  p.reads.end());
+    out->push_back(p);
+  }
+  return true;
 }
 
 namespace {

@@ -94,25 +94,34 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
                            size_t table_labels) {
   if (events.empty()) return 0;
   num_traces += 1;
-  num_events += events.size();
+  for (const Event &ev : events) num_events += ev.count;
 
   NodeRef parent = kRoot;
   uint8_t dir = 0;
   uint64_t trace_depth = 0;
   size_t i = 0;
-  for (; i < events.size(); ++i) {
+  uint16_t k = 0;  // consumed logical events inside the current frame
+  // Prefix match: advance along existing edges one logical event at a time.
+  // A fold frame contributes `count` logical events with the same cid/result.
+  while (i < events.size()) {
+    const Event &ev = events[i];
     NodeRef next = node(parent).child[dir];
     if (next == kUnexplored) break;
-    if (next == kTerminal || node(next).cid != events[i].cid) {
+    if (next == kTerminal || node(next).cid != ev.cid) {
       num_conflicts += 1;
       return 0;
     }
     parent = next;
-    dir = events[i].result ? 1 : 0;
+    dir = ev.result ? 1 : 0;
     trace_depth += 1;
+    k += 1;
+    if (k == ev.count) {
+      k = 0;
+      i += 1;
+    }
   }
 
-  if (i == events.size()) {
+  if (i == events.size() && k == 0) {
     if (node(parent).child[dir] == kUnexplored) {
       node(parent).child[dir] = kTerminal;
     }
@@ -122,22 +131,34 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   RunConverter conv(table, table_labels, &pred_arena_);
   uint32_t created = 0;
   for (; i < events.size(); ++i) {
-    Node new_node;
-    new_node.cid = events[i].cid;
-    new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
-    new_node.pred = conv.conv(events[i].label);
-    if (new_node.pred.opaque) {
-      num_opaque += 1;
-      opaque_by_error[static_cast<size_t>(new_node.pred.error)] += 1;
-      if (new_node.pred.error_op) opaque_by_op[new_node.pred.error_op] += 1;
+    const Event &ev = events[i];
+    std::vector<Predicate> preds;
+    if (ev.count > 1) {
+      // `k` is nonzero when the tree already covered this frame's prefix;
+      // expand only the remaining logical events.
+      conv.expand_fold(ev.label, ev.count, k, &preds);
+    } else {
+      preds.push_back(conv.conv(ev.label));
     }
-    NodeRef next = append(std::move(new_node));
-    if (next == kUnexplored) return created;
-    node(parent).child[dir] = next;
-    parent = next;
-    dir = events[i].result ? 1 : 0;
-    created += 1;
-    trace_depth += 1;
+    k = 0;
+    for (const Predicate &pred : preds) {
+      Node new_node;
+      new_node.cid = ev.cid;
+      new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
+      new_node.pred = pred;
+      if (pred.opaque) {
+        num_opaque += 1;
+        opaque_by_error[static_cast<size_t>(pred.error)] += 1;
+        if (pred.error_op) opaque_by_op[pred.error_op] += 1;
+      }
+      NodeRef next = append(std::move(new_node));
+      if (next == kUnexplored) return created;
+      node(parent).child[dir] = next;
+      parent = next;
+      dir = ev.result ? 1 : 0;
+      created += 1;
+      trace_depth += 1;
+    }
   }
 
   node(parent).child[dir] = kTerminal;
@@ -155,7 +176,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     return 0;
   }
   num_traces += 1;
-  num_events += events.size();
+  for (const Event &ev : events) num_events += ev.count;
 
   if (events.empty()) {
     node(parent).child[direction] = kTerminal;
@@ -167,21 +188,29 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   uint8_t dir = direction;
   NodeRef cur = parent;
   for (const Event &event : events) {
-    Node new_node;
-    new_node.cid = event.cid;
-    new_node.depth = node(cur).depth + 1;
-    new_node.pred = conv.conv(event.label);
-    if (new_node.pred.opaque) {
-      num_opaque += 1;
-      opaque_by_error[static_cast<size_t>(new_node.pred.error)] += 1;
-      if (new_node.pred.error_op) opaque_by_op[new_node.pred.error_op] += 1;
+    std::vector<Predicate> preds;
+    if (event.count > 1) {
+      conv.expand_fold(event.label, event.count, 0, &preds);
+    } else {
+      preds.push_back(conv.conv(event.label));
     }
-    NodeRef next = append(std::move(new_node));
-    if (next == kUnexplored) return created;
-    node(cur).child[dir] = next;
-    cur = next;
-    dir = event.result ? 1 : 0;
-    created += 1;
+    for (const Predicate &pred : preds) {
+      Node new_node;
+      new_node.cid = event.cid;
+      new_node.depth = node(cur).depth + 1;
+      new_node.pred = pred;
+      if (pred.opaque) {
+        num_opaque += 1;
+        opaque_by_error[static_cast<size_t>(pred.error)] += 1;
+        if (pred.error_op) opaque_by_op[pred.error_op] += 1;
+      }
+      NodeRef next = append(std::move(new_node));
+      if (next == kUnexplored) return created;
+      node(cur).child[dir] = next;
+      cur = next;
+      dir = event.result ? 1 : 0;
+      created += 1;
+    }
   }
 
   node(cur).child[dir] = kTerminal;
@@ -272,13 +301,18 @@ Tree::ReplayReport Tree::ReplayFullTrace(
 
   EvalContext eval;
   eval.Reset();
+  size_t logic = 0;  // verified logical events (fold frames expand)
+  size_t trace_total = 0;
+  for (const Event &ev : events) trace_total += ev.count;
   size_t i = 0;
-  for (; i < events.size(); ++i) {
-    const Event &ev = events[i];
+  // Validate one logical event against the tree. Returns false when the
+  // replay must stop (r already describes the outcome).
+  auto step = [&](const Event &ev) -> bool {
+    logic += 1;
     if (ev.result > 1) {
       r.error = ReplayError::InvalidEventResult;
       r.event_index = i;
-      return r;
+      return false;
     }
     const Node &current = node(cur);
     // CID check
@@ -288,7 +322,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
       r.event_index = i;
       r.expected_cid = current.cid;
       r.observed_cid = ev.cid;
-      return r;
+      return false;
     }
     // Constraint events (tainted GEP index / indcall target == concrete)
     // record result always 1: the constraint held for the traced run. The
@@ -299,48 +333,48 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     if (ev.constraint) {
       NodeRef next = current.child[ev.result ? 1 : 0];
       if (next == kTerminal) {
-        if (i + 1 < events.size()) {
+        if (logic < trace_total) {
           r.error = ReplayError::AfterTerminal;
-          r.event_index = i + 1;
-          r.verified_events = i + 1;
-          return r;
+          r.event_index = i;
+          r.verified_events = logic;
+          return false;
         }
         r.event_index = i;
-        r.verified_events = i + 1;
+        r.verified_events = logic;
         r.reached_terminal = true;
-        return r;
+        return false;
       }
       if (next == kUnexplored) {
         r.event_index = i;
-        r.verified_events = i + 1;
+        r.verified_events = logic;
         r.reached_frontier = true;
         r.frontier_node = cur;
         r.frontier_dir = ev.result ? 1 : 0;
-        r.suffix_begin = i + 1;
-        return r;
+        r.suffix_begin = logic;
+        return false;
       }
       cur = next;
-      continue;
+      return true;
     }
     // Evaluate predicate
     if (current.pred.opaque) {
       r.event_index = i;
-      r.verified_events = i;  // events before this opaque one are verified
+      r.verified_events = logic - 1;  // events before this opaque one
       r.reached_frontier = true;
       r.frontier_node = cur;
       r.frontier_dir = ev.result;
       r.opaque_admission = true;
-      return r;
+      return false;
     }
     uint64_t v = 0;
     if (!eval_predicate(pred_arena_, current.pred, input, len, &v, &eval)) {
       r.event_index = i;
-      r.verified_events = i;
+      r.verified_events = logic - 1;
       r.reached_frontier = true;
       r.frontier_node = cur;
       r.frontier_dir = ev.result;
       r.eval_failure = true;
-      return r;
+      return false;
     }
     uint8_t dir = v ? 1 : 0;
     r.direction_checked = true;
@@ -352,42 +386,55 @@ Tree::ReplayReport Tree::ReplayFullTrace(
       r.observed_cid = ev.cid;
       r.evaluated_dir = dir;
       r.observed_dir = ev.result;
-      return r;
+      return false;
     }
     NodeRef next = current.child[dir];
     if (next == kTerminal) {
-      if (i + 1 < events.size()) {
+      if (logic < trace_total) {
         // More events follow, but trace already consumed
         r.error = ReplayError::AfterTerminal;
-        r.event_index = i + 1;
-        r.verified_events = i + 1;
-        return r;
+        r.event_index = i;
+        r.verified_events = logic;
+        return false;
       }
       // Last event ends exactly at a terminal edge: consistent.
       r.event_index = i;
-      r.verified_events = i + 1;
+      r.verified_events = logic;
       r.reached_terminal = true;
-      return r;
+      return false;
     }
     if (next == kUnexplored) {
       r.event_index = i;
-      r.verified_events = i + 1;  // this event passed all checks
+      r.verified_events = logic;  // this event passed all checks
       r.reached_frontier = true;
       r.frontier_node = cur;
       r.frontier_dir = dir;
-      r.suffix_begin = i + 1;
-      return r;
+      r.suffix_begin = logic;
+      return false;
     }
     cur = next;
-  }
+    return true;
+  };
 
-  // All events consumed without hitting terminal or frontier: the tree
-  // expects more conditions.  This can happen after the last event if
-  // cur.child[dir] points to another node (not kTerminal/Unexplored).
-  r.verified_events = i;
-  r.event_index = i;
-  r.error = ReplayError::TruncatedTrace;
-  if (debug_) DebugPredicate(cur, input, len);
+  bool stopped = false;
+  for (; i < events.size(); ++i) {
+    const Event &ev = events[i];
+    bool cont = true;
+    for (uint16_t k = 0; k < ev.count && cont; ++k) cont = step(ev);
+    if (!cont) {
+      stopped = true;
+      break;
+    }
+  }
+  if (!stopped) {
+    // All events consumed without hitting terminal or frontier: the tree
+    // expects more conditions.  This can happen after the last event if
+    // cur.child[dir] points to another node (not kTerminal/Unexplored).
+    r.verified_events = logic;
+    r.event_index = i;
+    r.error = ReplayError::TruncatedTrace;
+    if (debug_) DebugPredicate(cur, input, len);
+  }
   return r;
 }
 
