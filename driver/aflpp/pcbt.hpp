@@ -27,6 +27,14 @@ struct Node {
   NodeRef child[2] = {kUnexplored, kUnexplored};
   uint32_t depth = 0;                // root's children = 1
   uint8_t rCnt[2] = {0, 0};          // non-gaining admissions per direction
+  // This node is a constraint event (tainted GEP index / indcall target ==
+  // concrete value): its predicate pins an observed value rather than a
+  // branch outcome, so edges past it only describe the pinned value's
+  // behavior. Suffix learning through such an edge is capped (see
+  // InsertSuffix): the run cannot confirm any node past the constraint,
+  // because screening a candidate with a different value evaluates the
+  // constraint false and never reaches the learned subtree.
+  bool constraint = false;
   // The stored predicate's decision depends on a length/count family leaf
   // (Len/EofRead/Count/CountNeg1/CountElems). Length-derived decisions are
   // path-dependent in label presence: a trace whose length counter was never
