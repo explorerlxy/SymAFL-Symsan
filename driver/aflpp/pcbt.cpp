@@ -120,9 +120,20 @@ static bool pred_has_len_kind(const PredArena &arena, const Predicate &pred) {
   return false;
 }
 
+// skipCnt assignment for a new node: constraint nodes share the parent's
+// skipCnt (the candidate re-emits its own constraint event at the same
+// stream position), ordinary nodes advance by one stream position — plus
+// one extra when the parent is a constraint, because the constraint event
+// itself also occupies a stream position.
+static inline uint32_t child_skip_cnt(const Node &parent, bool constraint) {
+  if (constraint) return parent.skipCnt;
+  return parent.skipCnt + (parent.constraint ? 2 : 1);
+}
+
 uint32_t Tree::InsertTrace(const std::vector<Event> &events,
                            const dfsan_label_info *table,
-                           size_t table_labels) {
+                           size_t table_labels,
+                           const uint8_t *input, uint32_t len) {
   if (events.empty()) return 0;
   num_traces += 1;
   for (const Event &ev : events) num_events += ev.count;
@@ -132,29 +143,57 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   uint64_t trace_depth = 0;
   size_t i = 0;
   uint16_t k = 0;  // consumed logical events inside the current frame
-  // Prefix match: advance along existing edges one logical event at a time.
-  // A fold frame contributes `count` logical events with the same cid/result.
-  while (i < events.size()) {
+  EvalContext eval;
+  eval.Reset();
+  // Prefix match: walk the tree by evaluating each visited node's predicate
+  // against the candidate input (symmetric with CheckInput). One stream
+  // event is consumed per non-constraint node, and additionally when the
+  // walk steps from a constraint node onto a non-constraint child (the
+  // candidate's replacement constraint event shares its stream position
+  // with the value-chain, so stepping INTO a constraint consumes nothing).
+  NodeRef cur = node(kRoot).child[0];
+  while (i < events.size() && cur != kUnexplored && cur != kTerminal) {
     const Event &ev = events[i];
-    NodeRef next = node(parent).child[dir];
-    if (next == kUnexplored) break;
-    if (next == kTerminal || node(next).cid != ev.cid) {
-      num_conflicts += 1;
-      return 0;
+    const Node &cn = node(cur);
+    uint64_t v = 0;
+    uint8_t edir;
+    if (cn.pred.opaque || input == nullptr ||
+        !eval_predicate(pred_arena_, cn.pred, input, len, &v, &eval)) {
+      edir = ev.result ? 1 : 0;  // follow the recorded direction
+    } else {
+      edir = v ? 1 : 0;
     }
-    parent = next;
-    dir = ev.result ? 1 : 0;
     trace_depth += 1;
-    k += 1;
-    if (k == ev.count) {
-      k = 0;
-      i += 1;
+    parent = cur;
+    dir = edir;
+    NodeRef nxt = node(parent).child[dir];
+    if (!cn.constraint ||
+        (nxt != kUnexplored && nxt != kTerminal && !node(nxt).constraint)) {
+      k += 1;
+      if (k == ev.count) {
+        k = 0;
+        i += 1;
+      }
     }
+    cur = nxt;
+  }
+  // `parent`/`dir` address the edge where the walk stopped; `i`/`k` index
+  // the first unconsumed stream event.
+  if (cur == kTerminal && i < events.size()) {
+    // The evaluated path reaches an explored-terminal edge while the trace
+    // still has events: prefix drift (or a suffix-truncated earlier
+    // insertion). Discard; never insert.
+    num_conflicts += 1;
+    return 0;
   }
 
   if (i == events.size() && k == 0) {
     if (node(parent).child[dir] == kUnexplored) {
-      node(parent).child[dir] = kTerminal;
+      // A trace ending right after a constraint event has only observed the
+      // pinned value; the tail edge must stay unexplored so unseen values
+      // reach a frontier.
+      if (!node(parent).constraint)
+        node(parent).child[dir] = kTerminal;
     }
     return 0;
   }
@@ -176,7 +215,11 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       Node new_node;
       new_node.cid = ev.cid;
       new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
+      new_node.skipCnt = parent == kRoot
+          ? (ev.constraint ? 0u : 1u)
+          : child_skip_cnt(node(parent), ev.constraint != 0);
       new_node.pred = pred;
+      new_node.constraint = ev.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
         num_opaque += 1;
@@ -193,7 +236,10 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     }
   }
 
-  node(parent).child[dir] = kTerminal;
+  // A trace ending right after a constraint event has only observed the
+  // pinned value; the tail edge stays unexplored.
+  if (!events.back().constraint)
+    node(parent).child[dir] = kTerminal;
   num_nodes += created;
   if (trace_depth > max_depth) max_depth = trace_depth;
   return created;
@@ -211,7 +257,11 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   for (const Event &ev : events) num_events += ev.count;
 
   if (events.empty()) {
-    node(parent).child[direction] = kTerminal;
+    // Empty suffix on a constraint edge: the run only confirmed that the
+    // pinned value produces no further symbolic decisions. Other values are
+    // unobserved, so the edge must stay unexplored.
+    if (!node(parent).constraint)
+      node(parent).child[direction] = kTerminal;
     return 0;
   }
 
@@ -230,7 +280,9 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       Node new_node;
       new_node.cid = event.cid;
       new_node.depth = node(cur).depth + 1;
+      new_node.skipCnt = child_skip_cnt(node(cur), event.constraint != 0);
       new_node.pred = pred;
+      new_node.constraint = event.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
         num_opaque += 1;
@@ -246,7 +298,10 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     }
   }
 
-  node(cur).child[dir] = kTerminal;
+  // A suffix ending right after a constraint event has only observed the
+  // pinned value; the tail edge stays unexplored.
+  if (!events.back().constraint)
+    node(cur).child[dir] = kTerminal;
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
   return created;

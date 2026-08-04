@@ -587,7 +587,7 @@ static void arm_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
-  control->skip_depth = data->tree.depth(node);
+  control->skip_depth = data->tree.skip_for(node);
   __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_SHM, __ATOMIC_RELEASE);
   __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
   data->last_node = node;
@@ -601,7 +601,7 @@ static void arm_pipe_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
-  control->skip_depth = data->tree.depth(node);
+  control->skip_depth = data->tree.skip_for(node);
   __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_PIPE,
                    __ATOMIC_RELEASE);
   __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
@@ -768,7 +768,8 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
     return false;
   }
   uint32_t created = data->tree.InsertTrace(events, __dfsan_label_info,
-                                            MAX_LABEL);
+                                            MAX_LABEL, buf,
+                                            (uint32_t)buf_size);
   data->traced_runs += 1;
   uint64_t expanded = 0;
   for (const pcbt::Event &ev : events) expanded += ev.count;

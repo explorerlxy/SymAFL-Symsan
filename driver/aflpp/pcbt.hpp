@@ -25,8 +25,21 @@ struct Node {
   uint32_t cid = 0;  // compile-time branch id
   Predicate pred;    // root view into Tree::pred_arena_
   NodeRef child[2] = {kUnexplored, kUnexplored};
-  uint32_t depth = 0;                // root's children = 1
+  uint32_t depth = 0;                // root's children = 1 (topology stats)
+  // Event-stream position basis for suffix capture: when CheckInput admits a
+  // candidate at the unexplored edge below this node, the runtime must skip
+  // exactly skipCnt events so the candidate's own stream continues from this
+  // node's position. Constraint nodes (multi-successor single decisions:
+  // tainted GEP index / jump target == concrete) re-emit at the same stream
+  // position on candidates that pin a different value, so they do not
+  // advance the count: constraint -> skipCnt = parent.skipCnt; ordinary
+  // node -> parent.skipCnt + (parent.constraint ? 2 : 1).
+  uint32_t skipCnt = 0;
   uint8_t rCnt[2] = {0, 0};          // non-gaining admissions per direction
+  // This node is a constraint event (see skipCnt above). Its dir-1 subtree
+  // describes only the pinned value's behavior; dir-0 is the value-fork
+  // chain for candidates that pin a different value.
+  bool constraint = false;
   // The stored predicate's decision depends on a length/count family leaf
   // (Len/EofRead/Count/CountNeg1/CountElems). Length-derived decisions are
   // path-dependent in label presence: a trace whose length counter was never
@@ -53,15 +66,22 @@ class Tree {
  public:
   Tree();
 
-  // Insert one full branch-event path. The union table must still hold this
-  // run's content. Returns the number of new topology nodes created.
+  // Insert one full branch-event path evaluated against `input`. The union
+  // table must still hold this run's content. Prefix matching is
+  // predicate-evaluation-driven (symmetric with CheckInput): each existing
+  // node's predicate is evaluated on the candidate input to choose the walk
+  // direction, so a constraint node forks candidates that pin a different
+  // value down its dir-0 value chain. Returns the number of new topology
+  // nodes created.
   uint32_t InsertTrace(const std::vector<Event> &events,
-                       const dfsan_label_info *table,
-                       size_t table_labels);
+                       const dfsan_label_info *table, size_t table_labels,
+                       const uint8_t *input, uint32_t len);
 
   // Insert the suffix known to follow parent.child[direction]. The caller has
   // already established the PCBT prefix during screening, so this performs no
-  // root replay or prefix matching. An empty suffix records the terminal node.
+  // root replay or prefix matching. An empty suffix records the terminal node
+  // (except on constraint edges: an empty suffix only proves the pinned value
+  // produces no further decisions, so the edge stays unexplored).
   uint32_t InsertSuffix(NodeRef parent, uint8_t direction,
                         const std::vector<Event> &events,
                         const dfsan_label_info *table, size_t table_labels);
@@ -106,6 +126,11 @@ class Tree {
   bool IsSaturated(uint8_t rlimit) const;
   uint32_t depth(NodeRef ref) const { return node(ref).depth; }
   uint32_t cid_of(NodeRef ref) const { return node(ref).cid; }
+  // Number of leading stream events the runtime must skip so the candidate's
+  // own events from this frontier node's position onward are exported.
+  uint32_t skip_for(NodeRef frontier_parent) const {
+    return frontier_parent == kRoot ? 0 : node(frontier_parent).skipCnt;
+  }
   uint64_t num_pred_nodes() const { return pred_arena_.nodes.size(); }
   uint8_t &retry_count(NodeRef ref, uint8_t direction) {
     return node(ref).rCnt[direction];
