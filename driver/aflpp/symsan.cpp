@@ -1344,11 +1344,15 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                 (unsigned long long)data->tree.max_depth);
         fprintf(stderr,
                 "[pcbt] probe-gain saturation after %llu vetoes "
-                "(window=%llu gains=%llu consec=%llu); switching to concrete\n",
+                "(window=%llu gains=%llu consec=%llu phase_secs=%llu); "
+                "switching to concrete\n",
                 (unsigned long long)data->vetoed,
                 (unsigned long long)data->sat_window,
                 (unsigned long long)data->sat_min_gains,
-                (unsigned long long)data->sat_low_windows);
+                (unsigned long long)data->sat_low_windows,
+                data->phase_start
+                    ? (unsigned long long)(time(nullptr) - data->phase_start)
+                    : 0ull);
       }
       data->screening = false;
       data->afl->pcbt_switch_pending = 1;
@@ -1363,8 +1367,12 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     if (!data->saturation_logged) {
       data->saturation_logged = true;
       fprintf(stderr,
-              "[pcbt] tree saturated after %llu vetoes; switching to concrete\n",
-              (unsigned long long)data->vetoed);
+              "[pcbt] tree saturated after %llu vetoes "
+              "(phase_secs=%llu); switching to concrete\n",
+              (unsigned long long)data->vetoed,
+              data->phase_start
+                  ? (unsigned long long)(time(nullptr) - data->phase_start)
+                  : 0ull);
     }
   }
   *out_buf = NULL;
