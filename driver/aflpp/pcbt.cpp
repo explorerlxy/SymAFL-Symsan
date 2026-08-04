@@ -94,15 +94,28 @@ NodeRef Tree::append(Node &&new_node) {
 // whose length counter was never symbolically updated contributes no event,
 // candidates on other paths do), so terminal vetoes at such nodes are not
 // trustworthy. See Node::len_related.
+//
+// The visited set is a generation-stamped array of arena size instead of a
+// freshly allocated per-call vector: this runs once per new tree node, and a
+// per-node `vector<uint8_t> visited(arena.nodes.size(), 0)` zero-fills the
+// whole arena per node (the profiled 74% memset in InsertSuffix).
 static bool pred_has_len_kind(const PredArena &arena, const Predicate &pred) {
   if (pred.opaque || pred.root >= arena.nodes.size()) return false;
-  std::vector<uint8_t> visited(arena.nodes.size(), 0);
+  static thread_local std::vector<uint32_t> visited;
+  static thread_local uint32_t generation = 0;
+  if (visited.size() < arena.nodes.size()) {
+    visited.resize(arena.nodes.size(), 0);
+  }
+  if (++generation == 0) {  // wrap: stale stamps would read as visited
+    std::fill(visited.begin(), visited.end(), 0);
+    generation = 1;
+  }
   std::vector<uint32_t> stack = {pred.root};
   while (!stack.empty()) {
     uint32_t idx = stack.back();
     stack.pop_back();
-    if (idx >= arena.nodes.size() || visited[idx]) continue;
-    visited[idx] = 1;
+    if (idx >= arena.nodes.size() || visited[idx] == generation) continue;
+    visited[idx] = generation;
     const PNode &p = arena.nodes[idx];
     switch (p.kind) {
       case PKind::Len:
@@ -319,7 +332,10 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
     return true;
   }
 
-  EvalContext eval;
+  // The context persists across candidates (vectors amortized instead of
+  // re-filled to the arena size per check; the per-check zero-fill of
+  // values_/stamps_ was the profiled check cost at large arena sizes).
+  EvalContext &eval = check_eval_;
   eval.Reset();
   while (true) {
     const Node &current = node(cur);

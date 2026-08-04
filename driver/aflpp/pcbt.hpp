@@ -174,6 +174,12 @@ class Tree {
   NodeRef append(Node &&node);
   bool IsSaturated(NodeRef ref, uint8_t rlimit) const;
   bool debug_ = false;
+  // Persistent eval context for CheckInput: the values_/stamps_ vectors are
+  // keyed by arena index, so they must only grow (the arena is append-only
+  // between checks); a fresh context per check zero-fills up to the arena
+  // size (profiled ~4 ms/check at 5.6M pred nodes). Reset() bumps the
+  // generation so stale slots never read as valid.
+  mutable EvalContext check_eval_;
 
   // Index 1 is a global terminal node; index 2 is the virtual root.
   std::vector<Node> nodes_;

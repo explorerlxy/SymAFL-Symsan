@@ -143,6 +143,10 @@ struct my_mutator_t {
   uint64_t profile_check_calls = 0;
   uint64_t profile_trace_ns = 0;
   uint64_t profile_trace_calls = 0;
+  uint64_t profile_decode_ns = 0;   // suffix decode (SHM -> Event vector)
+  uint64_t profile_decode_calls = 0;
+  uint64_t profile_insert_ns = 0;   // InsertSuffix (label->predicate + arena)
+  uint64_t profile_insert_calls = 0;
   uint64_t profile_replay_ns = 0;
   uint64_t profile_replay_calls = 0;
 
@@ -490,7 +494,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
-          "replay_ns=%llu replay_calls=%llu\n",
+          "replay_ns=%llu replay_calls=%llu decode_ns=%llu decode_calls=%llu "
+          "insert_ns=%llu insert_calls=%llu\n",
           (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
           (unsigned long long)t.num_pred_nodes(),
           (unsigned long long)t.max_depth,
@@ -521,7 +526,11 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->profile_trace_ns,
           (unsigned long long)data->profile_trace_calls,
           (unsigned long long)data->profile_replay_ns,
-          (unsigned long long)data->profile_replay_calls);
+          (unsigned long long)data->profile_replay_calls,
+          (unsigned long long)data->profile_decode_ns,
+          (unsigned long long)data->profile_decode_calls,
+          (unsigned long long)data->profile_insert_ns,
+          (unsigned long long)data->profile_insert_calls);
   fprintf(stderr,
           "[pcbt-replay] checked=%llu cid_mismatch=%llu dir_mismatch=%llu "
           "after_terminal=%llu truncated=%llu frontier_match=%llu "
@@ -844,6 +853,7 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
   }
   std::vector<pcbt::Event> events;
   events.reserve(count);
+  uint64_t decode_start = profile_start(data);
   for (uint32_t i = 0; i < count; ++i) {
     const symafl_single_pass_event &event = control->events[i];
     if (event.label == 0 || event.label == kInitializingLabel ||
@@ -860,8 +870,13 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
     events.push_back({event.cid, event.label, event.result,
                       event.constraint, fold});
   }
+  profile_stop(data, decode_start, &data->profile_decode_ns,
+               &data->profile_decode_calls);
+  uint64_t insert_start = profile_start(data);
   uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
       events, data->single_pass_label_info, MAX_LABEL);
+  profile_stop(data, insert_start, &data->profile_insert_ns,
+               &data->profile_insert_calls);
   data->single_pass_captures += 1;
   uint64_t expanded = 0;
   for (const pcbt::Event &ev : events) expanded += ev.count;
