@@ -154,11 +154,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
 
   if (i == events.size() && k == 0) {
     if (node(parent).child[dir] == kUnexplored) {
-      // Same rule as InsertSuffix: a trace ending right after a constraint
-      // event has only observed the pinned value; the tail edge must stay
-      // unexplored so unseen values reach a frontier.
-      if (!events.back().constraint)
-        node(parent).child[dir] = kTerminal;
+      node(parent).child[dir] = kTerminal;
     }
     return 0;
   }
@@ -181,7 +177,6 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.cid = ev.cid;
       new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
       new_node.pred = pred;
-      new_node.constraint = ev.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
         num_opaque += 1;
@@ -216,11 +211,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   for (const Event &ev : events) num_events += ev.count;
 
   if (events.empty()) {
-    // Empty suffix on a constraint edge: the run only confirmed that the
-    // pinned value produces no further symbolic decisions. Other values are
-    // unobserved, so the edge must stay unexplored.
-    if (!node(parent).constraint)
-      node(parent).child[direction] = kTerminal;
+    node(parent).child[direction] = kTerminal;
     return 0;
   }
 
@@ -228,17 +219,6 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   uint32_t created = 0;
   uint8_t dir = direction;
   NodeRef cur = parent;
-  // Constraint-cap: a constraint event pins a value the trace observed, not
-  // a branch outcome. A suffix attached at (or past) a constraint edge may
-  // keep exactly one non-constraint branch node — the one the candidate's
-  // own run confirmed — and its tail edge must stay unexplored: deeper
-  // nodes are unconfirmable by screening (a candidate with a different
-  // pinned value evaluates the constraint false and never reaches them) and
-  // a Terminal tail would veto every unseen value. Detach the excess below.
-  bool capped = node(parent).constraint;      // cap active from the parent edge
-  bool over_cap = false;                      // >1 real node past the cap
-  NodeRef cap_node = kUnexplored;             // edge to detach on over_cap
-  uint8_t cap_dir = 0;
   for (const Event &event : events) {
     std::vector<Predicate> preds;
     if (event.count > 1) {
@@ -251,7 +231,6 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.cid = event.cid;
       new_node.depth = node(cur).depth + 1;
       new_node.pred = pred;
-      new_node.constraint = event.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
         num_opaque += 1;
@@ -264,34 +243,9 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       cur = next;
       dir = event.result ? 1 : 0;
       created += 1;
-      if (event.constraint) {
-        // A nested constraint (re)arms the cap: its recorded direction is
-        // confirmed by this run, and the one-branch budget restarts below.
-        capped = true;
-        over_cap = false;
-        cap_node = kUnexplored;
-      } else if (capped && !over_cap) {
-        if (cap_node == kUnexplored) {
-          cap_node = cur;   // first real branch past the cap: confirmed
-          cap_dir = dir;
-        } else {
-          over_cap = true;  // second real branch: unconfirmable
-        }
-      }
     }
   }
 
-  if (over_cap) {
-    NodeRef tail = node(cap_node).child[cap_dir];
-    if (tail != kUnexplored && tail != kTerminal && tail != cap_node) {
-      node(cap_node).child[cap_dir] = kUnexplored;
-    }
-  }
-  if (capped) {
-    // No Terminal mark past a constraint: the unobserved direction/value
-    // populations must keep reaching a frontier.
-    return created;
-  }
   node(cur).child[dir] = kTerminal;
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
