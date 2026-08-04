@@ -1064,6 +1064,21 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
       if (data->last_probe_suffix_nonempty) data->probe_gained_nonempty += 1;
       else if (data->last_probe_suffix_overflow) data->probe_gained_overflow += 1;
       else data->probe_gained_empty += 1;
+      // Capture real vetoed-gainful cases for event-free divergence
+      // forensics: the queue file holds the input, the veto position
+      // identifies where the tree claimed termination, and the suffix class
+      // tells whether the real decision trace continued past it.
+      fprintf(stderr,
+              "[pcbt-diag] gained-case probe file=%s len=%u veto_depth=%u "
+              "veto_node=%u veto_cid=%u suffix=%s\n",
+              filename_new_queue, data->last_probe_input_len,
+              data->last_veto_depth, data->last_veto_node,
+              data->last_veto_node != pcbt::kUnexplored
+                  ? data->tree.cid_of(data->last_veto_node)
+                  : 0u,
+              data->last_probe_suffix_nonempty
+                  ? "nonempty"
+                  : data->last_probe_suffix_overflow ? "overflow" : "empty");
     }
     data->last_probe_suffix_overflow = false;
     data->last_gained = true;

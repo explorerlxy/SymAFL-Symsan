@@ -105,6 +105,7 @@ class Tree {
 
   bool IsSaturated(uint8_t rlimit) const;
   uint32_t depth(NodeRef ref) const { return node(ref).depth; }
+  uint32_t cid_of(NodeRef ref) const { return node(ref).cid; }
   uint64_t num_pred_nodes() const { return pred_arena_.nodes.size(); }
   uint8_t &retry_count(NodeRef ref, uint8_t direction) {
     return node(ref).rCnt[direction];
