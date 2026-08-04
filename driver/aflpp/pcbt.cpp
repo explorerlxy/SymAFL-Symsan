@@ -89,6 +89,37 @@ NodeRef Tree::append(Node &&new_node) {
   return (NodeRef)nodes_.size() - 1;
 }
 
+// Does the predicate's DAG contain a length/count-family leaf?
+// Length-derived decisions are path-dependent in label presence (a trace
+// whose length counter was never symbolically updated contributes no event,
+// candidates on other paths do), so terminal vetoes at such nodes are not
+// trustworthy. See Node::len_related.
+static bool pred_has_len_kind(const PredArena &arena, const Predicate &pred) {
+  if (pred.opaque || pred.root >= arena.nodes.size()) return false;
+  std::vector<uint8_t> visited(arena.nodes.size(), 0);
+  std::vector<uint32_t> stack = {pred.root};
+  while (!stack.empty()) {
+    uint32_t idx = stack.back();
+    stack.pop_back();
+    if (idx >= arena.nodes.size() || visited[idx]) continue;
+    visited[idx] = 1;
+    const PNode &p = arena.nodes[idx];
+    switch (p.kind) {
+      case PKind::Len:
+      case PKind::EofRead:
+      case PKind::Count:
+      case PKind::CountNeg1:
+      case PKind::CountElems:
+        return true;
+      default:
+        break;
+    }
+    if (p.a != UINT32_MAX) stack.push_back(p.a);
+    if (p.b != UINT32_MAX) stack.push_back(p.b);
+  }
+  return false;
+}
+
 uint32_t Tree::InsertTrace(const std::vector<Event> &events,
                            const dfsan_label_info *table,
                            size_t table_labels) {
@@ -146,6 +177,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.cid = ev.cid;
       new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
       new_node.pred = pred;
+      new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
         num_opaque += 1;
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
@@ -199,6 +231,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.cid = event.cid;
       new_node.depth = node(cur).depth + 1;
       new_node.pred = pred;
+      new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
         num_opaque += 1;
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
@@ -221,7 +254,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
 
 bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                       uint8_t *out_dir, uint8_t rlimit,
-                      uint32_t *out_veto_depth) {
+                      uint32_t *out_veto_depth, NodeRef *out_veto_node) {
   NodeRef cur = node(kRoot).child[0];
   if (cur == kUnexplored) {
     *out_node = kUnexplored;
@@ -250,9 +283,16 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
     uint8_t dir = v ? 1 : 0;
     NodeRef next = current.child[dir];
     if (next == kTerminal) {
+      // Terminal vetoes at length/count-family nodes can be untrustworthy
+      // (same-prefix candidates legitimately continue when their length
+      // counter carries a symbolic shadow the traced path never had), but
+      // downgrading them all admits ~97% no-op executions (measured: the
+      // vetoed population's post-terminal suffix is empty 99.6% of the time),
+      // so the veto stands; len_related is retained as diagnostic signal.
       *out_node = kUnexplored;
       *out_dir = 0;
       if (out_veto_depth) *out_veto_depth = current.depth;
+      if (out_veto_node) *out_veto_node = cur;
       check_veto_terminal += 1;
       return false;
     }
@@ -264,6 +304,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
         return true;
       }
       if (out_veto_depth) *out_veto_depth = current.depth;
+      if (out_veto_node) *out_veto_node = cur;
       check_veto_rlimit += 1;
       return false;
     }

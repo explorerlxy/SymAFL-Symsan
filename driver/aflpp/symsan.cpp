@@ -176,6 +176,9 @@ struct my_mutator_t {
   // Veto depth buckets (16-deep buckets, >=256 in the last one).
   uint64_t diag_veto_depth[17] = {};
   uint32_t last_veto_depth = 0;
+  pcbt::NodeRef last_veto_node = pcbt::kUnexplored;
+  uint8_t last_probe_input[64] = {};
+  uint32_t last_probe_input_len = 0;
   // Saturation via probe-gain windows (SYMAFL_SAT_WINDOW / SYMAFL_SAT_MIN_GAINS,
   // default off): once a window of probe outcomes yields fewer than
   // sat_min_gains coverage gains, the vetoed population no longer carries
@@ -255,10 +258,11 @@ class ProfileSegment {
 
 static bool check_input_timed(my_mutator_t *data, const u8 *buf,
                               uint32_t buf_size, pcbt::NodeRef *node,
-                              uint8_t *dir, uint32_t *veto_depth = nullptr) {
+                              uint8_t *dir, uint32_t *veto_depth = nullptr,
+                              pcbt::NodeRef *veto_node = nullptr) {
   uint64_t start = profile_start(data);
   bool admitted = data->tree.CheckInput(buf, buf_size, node, dir,
-                                        data->rlimit, veto_depth);
+                                        data->rlimit, veto_depth, veto_node);
   profile_stop(data, start, &data->profile_check_ns,
                &data->profile_check_calls);
   return admitted;
@@ -466,7 +470,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
           "single_pass=%llu single_pass_overflow=%llu "
           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
-          "veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
+          "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
           "replay_ns=%llu replay_calls=%llu\n",
           (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
@@ -488,6 +492,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.check_admit_opaque,
           (unsigned long long)t.check_admit_eval_failure,
           (unsigned long long)t.check_admit_frontier,
+          (unsigned long long)t.check_admit_len_veto,
           (unsigned long long)t.check_veto_terminal,
           (unsigned long long)t.check_veto_rlimit,
           (unsigned long long)data->veto_probe_admitted,
@@ -930,16 +935,43 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
       if (data->diag_probe_details < 30) {
         data->diag_probe_details += 1;
         fprintf(stderr,
-                "[pcbt-diag] probe-detail len=%u veto_depth=%u suffix=%u "
-                "events:",
-                data->last_probe_len, data->last_veto_depth, count);
-        uint32_t shown = count < 4 ? count : 4;
+                "[pcbt-diag] probe-detail len=%u veto_depth=%u veto_node=%u "
+                "suffix=%u\n",
+                data->last_probe_len, data->last_veto_depth,
+                data->last_veto_node, count);
+        fprintf(stderr, "[pcbt-diag]   input:");
+        for (uint32_t k = 0; k < data->last_probe_input_len; ++k) {
+          fprintf(stderr, " %02x", data->last_probe_input[k]);
+        }
+        fprintf(stderr, "\n");
+        if (data->tree.debug() &&
+            data->last_veto_node != pcbt::kUnexplored) {
+          data->tree.DebugPredicate(data->last_veto_node,
+                                    data->last_probe_input,
+                                    data->last_probe_len);
+        }
+        fprintf(stderr, "[pcbt-diag]   suffix events:");
+        uint32_t shown = count < 8 ? count : 8;
         for (uint32_t k = 0; k < shown; ++k) {
           const symafl_single_pass_event &ev = control->events[k];
           fprintf(stderr, " cid=%u label=%u res=%u cnt=%u",
                   ev.cid, ev.label, ev.result, ev.count);
         }
         fprintf(stderr, "\n");
+        // Label structure of the first suffix events: what do these
+        // decisions actually depend on?
+        if (count > 0) {
+          const symafl_single_pass_event &ev = control->events[0];
+          if (ev.label >= 1 && ev.label < MAX_LABEL) {
+            const dfsan_label_info &li = __dfsan_label_info[ev.label];
+            fprintf(stderr,
+                    "[pcbt-diag]   first-suffix label_info op=%u size=%u "
+                    "l1=%u l2=%u op1=%llu op2=%llu\n",
+                    li.op, li.size, li.l1, li.l2,
+                    (unsigned long long)li.op1.i,
+                    (unsigned long long)li.op2.i);
+          }
+        }
       }
     } else {
       data->diag_probe_suffix_empty += 1;
@@ -1089,7 +1121,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   pcbt::NodeRef node = pcbt::kUnexplored;
   uint8_t dir = 0;
   if (check_input_timed(data, buf, (uint32_t)buf_size, &node, &dir,
-                        &data->last_veto_depth)) {
+                        &data->last_veto_depth, &data->last_veto_node)) {
     data->admitted += 1;
     data->vetoes_since_admit = 0;
     data->last_gained = false;
@@ -1134,6 +1166,8 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     data->last_node = pcbt::kUnexplored;
     data->last_probe_suffix_nonempty = false;
     data->last_probe_len = (uint32_t)buf_size;
+    data->last_probe_input_len = (uint32_t)buf_size < 64 ? (uint32_t)buf_size : 64;
+    memcpy(data->last_probe_input, buf, data->last_probe_input_len);
     if (data->sat_window) data->sat_probe_total += 1;
     if (data->single_pass_armed) disarm_capture(data);
     if (data->probe_diag && data->last_veto_depth > 0) {
@@ -1164,7 +1198,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     fprintf(stderr,
             "[pcbt-concolic-phase] screened=%llu admitted=%llu "
             "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
-            "probe_gained=%llu admit_frontier=%llu veto_terminal=%llu "
+            "probe_gained=%llu admit_frontier=%llu admit_len_veto=%llu veto_terminal=%llu "
             "traces=%llu nodes=%llu depth=%llu\n",
             (unsigned long long)data->screened,
             (unsigned long long)data->admitted,
@@ -1173,6 +1207,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
             (unsigned long long)data->veto_probe_admitted,
             (unsigned long long)data->veto_probe_gained,
             (unsigned long long)data->tree.check_admit_frontier,
+            (unsigned long long)data->tree.check_admit_len_veto,
             (unsigned long long)data->tree.check_veto_terminal,
             (unsigned long long)data->tree.num_traces,
             (unsigned long long)data->tree.num_nodes,
@@ -1205,7 +1240,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
         fprintf(stderr,
                 "[pcbt-concolic-phase] screened=%llu admitted=%llu "
                 "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
-                "probe_gained=%llu admit_frontier=%llu veto_terminal=%llu "
+                "probe_gained=%llu admit_frontier=%llu admit_len_veto=%llu veto_terminal=%llu "
                 "traces=%llu nodes=%llu depth=%llu\n",
                 (unsigned long long)data->screened,
                 (unsigned long long)data->admitted,
@@ -1214,6 +1249,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                 (unsigned long long)data->veto_probe_admitted,
                 (unsigned long long)data->veto_probe_gained,
                 (unsigned long long)data->tree.check_admit_frontier,
+                (unsigned long long)data->tree.check_admit_len_veto,
                 (unsigned long long)data->tree.check_veto_terminal,
                 (unsigned long long)data->tree.num_traces,
                 (unsigned long long)data->tree.num_nodes,
@@ -1256,7 +1292,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "screened=%llu admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
            "single_pass=%llu single_pass_overflow=%llu "
            "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
-            "veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
+           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu profile=%d "
            "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
            "replay_ns=%llu replay_calls=%llu",
            (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
@@ -1278,7 +1314,8 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)t.check_admit_opaque,
            (unsigned long long)t.check_admit_eval_failure,
            (unsigned long long)t.check_admit_frontier,
-            (unsigned long long)t.check_veto_terminal,
+           (unsigned long long)t.check_admit_len_veto,
+           (unsigned long long)t.check_veto_terminal,
            (unsigned long long)t.check_veto_rlimit,
            (unsigned long long)data->veto_probe_admitted,
            (unsigned long long)data->veto_probe_gained,

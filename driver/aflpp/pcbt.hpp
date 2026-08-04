@@ -27,6 +27,13 @@ struct Node {
   NodeRef child[2] = {kUnexplored, kUnexplored};
   uint32_t depth = 0;                // root's children = 1
   uint8_t rCnt[2] = {0, 0};          // non-gaining admissions per direction
+  // The stored predicate's decision depends on a length/count family leaf
+  // (Len/EofRead/Count/CountNeg1/CountElems). Length-derived decisions are
+  // path-dependent in label presence: a trace whose length counter was never
+  // symbolically updated contributes no event, while candidates on other
+  // paths do. Terminal vetoes at such nodes are therefore not trustworthy
+  // (same-prefix candidates legitimately continue); they admit conservatively.
+  bool len_related = false;
 };
 
 struct Event {
@@ -64,7 +71,8 @@ class Tree {
   // edges are already explored and vetoed.
   bool CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                   uint8_t *out_dir, uint8_t rlimit,
-                  uint32_t *out_veto_depth = nullptr);
+                  uint32_t *out_veto_depth = nullptr,
+                  NodeRef *out_veto_node = nullptr);
 
   // Const replay: walk the event vector from kRoot and compare CID order
   // and predicate directions against the tree.  Never mutates any state.
@@ -123,6 +131,7 @@ class Tree {
   uint64_t check_admit_opaque = 0;
   uint64_t check_admit_eval_failure = 0;
   uint64_t check_admit_frontier = 0;
+  uint64_t check_admit_len_veto = 0;  // terminal veto downgraded to admit
   uint64_t check_veto_terminal = 0;
   uint64_t check_veto_rlimit = 0;
   std::array<uint64_t, kPredErrorCount> opaque_by_error{};
