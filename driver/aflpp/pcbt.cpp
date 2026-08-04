@@ -150,6 +150,17 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       k = 0;
       i += 1;
     }
+    // A chain node in the tree stands for the whole branchless run of
+    // consecutive constraint events with this cid; absorb the candidate's
+    // remaining ones (constraint events always have count 1) so the next
+    // event matches the node after the chain.
+    if (node(parent).constraint_node) {
+      while (i < events.size() && events[i].constraint &&
+             events[i].cid == ev.cid) {
+        i += 1;
+      }
+      k = 0;
+    }
   }
 
   if (i == events.size() && k == 0) {
@@ -191,6 +202,17 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       created += 1;
       trace_depth += 1;
     }
+    // Branchless constraint chains collapse: consecutive constraint events
+    // with the same cid produce a single chain node (their length carries no
+    // routing information; see Node::constraint_node). Fold frames are never
+    // constraint events (the runtime excludes them from folding).
+    if (ev.constraint && ev.count == 1) {
+      node(parent).constraint_node = true;
+      while (i + 1 < events.size() && events[i + 1].constraint &&
+             events[i + 1].cid == ev.cid) {
+        i += 1;
+      }
+    }
   }
 
   node(parent).child[dir] = kTerminal;
@@ -219,7 +241,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   uint32_t created = 0;
   uint8_t dir = direction;
   NodeRef cur = parent;
-  for (const Event &event : events) {
+  for (size_t idx = 0; idx < events.size(); ++idx) {
+    const Event &event = events[idx];
     std::vector<Predicate> preds;
     if (event.count > 1) {
       conv.expand_fold(event.label, event.count, 0, &preds);
@@ -243,6 +266,15 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       cur = next;
       dir = event.result ? 1 : 0;
       created += 1;
+    }
+    // Branchless constraint chains collapse (see Node::constraint_node):
+    // consecutive constraint events with the same cid produce one node.
+    if (event.constraint && event.count == 1) {
+      node(cur).constraint_node = true;
+      while (idx + 1 < events.size() && events[idx + 1].constraint &&
+             events[idx + 1].cid == event.cid) {
+        idx += 1;
+      }
     }
   }
 
@@ -375,6 +407,18 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     // positive. Follow the recorded direction; the next event's CID check
     // still guards the path.
     if (ev.constraint) {
+      // Chain node: the stored node stands for the whole branchless run of
+      // consecutive constraint events with this cid; absorb the candidate's
+      // remaining ones (constraint events have count 1) without stepping,
+      // before the terminal/frontier checks so trace_total comparisons
+      // account for them.
+      if (current.constraint_node) {
+        while (i + 1 < events.size() && events[i + 1].constraint &&
+               events[i + 1].cid == ev.cid) {
+          i += 1;
+          logic += 1;
+        }
+      }
       NodeRef next = current.child[ev.result ? 1 : 0];
       if (next == kTerminal) {
         if (logic < trace_total) {

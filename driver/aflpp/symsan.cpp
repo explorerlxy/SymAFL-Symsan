@@ -1002,9 +1002,20 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
                                       __ATOMIC_ACQUIRE);
       if (mode == SYMAFL_TRACE_SUFFIX_SHM) {
         uint64_t before = data->tree.num_traces;
-        (void)insert_suffix_capture(data, nullptr, 0, "admit-run");
-        if (data->tree.num_traces > before) {
+        bool ok = insert_suffix_capture(data, nullptr, 0, "admit-run");
+        if (ok && data->tree.num_traces > before) {
           data->last_node = pcbt::kUnexplored;
+        } else if (!ok && data->last_node != pcbt::kUnexplored) {
+          // The bounded SHM truncated this admitted run's suffix; without a
+          // replay the tree silently loses the tail (and queue_new_entry
+          // only fires on coverage gains, which tree learning dries up).
+          // Replay through pipe-suffix so the full suffix is learned.
+          std::vector<u8> buf;
+          if (read_cur_input(data, &buf)) {
+            (void)replay_pipe_suffix(data, buf.data(), buf.size(),
+                                     ".cur_input", data->last_node,
+                                     data->last_dir);
+          }
         }
       }
     }
