@@ -34,16 +34,6 @@ struct Node {
   // paths do. Terminal vetoes at such nodes are therefore not trustworthy
   // (same-prefix candidates legitimately continue); they admit conservatively.
   bool len_related = false;
-  // Chain node: this node stands for a run of consecutive branchless
-  // constraint events (tainted GEP index / indcall target == concrete, result
-  // always 1, same cid). Constraint chains carry no routing information
-  // beyond "the constraint held" - every element's direction is 1 - so a
-  // chain of any length collapses into a single node. This bounds tree
-  // depth by the number of decision points, not by loop iteration counts
-  // (e.g. the crc32 table-index chain, ~124 nodes on XZ seeds). Insert and
-  // replay absorb consecutive constraint events of the same cid at chain
-  // nodes; CheckInput evaluates the stored predicate once (direction 1).
-  bool constraint_node = false;
 };
 
 struct Event {
