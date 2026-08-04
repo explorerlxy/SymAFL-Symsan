@@ -63,17 +63,30 @@ using namespace __dfsan;
 static inline void clear_shadow_range(void *ptr, size_t bytes) {
   if (!ptr || !bytes) return;
   // shadow_for() is not page-aligned; MADV_DONTNEED requires a page-aligned
-  // range, so round to the enclosing pages before advising.
+  // range. Rounding to the enclosing pages would also discard the shadow
+  // labels of the neighboring allocation when two small allocations are
+  // adjacent (their shadow ranges fall inside the same page): the LZMA
+  // coder state (4 KB) adjacent to the input buffer made the advice range
+  // start one page early and wiped the input labels, so the range decoder
+  // read untainted compressed bytes and every bit decision lost its label.
+  // Advise only the fully-contained pages and zero the unaligned head and
+  // tail eagerly (at most two partial pages per allocation; the 64 MB LZMA
+  // dictionary keeps its ~256 MB body on the DONTNEED path).
   uptr page = GetPageSizeCached();
   uptr start = (uptr)__dfsan::shadow_for(ptr);
   uptr len = bytes * sizeof(dfsan_label);
-  uptr adv_start = RoundDownTo(start, page);
-  uptr adv_end = RoundUpTo(start + len, page);
-  if (madvise((void *)adv_start, adv_end - adv_start, MADV_DONTNEED) != 0) {
-    // Fallback for an unmapped or unsupported shadow tail: eager zeroing
-    // keeps the shadow correct, at the cost of faulting the pages.
-    internal_memset((void *)start, 0, len);
+  uptr end = start + len;
+  uptr body_start = RoundUpTo(start, page);
+  uptr body_end = RoundDownTo(end, page);
+  if (body_end > body_start) {
+    if (madvise((void *)body_start, body_end - body_start, MADV_DONTNEED) != 0) {
+      // Fallback for an unmapped or unsupported shadow body: eager zeroing
+      // keeps the shadow correct, at the cost of faulting the pages.
+      internal_memset((void *)body_start, 0, body_end - body_start);
+    }
   }
+  if (start < body_start) internal_memset((void *)start, 0, body_start - start);
+  if (end > body_end) internal_memset((void *)body_end, 0, end - body_end);
 }
 
 #define CALL_WEAK_INTERCEPTOR_HOOK(f, ...)                                     \
