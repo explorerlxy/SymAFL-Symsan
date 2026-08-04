@@ -208,10 +208,19 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
                             const std::vector<Event> &events,
                             const dfsan_label_info *table,
                             size_t table_labels) {
-  if (parent < kRoot || parent >= nodes_.size() || direction > 1 ||
-      node(parent).child[direction] != kUnexplored) {
+  if (parent < kRoot || parent >= nodes_.size() || direction > 1) {
     return 0;
   }
+  NodeRef edge = node(parent).child[direction];
+  if (edge == kTerminal) return 0;
+  if (edge != kUnexplored && !node(edge).constraint) return 0;
+  // edge != kUnexplored here means a constraint node whose pinned value the
+  // candidate does not hold: CheckInput returns the constraint's parent as
+  // the frontier so the candidate's own replacement constraint event lands
+  // in this suffix. The old constraint subtree is orphaned below — kept in
+  // the arena but detached — because its edges generalized the first pinned
+  // value to all unseen values.
+  NodeRef replaced = edge != kUnexplored ? edge : kUnexplored;
   num_traces += 1;
   for (const Event &ev : events) num_events += ev.count;
 
@@ -219,8 +228,17 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     // Empty suffix on a constraint edge: the run only confirmed that the
     // pinned value produces no further symbolic decisions. Other values are
     // unobserved, so the edge must stay unexplored.
-    if (!node(parent).constraint)
+    if (!node(parent).constraint && replaced == kUnexplored)
       node(parent).child[direction] = kTerminal;
+    return 0;
+  }
+
+  // A replacement suffix must start with the candidate's own constraint
+  // event (same cid as the replaced node); anything else means the run did
+  // not reach the pinned decision and the suffix cannot be anchored here.
+  if (replaced != kUnexplored &&
+      (events.front().constraint == 0 ||
+       events.front().cid != node(replaced).cid)) {
     return 0;
   }
 
@@ -235,7 +253,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   // nodes are unconfirmable by screening (a candidate with a different
   // pinned value evaluates the constraint false and never reaches them) and
   // a Terminal tail would veto every unseen value. Detach the excess below.
-  bool capped = node(parent).constraint;      // cap active from the parent edge
+  bool capped = node(parent).constraint || replaced != kUnexplored;
   bool over_cap = false;                      // >1 real node past the cap
   NodeRef cap_node = kUnexplored;             // edge to detach on over_cap
   uint8_t cap_dir = 0;
@@ -311,6 +329,8 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
 
   EvalContext eval;
   eval.Reset();
+  NodeRef parent = kRoot;   // parent of cur on the walked path
+  uint8_t parent_dir = 0;   // direction from parent to cur
   while (true) {
     const Node &current = node(cur);
     if (current.pred.opaque) {
@@ -343,6 +363,8 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
           check_admit_frontier += 1;
           return true;
         }
+        parent = cur;
+        parent_dir = 0;
         cur = next;
         continue;
       }
@@ -350,8 +372,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       *out_dir = 0;
       check_admit_opaque += 1;
       return true;
-    }
-    uint64_t v = 0;
+    }    uint64_t v = 0;
     if (!eval_predicate(pred_arena_, current.pred, input, len, &v, &eval)) {
       *out_node = kUnexplored;
       *out_dir = 0;
@@ -359,6 +380,39 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       return true;
     }
     uint8_t dir = v ? 1 : 0;
+    if (current.constraint && dir != 1) {
+      // Diverging at a constraint node means the candidate pins a different
+      // concrete value (GEP index / jump target). The stored constraint
+      // node's predicate carries the OLD constant, and the candidate's own
+      // event stream carries a NEW constraint event at this position. The
+      // frontier must therefore be the constraint node's parent (skip_depth
+      // one less), so the candidate's replacement constraint event is
+      // exported and inserted; otherwise skip_depth silently drops it and
+      // the tree conflates every unseen pinned value with the first one.
+      //
+      // The subtree under the OLD constraint node stays authoritative for
+      // candidates that hold the OLD value, so the replacement edge must
+      // first be captured by a full trace before the parent-edge admit
+      // channel opens (InsertTrace prefix-matches into the old subtree and
+      // re-screens inside it). Until then the candidate vetoes here: the
+      // vetoed population carries unseen pinned values only until the
+      // next coverage-gaining full trace learns them.
+      if (parent != kRoot && node(parent).child[parent_dir] == cur) {
+        NodeRef down = current.child[1];
+        if (down != kUnexplored && down != kTerminal) {
+          if (out_veto_depth) *out_veto_depth = current.depth;
+          if (out_veto_node) *out_veto_node = cur;
+          check_veto_rlimit += 1;  // constraint-variant wait: see above
+          return false;
+        }
+        *out_node = parent;
+        *out_dir = parent_dir;
+        check_admit_frontier += 1;
+        return true;
+      }
+      // Root constraint (no parent): fall through to the ordinary frontier
+      // at the constraint node itself.
+    }
     NodeRef next = current.child[dir];
     if (next == kTerminal) {
       // Terminal vetoes at length/count-family nodes can be untrustworthy
@@ -386,6 +440,8 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       check_veto_rlimit += 1;
       return false;
     }
+    parent = cur;
+    parent_dir = dir;
     cur = next;
   }
 }
