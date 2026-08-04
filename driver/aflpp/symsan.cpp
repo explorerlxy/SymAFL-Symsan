@@ -1044,37 +1044,15 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
                       &data->diag_admit_suffix_overflow,
                       &data->diag_admit_suffix_events);
     }
-    // Tree learning: every admitted execution that carried a decision
-    // suffix past the frontier contributes it to the tree, not just
-    // coverage-gaining ones. The tree's decision coverage then tracks the
-    // executed population (instead of ~1/90 of it), so frontier judgments
-    // sharpen and the admit channel can carry a larger share of the
-    // execution budget. Mark the frontier consumed so queue_new_entry's
-    // duplicate insert (coverage-gaining case) is a no-op and never
-    // triggers an overflow replay.
-    if (data->single_pass_armed && data->last_node != pcbt::kUnexplored) {
-      uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
-                                      __ATOMIC_ACQUIRE);
-      if (mode == SYMAFL_TRACE_SUFFIX_SHM) {
-        uint64_t before = data->tree.num_traces;
-        bool ok = insert_suffix_capture(data, nullptr, 0, "admit-run");
-        if (ok) record_admitted_pair(data);
-        if (ok && data->tree.num_traces > before) {
-          data->last_node = pcbt::kUnexplored;
-        } else if (!ok && data->last_node != pcbt::kUnexplored) {
-          // The bounded SHM truncated this admitted run's suffix; without a
-          // replay the tree silently loses the tail (and queue_new_entry
-          // only fires on coverage gains, which tree learning dries up).
-          // Replay through pipe-suffix so the full suffix is learned.
-          std::vector<u8> buf;
-          if (read_cur_input(data, &buf)) {
-            (void)replay_pipe_suffix(data, buf.data(), buf.size(),
-                                     ".cur_input", data->last_node,
-                                     data->last_dir);
-          }
-        }
-      }
-    }
+    // The tree learns an admitted run's suffix ONLY when the run gains
+    // coverage (afl_custom_queue_new_entry inserts it). A non-gaining run
+    // contributes nothing to the tree: post_process's retry bookkeeping
+    // bumps rCnt for its frontier edge, so rlimit bounds how many times a
+    // frontier edge is re-mined before candidates there are vetoed
+    // (veto_rlimit). This block deliberately does NOT reset last_node
+    // (post_process needs it for the rCnt bump) and does NOT consume the
+    // capture: queue_new_entry reads it for the gaining run, and
+    // post_process disarms it when no gain happened.
     return;
   }
   if (!data->single_pass_armed) return;
@@ -1144,9 +1122,9 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   // Seeds and post-saturation concrete-phase gains are not PCBT admissions.
   if (!data->bootstrap_done || !data->screening) return 0;
   data->traced_entries.insert((const char *)filename_new_queue);
-  // post_run already learned this admitted run's suffix into the tree (all
-  // admitted runs learn now, not just coverage-gaining ones), so there is
-  // nothing left to capture for it.
+  // This admitted run gained coverage, so its suffix is tree material:
+  // post_run inserts nothing (non-gaining runs only bump rCnt), and the
+  // run's SHM capture is still armed for us to consume here.
   if (!data->single_pass_armed) return 0;
   const char *fname = (const char *)filename_new_queue;
   std::vector<u8> buf;
@@ -1166,6 +1144,7 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
             : mode == SYMAFL_TRACE_FULL_STREAM
                   ? insert_full_stream(data, buf.data(), buf.size(), fname)
                   : false;
+  if (inserted) record_admitted_pair(data);
   if (!inserted && node != pcbt::kUnexplored) {
     (void)replay_pipe_suffix(data, buf.data(), buf.size(), fname, node, dir);
   }
