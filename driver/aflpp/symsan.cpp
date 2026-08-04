@@ -205,6 +205,15 @@ struct my_mutator_t {
   uint64_t probe_gained_empty = 0;
   uint64_t probe_gained_overflow = 0;
   uint64_t diag_probe_details = 0;  // printed nonempty-probe details
+
+  // Pair forensics (SYMAFL_PAIR_LOG=<path>): record every admitted run's
+  // input at its (node, dir) admission edge. A later vetoed-but-gainful
+  // candidate at veto node N with evaluated direction d has its admitted
+  // counterpart recorded at (N, d) -- the run that created the terminal
+  // edge -- with the identical PCBT path. Both streams replayed through the
+  // concolic target expose the decision the tree missed.
+  FILE *pair_log = nullptr;
+  uint8_t last_veto_dir = 0;
 };
 
 // Shared union table owned by the target forkserver.
@@ -259,10 +268,12 @@ class ProfileSegment {
 static bool check_input_timed(my_mutator_t *data, const u8 *buf,
                               uint32_t buf_size, pcbt::NodeRef *node,
                               uint8_t *dir, uint32_t *veto_depth = nullptr,
-                              pcbt::NodeRef *veto_node = nullptr) {
+                              pcbt::NodeRef *veto_node = nullptr,
+                              uint8_t *veto_dir = nullptr) {
   uint64_t start = profile_start(data);
   bool admitted = data->tree.CheckInput(buf, buf_size, node, dir,
-                                        data->rlimit, veto_depth, veto_node);
+                                        data->rlimit, veto_depth, veto_node,
+                                        veto_dir);
   profile_stop(data, start, &data->profile_check_ns,
                &data->profile_check_calls);
   return admitted;
@@ -425,6 +436,13 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->probe_diag = true;
     fprintf(stderr, "[pcbt] probe diagnostic enabled (SYMAFL_PROBE_DIAG=1)\n");
   }
+  if (const char *pl = getenv("SYMAFL_PAIR_LOG")) {
+    data->pair_log = fopen(pl, "w");
+    if (!data->pair_log) {
+      FATAL("cannot open SYMAFL_PAIR_LOG=%s", pl);
+    }
+    fprintf(stderr, "[pcbt] pair forensics log: %s\n", pl);
+  }
   if (const char *cd = getenv("SYMAFL_CONCOLIC_SECONDS")) {
     char *end = nullptr;
     unsigned long long parsed = strtoull(cd, &end, 10);
@@ -560,6 +578,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
               i + 1 < 17 ? "," : "\n");
     }
   }
+  if (data->pair_log) fclose(data->pair_log);
   delete data;
 }
 
@@ -900,6 +919,26 @@ static bool read_cur_input(my_mutator_t *data, std::vector<u8> *buf) {
   return ok;
 }
 
+// Pair forensics: record the admitted run's input at its (node, dir) edge.
+// The first admitted run at an edge is the one that inserted the suffix (and
+// possibly created the terminal edge there), so a later veto at (node, dir)
+// pairs with this input: identical PCBT path, bitmap difference is what the
+// tree missed.
+static void record_admitted_pair(my_mutator_t *data) {
+  if (!data->pair_log || data->last_node == pcbt::kUnexplored) return;
+  std::vector<u8> buf;
+  if (!read_cur_input(data, &buf)) return;
+  fprintf(data->pair_log, "admit node=%u dir=%u len=%zu hex=",
+          data->last_node, data->last_dir, buf.size());
+  size_t shown = buf.size() < 4096 ? buf.size() : 4096;
+  for (size_t i = 0; i < shown; ++i) {
+    fprintf(data->pair_log, "%02x", buf[i]);
+  }
+  if (shown < buf.size()) fprintf(data->pair_log, " TRUNC");
+  fprintf(data->pair_log, "\n");
+  fflush(data->pair_log);
+}
+
 static void classify_suffix(my_mutator_t *data, uint64_t *empty,
                             uint64_t *nonempty, uint64_t *overflow,
                             uint64_t *events_sum) {
@@ -1004,6 +1043,7 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
       if (mode == SYMAFL_TRACE_SUFFIX_SHM) {
         uint64_t before = data->tree.num_traces;
         bool ok = insert_suffix_capture(data, nullptr, 0, "admit-run");
+        if (ok) record_admitted_pair(data);
         if (ok && data->tree.num_traces > before) {
           data->last_node = pcbt::kUnexplored;
         } else if (!ok && data->last_node != pcbt::kUnexplored) {
@@ -1071,12 +1111,13 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
       // tells whether the real decision trace continued past it.
       fprintf(stderr,
               "[pcbt-diag] gained-case probe file=%s len=%u veto_depth=%u "
-              "veto_node=%u veto_cid=%u suffix=%s\n",
+              "veto_node=%u veto_cid=%u veto_dir=%u suffix=%s\n",
               filename_new_queue, data->last_probe_input_len,
               data->last_veto_depth, data->last_veto_node,
               data->last_veto_node != pcbt::kUnexplored
                   ? data->tree.cid_of(data->last_veto_node)
                   : 0u,
+              data->last_veto_dir,
               data->last_probe_suffix_nonempty
                   ? "nonempty"
                   : data->last_probe_suffix_overflow ? "overflow" : "empty");
@@ -1148,7 +1189,8 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   pcbt::NodeRef node = pcbt::kUnexplored;
   uint8_t dir = 0;
   if (check_input_timed(data, buf, (uint32_t)buf_size, &node, &dir,
-                        &data->last_veto_depth, &data->last_veto_node)) {
+                        &data->last_veto_depth, &data->last_veto_node,
+                        &data->last_veto_dir)) {
     data->admitted += 1;
     data->vetoes_since_admit = 0;
     data->last_gained = false;
@@ -1202,7 +1244,11 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
       __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
       __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
       __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
-      control->skip_depth = data->last_veto_depth;
+      // The runtime skip counts stream positions (label!=0 events), so the
+      // veto node's topology depth is not the right basis (constraint value
+      // chains advance topology without advancing stream positions). Use the
+      // node's skipCnt, symmetric with the admitted-run arm path.
+      control->skip_depth = data->tree.skip_for(data->last_veto_node);
       __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_SHM,
                        __ATOMIC_RELEASE);
       __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);

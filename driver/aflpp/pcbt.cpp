@@ -309,7 +309,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
 
 bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                       uint8_t *out_dir, uint8_t rlimit,
-                      uint32_t *out_veto_depth, NodeRef *out_veto_node) {
+                      uint32_t *out_veto_depth, NodeRef *out_veto_node,
+                      uint8_t *out_veto_dir) {
   NodeRef cur = node(kRoot).child[0];
   if (cur == kUnexplored) {
     *out_node = kUnexplored;
@@ -343,6 +344,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
           *out_dir = 0;
           if (out_veto_depth) *out_veto_depth = current.depth;
           if (out_veto_node) *out_veto_node = cur;
+          if (out_veto_dir) *out_veto_dir = 0;
           check_veto_terminal += 1;
           return false;
         }
@@ -380,6 +382,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       *out_dir = 0;
       if (out_veto_depth) *out_veto_depth = current.depth;
       if (out_veto_node) *out_veto_node = cur;
+      if (out_veto_dir) *out_veto_dir = dir;
       check_veto_terminal += 1;
       return false;
     }
@@ -392,6 +395,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       }
       if (out_veto_depth) *out_veto_depth = current.depth;
       if (out_veto_node) *out_veto_node = cur;
+      if (out_veto_dir) *out_veto_dir = dir;
       check_veto_rlimit += 1;
       return false;
     }

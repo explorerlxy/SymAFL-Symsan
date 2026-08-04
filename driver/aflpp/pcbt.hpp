@@ -88,11 +88,16 @@ class Tree {
 
   // Screen a candidate. On admission, *out_node / *out_dir identify an
   // unexplored frontier for retry bookkeeping and suffix skip depth. Terminal
-  // edges are already explored and vetoed.
+  // edges are already explored and vetoed. On veto, *out_veto_depth /
+  // *out_veto_node identify the site and *out_veto_dir the evaluated
+  // direction that hit the terminal/rlimit edge (pair forensics: the
+  // admitted run recorded at (veto_node, veto_dir) walked the identical
+  // path and created the terminal edge).
   bool CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                   uint8_t *out_dir, uint8_t rlimit,
                   uint32_t *out_veto_depth = nullptr,
-                  NodeRef *out_veto_node = nullptr);
+                  NodeRef *out_veto_node = nullptr,
+                  uint8_t *out_veto_dir = nullptr);
 
   // Const replay: walk the event vector from kRoot and compare CID order
   // and predicate directions against the tree.  Never mutates any state.
