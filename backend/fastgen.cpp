@@ -39,9 +39,17 @@ static inline void __send_ubi(dfsan_label label, uint64_t result,
   }
 }
 
+// Multi-successor single-decision state for switch statements. A switch over
+// a symbolic condition is one decision point: every candidate contributes
+// exactly one event — the hit case's comparison (or, for the default path, a
+// tautological (cond == cond) event) — at a single stream position, so the
+// PCBT value-fork chain (case1 -> dir0 case2 -> dir0 ...) stays
+// position-aligned (skipCnt semantics).
 static struct switch_true_case {
-  dfsan_label label;
-  uint32_t cid;
+  dfsan_label label;       // hit case's (cond == case_value) label; 0 = none
+  dfsan_label cond_label;  // switch condition label (default-path event)
+  uint32_t cid;            // in-flight switch's cid; 0 = no switch in flight
+  uint32_t size;           // condition width in bits
 } __switch_true_case = {0};
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -75,40 +83,63 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
   uint8_t r = get_const_result(c1, c2, predicate);
   dfsan_label temp = dfsan_union(op1, op2, (predicate << 8) | ICmp, size, c1, c2);
 
-  if (r) {
-    // for the true case, we want to save it to solve the last,
-    // so the nested constraint will not affect other cases
-    __switch_true_case.label = temp;
+  // A switch over a symbolic condition is a multi-successor single-decision
+  // event: every candidate contributes exactly one event — the hit case's
+  // comparison — at one stream position. A non-hit case comparison is
+  // therefore NOT emitted (it would occupy the same position with a
+  // different label, misaligning the stream positions that PCBT's skipCnt
+  // semantics rely on). The hit case is kept and emitted as a constraint
+  // event at switch_end; a switch with no matching case emits a
+  // tautological (cond == cond) constraint event there (the default path).
+  if (__switch_true_case.cid != cid) {
+    // New switch in flight: reset the hit state (a previous switch's hit
+    // must not leak into this one).
+    __switch_true_case.label = 0;
+    __switch_true_case.cond_label = op1;
     __switch_true_case.cid = cid;
-  } else {
-    // solve without add_nested
-    __taint_send_cond(temp, r, 0, 0, cid, addr);
+    __switch_true_case.size = size;
+  }
+  if (r) {
+    __switch_true_case.label = temp;
   }
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_switch_end(uint32_t cid) {
-  if (__switch_true_case.label == 0) {
-    return;
-  } else if (__switch_true_case.cid != cid) {
-    AOUT("WARNING: switch end cid mismatch %u vs %u\n",
-         __switch_true_case.cid, cid);
+  if (__switch_true_case.cid != cid) {
     return;
   }
 
   void *addr = __builtin_return_address(0);
 
-  AOUT("solving switch end: %u 0x%x @%p\n",
-       __switch_true_case.label, cid, addr);
+  dfsan_label label = __switch_true_case.label;
+  if (label == 0) {
+    // No case matched (default branch): emit a tautological (cond == cond)
+    // constraint event so the default path occupies the decision point's
+    // stream position and routes through the value-fork chain tail (the
+    // all-false direction of the last case node).
+    label = dfsan_union(__switch_true_case.cond_label,
+                        __switch_true_case.cond_label,
+                        (bveq << 8) | ICmp, __switch_true_case.size, 0, 0);
+  }
 
-  // solve the true case
-  __taint_send_cond(__switch_true_case.label, 1, 1, 0, cid, addr);
+  AOUT("solving switch end: %u 0x%x @%p\n", label, cid, addr);
+
+  // Emit the decision as a constraint event (multi-successor
+  // single-decision semantics; result always 1 for the traced run).
+  if (label != 0 && label != kInitializingLabel)
+    __taint_send_cond(label, 1, 0, ConstraintFlag, cid, addr);
   __switch_true_case.label = 0;
+  __switch_true_case.cond_label = 0;
+  __switch_true_case.cid = 0;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
-  if (label == 0) {
+  // DIAGNOSTIC ONLY: label==0 conditions are forwarded so the direct-run
+  // stream exposes whether branch sites were instrumented at all and what
+  // their runtime label is. Shipped mode re-adds the filter.
+  if (false && label == 0) {
     // check for real loop exit
     if (!(((flag & FalseBranchLoopExit) && !r) ||
           ((flag & TrueBranchLoopExit) && r)))

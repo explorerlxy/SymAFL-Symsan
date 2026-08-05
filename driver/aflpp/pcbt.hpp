@@ -23,6 +23,14 @@ constexpr NodeRef kRoot = 2;
 
 struct Node {
   uint32_t cid = 0;  // compile-time branch id
+  // The traced event's union-table label this node was built from. For
+  // constraint nodes (multi-successor single-decision events: tainted GEP
+  // index / indcall target / switch case), a candidate that pins the same
+  // value re-emits the identical label at the same stream position; the
+  // re-emission is filtered during insertion instead of creating a
+  // duplicate node (the parent's dir-1 subtree then starts at the
+  // candidate's first post-decision event).
+  uint32_t label = 0;
   Predicate pred;    // root view into Tree::pred_arena_
   NodeRef child[2] = {kUnexplored, kUnexplored};
   uint32_t depth = 0;                // root's children = 1 (topology stats)
@@ -136,6 +144,16 @@ class Tree {
   bool IsSaturated(uint8_t rlimit) const;
   uint32_t depth(NodeRef ref) const { return node(ref).depth; }
   uint32_t cid_of(NodeRef ref) const { return node(ref).cid; }
+  // Minimal topology accessors (diagnostics and unit tests).
+  NodeRef root_child0() const { return node(kRoot).child[0]; }
+  NodeRef child(NodeRef ref, uint8_t direction) const {
+    return ref < kRoot || ref >= nodes_.size()
+               ? kUnexplored
+               : node(ref).child[direction & 1];
+  }
+  uint32_t skip_of(NodeRef ref) const {
+    return ref < kRoot || ref >= nodes_.size() ? 0 : node(ref).skipCnt;
+  }
   // Number of leading stream events the runtime must skip so the candidate's
   // own events from this frontier node's position onward are exported.
   uint32_t skip_for(NodeRef frontier_parent) const {

@@ -215,6 +215,18 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   uint32_t created = 0;
   for (; i < events.size(); ++i) {
     const Event &ev = events[i];
+    // Constraint re-emission: a candidate that pins the same value as the
+    // parent constraint node re-emits the parent's own event at the same
+    // stream position (multi-successor single-decision semantics: every
+    // candidate contributes exactly one event at the decision point). It is
+    // already modeled by the parent node, so skip it — the parent's dir-1
+    // subtree then starts at the candidate's first post-decision event.
+    // (A different pinned value produces a different label and is inserted
+    // as the value-fork chain instead.)
+    if (ev.constraint && node(parent).constraint &&
+        ev.cid == node(parent).cid && ev.label == node(parent).label) {
+      continue;
+    }
     std::vector<Predicate> preds;
     if (ev.count > 1) {
       // `k` is nonzero when the tree already covered this frame's prefix;
@@ -227,6 +239,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     for (const Predicate &pred : preds) {
       Node new_node;
       new_node.cid = ev.cid;
+      new_node.label = ev.label;
       new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
       new_node.skipCnt = parent == kRoot
           ? (ev.constraint ? 0u : 1u)
@@ -283,6 +296,20 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   uint8_t dir = direction;
   NodeRef cur = parent;
   for (const Event &event : events) {
+    // Constraint re-emission filter (symmetric with InsertTrace): the
+    // suffix capture skips `parent.skipCnt` events, so a candidate admitted
+    // on the parent's dir-1 (pinned-value) edge re-emits the parent's own
+    // event as the first captured event. It is already modeled; skip it so
+    // the dir-1 subtree starts at the candidate's first post-decision
+    // event. A candidate pinning a different value (admitted on dir-0)
+    // re-emits its own different-label event, which is inserted as the
+    // value-fork chain. When every event is filtered (only the re-emission
+    // was captured), the edge stays unexplored — the run only confirmed the
+    // pinned value produces no further decisions.
+    if (event.constraint && node(cur).constraint &&
+        event.cid == node(cur).cid && event.label == node(cur).label) {
+      continue;
+    }
     std::vector<Predicate> preds;
     if (event.count > 1) {
       conv.expand_fold(event.label, event.count, 0, &preds);
@@ -292,6 +319,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     for (const Predicate &pred : preds) {
       Node new_node;
       new_node.cid = event.cid;
+      new_node.label = event.label;
       new_node.depth = node(cur).depth + 1;
       new_node.skipCnt = child_skip_cnt(node(cur), event.constraint != 0);
       new_node.pred = pred;
