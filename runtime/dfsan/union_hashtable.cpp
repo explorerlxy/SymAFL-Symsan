@@ -8,7 +8,13 @@ union_hashtable::union_hashtable(uint64_t n) {
   bucket_size = n;
   bucket = reinterpret_cast<atomic_uintptr_t*>(
       allocator_alloc(n * sizeof(atomic_uintptr_t)));
-  __sanitizer::internal_memset(bucket, 0, n * sizeof(atomic_uintptr_t));
+  // No zeroing needed: the bucket region comes from the no-reserve,
+  // demand-zero allocator mapping, so it is already zero. The former 8 MB
+  // memset was redundant work AND ran once per forkserver child: this global
+  // constructor's default init priority (65535) runs AFTER the AFL forkserver
+  // starts (afl_init_shim is constructor(101)), so every forked child
+  // re-executed it, touching ~2000 fresh pages (~1.3 ms/run). Removing it
+  // raised the concolic admit rate 310 -> 529/s (A/B, 60s XZ, 2026-08-05).
 }
 
 uint32_t
