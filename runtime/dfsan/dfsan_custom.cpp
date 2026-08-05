@@ -266,6 +266,31 @@ static inline dfsan_label get_str_label(const char *s, dfsan_label s_label) {
   return get_str_label_n(s, s_label, len + 1, term_label);
 }
 
+// Event export used by the read interceptors (strong definition in
+// solver_common.cpp; fastgen links it into every concolic target).
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+void __taint_send_cond(dfsan_label label, uint8_t result, uint8_t add_nested,
+                       uint8_t loop_flag, uint32_t cid, void *addr);
+
+// Multi-successor single-decision read-count constraint: pin the actual
+// bytes/elements read to (count == ret), result always 1, so the PCBT
+// value-fork chain over observed read counts models length divergence at
+// the read site itself — a candidate whose length yields a different read
+// count diverges to a frontier instead of being misrouted by later
+// decisions that consume the count. `count_label` is the flen_* label the
+// interceptor just built (Count/CountElems/CountNeg1 evaluable against any
+// candidate length). EOF reads (ret == -1 for getline, NULL for fgets)
+// pin the EOF value of the Count family.
+static inline void taint_report_read_constraint(dfsan_label count_label,
+                                                uint64_t ret, uint32_t cid) {
+  if (count_label == 0 || count_label == kInitializingLabel) return;
+  dfsan_label eq = dfsan_union(count_label, 0, (bveq << 8) | ICmp,
+                               sizeof(ret) * 8, ret, ret);
+  if (eq != 0 && eq != kInitializingLabel)
+    __taint_send_cond(eq, 1, 0, ConstraintFlag, cid,
+                      (void *)__builtin_return_address(0));
+}
+
 static inline dfsan_label get_label_for(int fd, off_t offset) {
   // check if fd is stdin, if so, the label hasn't been pre-allocated
   if (is_stdin_taint() || (fd ==0 && flags().force_stdin))
@@ -1518,6 +1543,10 @@ __dfsw_pread(int fd, void *buf, size_t count, off_t offset,
       // function of the input length -> flen_count(pos, requested).
       *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
                                (uint64_t)offset, count);
+      // Multi-successor single-decision: pin the read count so length
+      // divergence is modeled at the read site itself.
+      taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                   kReadConstraintCid);
     } else {
       dfsan_set_label(0, buf, ret);
     }
@@ -1543,6 +1572,10 @@ __dfsw_pread64(int fd, void *buf, size_t count, off_t offset,
       // Length boundary: the count is min(count, len - offset).
       *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
                                (uint64_t)offset, count);
+      // Multi-successor single-decision: pin the read count so length
+      // divergence is modeled at the read site itself.
+      taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                   kReadConstraintCid);
     } else {
       dfsan_set_label(0, buf, ret);
     }
@@ -1571,6 +1604,10 @@ __dfsw_read(int fd, void *buf, size_t count,
       // function of the input length -> flen_count(pos, requested).
       *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
                                (uint64_t)offset, count);
+      // Multi-successor single-decision: pin the read count so length
+      // divergence is modeled at the read site itself.
+      taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                   kReadConstraintCid);
     } else {
       dfsan_set_label(0, buf, ret);
     }
@@ -3464,6 +3501,10 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
     *ret_label = dfsan_union(0, 0, flen_count_elems, sizeof(ret) * 8,
                              (uint64_t)offset,
                              ((uint64_t)size << 32) | (uint64_t)nmemb);
+    // Multi-successor single-decision: pin the read count (elements), so
+    // length divergence is modeled at the read site itself.
+    taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                 kFreadConstraintCid);
   }
   return ret;
 }
@@ -3517,6 +3558,8 @@ __dfsw_fread_unlocked(
     *ret_label = dfsan_union(0, 0, flen_count_elems, sizeof(ret) * 8,
                              (uint64_t)offset,
                              ((uint64_t)size << 32) | (uint64_t)nmemb);
+    taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                 kFreadConstraintCid);
   }
   return ret;
 }
@@ -3547,6 +3590,10 @@ __dfsw_getline(char **lineptr, size_t *n, FILE *stream,
     // flen_count_neg1(pos, requested buffer capacity).
     *ret_label = dfsan_union(0, 0, flen_count_neg1, sizeof(ret) * 8,
                              (uint64_t)offset, *n ? *n : 0);
+    // Multi-successor single-decision: pin the chars read (or -1 at EOF)
+    // so length divergence is modeled at the read site itself.
+    taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                 kGetlineConstraintCid);
   }
   return ret;
 }
@@ -3577,6 +3624,10 @@ __dfsw_getdelim(char **lineptr, size_t *n, int delim, FILE *stream,
     // Length boundary: getdelim returns -1 at EOF, else chars read.
     *ret_label = dfsan_union(0, 0, flen_count_neg1, sizeof(ret) * 8,
                              (uint64_t)offset, *n ? *n : 0);
+    // Multi-successor single-decision: pin the chars read (or -1 at EOF)
+    // so length divergence is modeled at the read site itself.
+    taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                 kGetlineConstraintCid);
   }
   return ret;
 }
@@ -3605,6 +3656,10 @@ __dfsw___getdelim(char **lineptr, size_t *n, int delim, FILE *stream,
     // Length boundary: __getdelim returns -1 at EOF, else chars read.
     *ret_label = dfsan_union(0, 0, flen_count_neg1, sizeof(ret) * 8,
                              (uint64_t)offset, *n ? *n : 0);
+    // Multi-successor single-decision: pin the chars read (or -1 at EOF)
+    // so length divergence is modeled at the read site itself.
+    taint_report_read_constraint(*ret_label, (uint64_t)ret,
+                                 kGetlineConstraintCid);
   }
   return ret;
 }
@@ -3690,6 +3745,11 @@ char *__dfsw_fgets(char *s, int size, FILE *stream, dfsan_label s_label,
     // an empty line mispredicted). n = size - 1 (fgets keeps the NUL slot).
     *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
                              (uint64_t)offset, (uint64_t)size - 1);
+    // Multi-successor single-decision: pin the chars read (0 at EOF/NULL)
+    // so length divergence is modeled at the read site itself.
+    taint_report_read_constraint(*ret_label,
+                                 ret ? (uint64_t)strlen(ret) : 0,
+                                 kFgetsConstraintCid);
   } else {
     *ret_label = 0;
   }
@@ -3722,6 +3782,11 @@ char *__dfsw_fgets_unlocked(char *s, int size, FILE *stream, dfsan_label s_label
     // Length boundary: fgets returns NULL at EOF; n = size - 1 (NUL slot).
     *ret_label = dfsan_union(0, 0, flen_count, sizeof(ret) * 8,
                              (uint64_t)offset, (uint64_t)size - 1);
+    // Multi-successor single-decision: pin the chars read (0 at EOF/NULL)
+    // so length divergence is modeled at the read site itself.
+    taint_report_read_constraint(*ret_label,
+                                 ret ? (uint64_t)strlen(ret) : 0,
+                                 kFgetsConstraintCid);
   } else {
     *ret_label = 0;
   }

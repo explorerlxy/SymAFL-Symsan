@@ -452,6 +452,18 @@ static const uint8_t UndefinedCheck = 0x10;
 // branches). Must be above LoopFlagMask so send_cond's loop switch ignores it.
 static const uint8_t ConstraintFlag = 0x20;
 
+// Reserved constraint cids for the test-input interfaces (multi-successor
+// single-decision: the bytes actually read depend on the candidate length).
+// Instrumented branch cids are djbHash("file:line:col") values in the high
+// range; the low values below are reserved for runtime-reported events.
+// A candidate's read count is pinned with (read_count == N), result always
+// 1, so the PCBT builds the value-fork chain over observed read counts and
+// length divergence is modeled at the read site itself.
+static constexpr uint32_t kFreadConstraintCid = 1;    // fread/fread_unlocked
+static constexpr uint32_t kReadConstraintCid = 2;     // read/pread/pread64
+static constexpr uint32_t kGetlineConstraintCid = 3;  // getline/getdelim
+static constexpr uint32_t kFgetsConstraintCid = 4;    // fgets/fgets_unlocked
+
 enum undefined_check_ids {
   ub_integer_overflow = 1,
   ub_division_by_zero,

@@ -49,9 +49,10 @@ extern SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL uint32_t __taint_trace_callstac
 
 // Note: get_const_result() is defined in dfsan.h
 
-// Send conditional branch info to solver
-void __taint_send_cond(dfsan_label label, uint8_t result,
-                       uint8_t add_nested, uint8_t loop_flag,
-                       uint32_t cid, void *addr);
+// Send conditional branch info to solver. extern "C": the dfsan runtime
+// interceptors (dfsan_custom.cpp) also report events through this entry.
+extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
+                                  uint8_t add_nested, uint8_t loop_flag,
+                                  uint32_t cid, void *addr);
 
 #endif // SOLVER_COMMON_H

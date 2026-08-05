@@ -313,9 +313,9 @@ extern "C" void __dfsan_flush_trace_fold() {
 // Shared Helper Functions
 //===----------------------------------------------------------------------===//
 
-void __taint_send_cond(dfsan_label label, uint8_t result,
-                       uint8_t add_nested, uint8_t loop_flag,
-                       uint32_t cid, void *addr) {
+extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
+                                  uint8_t add_nested, uint8_t loop_flag,
+                                  uint32_t cid, void *addr) {
 
   // AFL's SymAFL extension selects one of four per-child modes through the
   // shared control block. FULL_STREAM writes bootstrap events to the pipe;
