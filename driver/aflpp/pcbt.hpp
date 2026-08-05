@@ -23,14 +23,6 @@ constexpr NodeRef kRoot = 2;
 
 struct Node {
   uint32_t cid = 0;  // compile-time branch id
-  // The traced event's union-table label this node was built from. For
-  // constraint nodes (multi-successor single-decision events: tainted GEP
-  // index / indcall target / switch case), a candidate that pins the same
-  // value re-emits the identical label at the same stream position; the
-  // re-emission is filtered during insertion instead of creating a
-  // duplicate node (the parent's dir-1 subtree then starts at the
-  // candidate's first post-decision event).
-  uint32_t label = 0;
   Predicate pred;    // root view into Tree::pred_arena_
   NodeRef child[2] = {kUnexplored, kUnexplored};
   uint32_t depth = 0;                // root's children = 1 (topology stats)
@@ -153,6 +145,14 @@ class Tree {
   }
   uint32_t skip_of(NodeRef ref) const {
     return ref < kRoot || ref >= nodes_.size() ? 0 : node(ref).skipCnt;
+  }
+  // Constraint-node test for the suffix-capture skip adjustment: a candidate
+  // admitted on a constraint node's dir-1 (pinned-value) edge re-emits the
+  // parent's own decision event at the same stream position, so the capture
+  // must skip one extra event (the pin branch's suffix starts at the
+  // candidate's first post-decision event).
+  bool is_constraint(NodeRef ref) const {
+    return ref >= kRoot && ref < nodes_.size() ? node(ref).constraint : false;
   }
   // Number of leading stream events the runtime must skip so the candidate's
   // own events from this frontier node's position onward are exported.
