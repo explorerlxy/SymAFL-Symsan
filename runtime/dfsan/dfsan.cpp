@@ -69,7 +69,11 @@ struct taint_socket __dfsan::tainted_socket;
 
 // Hash table
 static const uptr hashtable_size = (1ULL << 32);
-static const size_t hashtable_buckets = (1ULL << 20);
+// 1M buckets (8 MB) spread per-child COW faults across ~2000 pages as the
+// label DAG inserts (~20K entries per run, uniform hashing); 64K buckets
+// (512 KB, load factor ~0.3 with chains ~1.3) shrink the touched working
+// set ~16x. Measured: see docs/status.md (2026-08-05).
+static const size_t hashtable_buckets = (1ULL << 16);
 static __taint::union_hashtable __union_table(hashtable_buckets);
 
 Flags __dfsan::flags_data;
