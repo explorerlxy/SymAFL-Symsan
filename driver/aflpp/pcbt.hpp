@@ -80,8 +80,13 @@ class Tree {
   // Insert the suffix known to follow parent.child[direction]. The caller has
   // already established the PCBT prefix during screening, so this performs no
   // root replay or prefix matching. An empty suffix records the terminal node
-  // (except on constraint edges: an empty suffix only proves the pinned value
-  // produces no further decisions, so the edge stays unexplored).
+  // on ordinary nodes. On a constraint parent it is never a valid
+  // termination: a candidate that walked the value-fork (dir-0) re-emits its
+  // own multi-successor decision event at the parent's stream position, so
+  // the captured suffix always contains that event and is never empty — an
+  // empty suffix there only arises from a collection-completeness gap (the
+  // decision was invisible for this candidate), and the edge stays
+  // unexplored for the rCnt/rlimit budget instead of being closed.
   uint32_t InsertSuffix(NodeRef parent, uint8_t direction,
                         const std::vector<Event> &events,
                         const dfsan_label_info *table, size_t table_labels);

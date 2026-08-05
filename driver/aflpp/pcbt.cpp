@@ -278,7 +278,19 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     // terminating here; the value-fork direction (dir-0) of a constraint
     // node is only ever marked terminal when a candidate actually walked it
     // with no follow-up (any divergence would have been collected).
-    node(parent).child[direction] = kTerminal;
+    // A constraint node's value-fork can never legitimately reach here: a
+    // candidate that evaluates dir-0 at a constraint node re-emits its own
+    // multi-successor decision event at the same stream position (suffix
+    // capture starts at the parent's skipCnt), so its captured suffix always
+    // contains that constraint event and is never empty. Reaching here on a
+    // constraint node therefore means the decision was invisible for this
+    // candidate (label==0, e.g. an EOF/zero-count read) — a
+    // collection-completeness gap, not a real termination — so the edge
+    // stays unexplored and the normal rCnt/rlimit budget governs it instead
+    // of being hard-closed.
+    if (!node(parent).constraint) {
+      node(parent).child[direction] = kTerminal;
+    }
     return 0;
   }
 
