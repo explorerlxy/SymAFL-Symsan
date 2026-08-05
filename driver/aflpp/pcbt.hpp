@@ -73,9 +73,16 @@ class Tree {
   // direction, so a constraint node forks candidates that pin a different
   // value down its dir-0 value chain. Returns the number of new topology
   // nodes created.
+  // On any insertion, *out_tail_node / *out_tail_dir (optional) receive the
+  // last edge the trace closed (the edge marked terminal, or the edge where
+  // the trace ended against the existing tree) — the edge a later veto
+  // lands on; pair forensics records it as the inserting candidate's tree
+  // position.
   uint32_t InsertTrace(const std::vector<Event> &events,
                        const dfsan_label_info *table, size_t table_labels,
-                       const uint8_t *input, uint32_t len);
+                       const uint8_t *input, uint32_t len,
+                       NodeRef *out_tail_node = nullptr,
+                       uint8_t *out_tail_dir = nullptr);
 
   // Insert the suffix known to follow parent.child[direction]. The caller has
   // already established the PCBT prefix during screening, so this performs no
@@ -87,9 +94,17 @@ class Tree {
   // empty suffix there only arises from a collection-completeness gap (the
   // decision was invisible for this candidate), and the edge stays
   // unexplored for the rCnt/rlimit budget instead of being closed.
+  // When the suffix inserts any node, *out_tail_node / *out_tail_dir
+  // (optional) receive the LAST inserted edge — the edge that becomes
+  // terminal (or that a later insertion continues from). This is the edge a
+  // later veto lands on, so pair forensics records it as the inserting
+  // candidate's tree position (the screening frontier can be shallower than
+  // the terminal edge when the suffix has more than one event).
   uint32_t InsertSuffix(NodeRef parent, uint8_t direction,
                         const std::vector<Event> &events,
-                        const dfsan_label_info *table, size_t table_labels);
+                        const dfsan_label_info *table, size_t table_labels,
+                        NodeRef *out_tail_node = nullptr,
+                        uint8_t *out_tail_dir = nullptr);
 
   // Screen a candidate. On admission, *out_node / *out_dir identify an
   // unexplored frontier for retry bookkeeping and suffix skip depth. Terminal

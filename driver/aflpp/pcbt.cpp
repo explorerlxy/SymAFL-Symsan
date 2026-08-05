@@ -146,8 +146,13 @@ static inline uint32_t child_skip_cnt(const Node &parent, bool constraint) {
 uint32_t Tree::InsertTrace(const std::vector<Event> &events,
                            const dfsan_label_info *table,
                            size_t table_labels,
-                           const uint8_t *input, uint32_t len) {
-  if (events.empty()) return 0;
+                           const uint8_t *input, uint32_t len,
+                           NodeRef *out_tail_node, uint8_t *out_tail_dir) {
+  if (events.empty()) {
+    if (out_tail_node) *out_tail_node = kUnexplored;
+    if (out_tail_dir) *out_tail_dir = 0;
+    return 0;
+  }
   num_traces += 1;
   for (const Event &ev : events) num_events += ev.count;
 
@@ -207,6 +212,8 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       // branch terminates here.
       node(parent).child[dir] = kTerminal;
     }
+    if (out_tail_node) *out_tail_node = parent;
+    if (out_tail_dir) *out_tail_dir = dir;
     return 0;
   }
 
@@ -258,15 +265,20 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   node(parent).child[dir] = kTerminal;
   num_nodes += created;
   if (trace_depth > max_depth) max_depth = trace_depth;
+  if (out_tail_node) *out_tail_node = parent;
+  if (out_tail_dir) *out_tail_dir = dir;
   return created;
 }
 
 uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
                             const std::vector<Event> &events,
                             const dfsan_label_info *table,
-                            size_t table_labels) {
+                            size_t table_labels, NodeRef *out_tail_node,
+                            uint8_t *out_tail_dir) {
   if (parent < kRoot || parent >= nodes_.size() || direction > 1 ||
       node(parent).child[direction] != kUnexplored) {
+    if (out_tail_node) *out_tail_node = kUnexplored;
+    if (out_tail_dir) *out_tail_dir = 0;
     return 0;
   }
   num_traces += 1;
@@ -291,6 +303,10 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     if (!node(parent).constraint) {
       node(parent).child[direction] = kTerminal;
     }
+    // The edge this insertion closed (or left unexplored on a constraint
+    // value-fork) is parent->direction.
+    if (out_tail_node) *out_tail_node = parent;
+    if (out_tail_dir) *out_tail_dir = direction;
     return 0;
   }
 
@@ -333,6 +349,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   node(cur).child[dir] = kTerminal;
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
+  if (out_tail_node) *out_tail_node = cur;
+  if (out_tail_dir) *out_tail_dir = dir;
   return created;
 }
 

@@ -803,7 +803,9 @@ static bool replay_check_trace(my_mutator_t *data,
 }
 
 static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
-                               size_t buf_size, const char *fname) {
+                               size_t buf_size, const char *fname,
+                               pcbt::NodeRef *out_tail_node = nullptr,
+                               uint8_t *out_tail_dir = nullptr) {
   ProfileSegment trace_seg(data, &data->profile_trace_ns,
                            &data->profile_trace_calls);
   std::vector<pcbt::Event> events;
@@ -818,7 +820,8 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   }
   uint32_t created = data->tree.InsertTrace(events, __dfsan_label_info,
                                             MAX_LABEL, buf,
-                                            (uint32_t)buf_size);
+                                            (uint32_t)buf_size,
+                                            out_tail_node, out_tail_dir);
   data->traced_runs += 1;
   uint64_t expanded = 0;
   for (const pcbt::Event &ev : events) expanded += ev.count;
@@ -830,7 +833,9 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
 }
 
 static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
-                                       size_t buf_size, const char *fname) {
+                                       size_t buf_size, const char *fname,
+                                       pcbt::NodeRef *out_tail_node = nullptr,
+                                       uint8_t *out_tail_dir = nullptr) {
   ProfileSegment trace_seg(data, &data->profile_trace_ns,
                            &data->profile_trace_calls);
   if (!data->single_pass_armed || data->last_node == pcbt::kUnexplored) {
@@ -843,7 +848,7 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
     return false;
   }
   uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
-      events, __dfsan_label_info, MAX_LABEL);
+      events, __dfsan_label_info, MAX_LABEL, out_tail_node, out_tail_dir);
   uint64_t expanded = 0;
   for (const pcbt::Event &ev : events) expanded += ev.count;
   fprintf(stderr,
@@ -856,7 +861,9 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
 }
 
 static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
-                                  size_t buf_size, const char *fname) {
+                                  size_t buf_size, const char *fname,
+                                  pcbt::NodeRef *out_tail_node = nullptr,
+                                  uint8_t *out_tail_dir = nullptr) {
   ProfileSegment trace_seg(data, &data->profile_trace_ns,
                            &data->profile_trace_calls);
   if (!data->single_pass_armed || data->last_node == pcbt::kUnexplored) {
@@ -895,7 +902,8 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
                &data->profile_decode_calls);
   uint64_t insert_start = profile_start(data);
   uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
-      events, data->single_pass_label_info, MAX_LABEL);
+      events, data->single_pass_label_info, MAX_LABEL,
+      out_tail_node, out_tail_dir);
   profile_stop(data, insert_start, &data->profile_insert_ns,
                &data->profile_insert_calls);
   data->single_pass_captures += 1;
@@ -960,12 +968,35 @@ static bool read_cur_input(my_mutator_t *data, std::vector<u8> *buf) {
 // possibly created the terminal edge there), so a later veto at (node, dir)
 // pairs with this input: identical PCBT path, bitmap difference is what the
 // tree missed.
-static void record_admitted_pair(my_mutator_t *data) {
-  if (!data->pair_log || data->last_node == pcbt::kUnexplored) return;
+static void record_admitted_pair(my_mutator_t *data, pcbt::NodeRef tail_node,
+                                 uint8_t tail_dir) {
+  if (!data->pair_log || tail_node == pcbt::kUnexplored) return;
   std::vector<u8> buf;
   if (!read_cur_input(data, &buf)) return;
-  fprintf(data->pair_log, "admit node=%u dir=%u len=%zu hex=",
-          data->last_node, data->last_dir, buf.size());
+  fprintf(data->pair_log, "admit node=%u cid=%u dir=%u len=%zu hex=",
+          tail_node, data->tree.cid_of(tail_node), tail_dir, buf.size());
+  size_t shown = buf.size() < 4096 ? buf.size() : 4096;
+  for (size_t i = 0; i < shown; ++i) {
+    fprintf(data->pair_log, "%02x", buf[i]);
+  }
+  if (shown < buf.size()) fprintf(data->pair_log, " TRUNC");
+  fprintf(data->pair_log, "\n");
+  fflush(data->pair_log);
+}
+
+// Veto side of the identical-PCBT-path pair forensics: a veto-probe that
+// gained coverage was vetoed at (last_veto_node, last_veto_dir); the admit
+// row recorded at the same (node, dir) (record_admitted_pair) is the pair
+// with the identical PCBT path. Same path + different bitmap = a predicate
+// node missing from the PCBT (collection incompleteness), merging two paths
+// that should have forked, both landing on the same terminal.
+static void record_veto_probe_pair(my_mutator_t *data, const char *fname) {
+  if (!data->pair_log || data->last_veto_node == pcbt::kUnexplored) return;
+  std::vector<u8> buf;
+  if (!read_queue_file(fname, &buf)) return;
+  fprintf(data->pair_log, "veto node=%u cid=%u dir=%u kind=%u len=%zu hex=",
+          data->last_veto_node, data->tree.cid_of(data->last_veto_node),
+          data->last_veto_dir, data->last_probe_veto_kind, buf.size());
   size_t shown = buf.size() < 4096 ? buf.size() : 4096;
   for (size_t i = 0; i < shown; ++i) {
     fprintf(data->pair_log, "%02x", buf[i]);
@@ -1079,21 +1110,30 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
   if (!data->single_pass_armed) return;
   uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
                                   __ATOMIC_ACQUIRE);
+  pcbt::NodeRef tail_node = pcbt::kUnexplored;
+  uint8_t tail_dir = 0;
   if (mode == SYMAFL_TRACE_SUFFIX_SHM &&
       data->last_node != pcbt::kUnexplored) {
-    (void)insert_suffix_capture(data, nullptr, 0, "bootstrap");
+    (void)insert_suffix_capture(data, nullptr, 0, "bootstrap", &tail_node,
+                                &tail_dir);
   } else if (mode == SYMAFL_TRACE_FULL_STREAM) {
     std::vector<u8> buf;
     if (read_cur_input(data, &buf)) {
-      (void)insert_full_stream(data, buf.data(), buf.size(), "bootstrap");
+      (void)insert_full_stream(data, buf.data(), buf.size(), "bootstrap",
+                               &tail_node, &tail_dir);
     } else {
       fprintf(stderr, "[pcbt] bootstrap cur_input unreadable (out_dir=%s); "
               "replay with len=0\n",
               data->afl->out_dir ? (const char *)data->afl->out_dir
                                  : "(null)");
-      (void)insert_full_stream(data, nullptr, 0, "bootstrap");
+      (void)insert_full_stream(data, nullptr, 0, "bootstrap", &tail_node,
+                               &tail_dir);
     }
   }
+  // The bootstrap admit that created a terminal edge is the pair partner
+  // for later veto-but-gain probes on that edge; record it too (the empty
+  // tree case has last_node == kUnexplored and is skipped by the guard).
+  record_admitted_pair(data, tail_node, tail_dir);
   data->last_node = pcbt::kUnexplored;
 }
 
@@ -1115,10 +1155,12 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     data->last_was_probe = false;
     data->veto_probe_gained += 1;
     if (data->probe_gained_log) {
-      fprintf(data->probe_gained_log, "kind=%u %s\n",
-              data->last_probe_veto_kind, filename_new_queue);
+      fprintf(data->probe_gained_log, "kind=%u node=%u dir=%u %s\n",
+              data->last_probe_veto_kind, data->last_veto_node,
+              data->last_veto_dir, filename_new_queue);
       fflush(data->probe_gained_log);
     }
+    record_veto_probe_pair(data, (const char *)filename_new_queue);
     if (data->sat_window) data->sat_probe_gained += 1;
     if (data->probe_diag) {
       if (data->last_probe_suffix_nonempty) data->probe_gained_nonempty += 1;
@@ -1163,14 +1205,19 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                                   __ATOMIC_ACQUIRE);
   pcbt::NodeRef node = data->last_node;
   uint8_t dir = data->last_dir;
+  pcbt::NodeRef tail_node = pcbt::kUnexplored;
+  uint8_t tail_dir = 0;
   bool inserted = mode == SYMAFL_TRACE_SUFFIX_SHM
-      ? insert_suffix_capture(data, buf.data(), buf.size(), fname)
+      ? insert_suffix_capture(data, buf.data(), buf.size(), fname,
+                              &tail_node, &tail_dir)
       : mode == SYMAFL_TRACE_SUFFIX_PIPE
-            ? insert_pipe_suffix_capture(data, buf.data(), buf.size(), fname)
+            ? insert_pipe_suffix_capture(data, buf.data(), buf.size(), fname,
+                                         &tail_node, &tail_dir)
             : mode == SYMAFL_TRACE_FULL_STREAM
-                  ? insert_full_stream(data, buf.data(), buf.size(), fname)
+                  ? insert_full_stream(data, buf.data(), buf.size(), fname,
+                                       &tail_node, &tail_dir)
                   : false;
-  if (inserted) record_admitted_pair(data);
+  if (inserted) record_admitted_pair(data, tail_node, tail_dir);
   if (!inserted && node != pcbt::kUnexplored) {
     (void)replay_pipe_suffix(data, buf.data(), buf.size(), fname, node, dir);
   }
