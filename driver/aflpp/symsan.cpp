@@ -181,6 +181,8 @@ struct my_mutator_t {
   uint64_t diag_veto_depth[17] = {};
   uint32_t last_veto_depth = 0;
   pcbt::NodeRef last_veto_node = pcbt::kUnexplored;
+  uint8_t last_veto_kind = 0;         // 0 = terminal-class, 1 = rlimit
+  uint8_t last_probe_veto_kind = 0;   // veto kind of the last probe candidate
   uint8_t last_probe_input[64] = {};
   uint32_t last_probe_input_len = 0;
   // Saturation via probe-gain windows (SYMAFL_SAT_WINDOW / SYMAFL_SAT_MIN_GAINS,
@@ -277,11 +279,12 @@ static bool check_input_timed(my_mutator_t *data, const u8 *buf,
                               uint32_t buf_size, pcbt::NodeRef *node,
                               uint8_t *dir, uint32_t *veto_depth = nullptr,
                               pcbt::NodeRef *veto_node = nullptr,
-                              uint8_t *veto_dir = nullptr) {
+                              uint8_t *veto_dir = nullptr,
+                              uint8_t *veto_kind = nullptr) {
   uint64_t start = profile_start(data);
   bool admitted = data->tree.CheckInput(buf, buf_size, node, dir,
                                         data->rlimit, veto_depth, veto_node,
-                                        veto_dir);
+                                        veto_dir, veto_kind);
   profile_stop(data, start, &data->profile_check_ns,
                &data->profile_check_calls);
   return admitted;
@@ -1106,7 +1109,8 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     data->last_was_probe = false;
     data->veto_probe_gained += 1;
     if (data->probe_gained_log) {
-      fprintf(data->probe_gained_log, "%s\n", filename_new_queue);
+      fprintf(data->probe_gained_log, "kind=%u %s\n",
+              data->last_probe_veto_kind, filename_new_queue);
       fflush(data->probe_gained_log);
     }
     if (data->sat_window) data->sat_probe_gained += 1;
@@ -1120,13 +1124,13 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
       // tells whether the real decision trace continued past it.
       fprintf(stderr,
               "[pcbt-diag] gained-case probe file=%s len=%u veto_depth=%u "
-              "veto_node=%u veto_cid=%u veto_dir=%u suffix=%s\n",
+              "veto_node=%u veto_cid=%u veto_dir=%u veto_kind=%u suffix=%s\n",
               filename_new_queue, data->last_probe_input_len,
               data->last_veto_depth, data->last_veto_node,
               data->last_veto_node != pcbt::kUnexplored
                   ? data->tree.cid_of(data->last_veto_node)
                   : 0u,
-              data->last_veto_dir,
+              data->last_veto_dir, data->last_probe_veto_kind,
               data->last_probe_suffix_nonempty
                   ? "nonempty"
                   : data->last_probe_suffix_overflow ? "overflow" : "empty");
@@ -1239,7 +1243,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   uint8_t dir = 0;
   if (check_input_timed(data, buf, (uint32_t)buf_size, &node, &dir,
                         &data->last_veto_depth, &data->last_veto_node,
-                        &data->last_veto_dir)) {
+                        &data->last_veto_dir, &data->last_veto_kind)) {
     data->admitted += 1;
     data->vetoes_since_admit = 0;
     data->last_gained = false;
@@ -1282,6 +1286,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     data->last_was_probe = true;
     data->last_gained = false;
     data->last_node = pcbt::kUnexplored;
+    data->last_probe_veto_kind = data->last_veto_kind;
     data->last_probe_suffix_nonempty = false;
     data->last_probe_len = (uint32_t)buf_size;
     data->last_probe_input_len = (uint32_t)buf_size < 64 ? (uint32_t)buf_size : 64;

@@ -92,12 +92,17 @@ class Tree {
   // *out_veto_node identify the site and *out_veto_dir the evaluated
   // direction that hit the terminal/rlimit edge (pair forensics: the
   // admitted run recorded at (veto_node, veto_dir) walked the identical
-  // path and created the terminal edge).
+  // path and created the terminal edge). *out_veto_kind classifies the veto:
+  // 0 = terminal-class (the tree claims the decision trace terminates here -
+  //   a probe-gained candidate here is evidence of a missed symbolic
+  //   decision), 1 = rlimit (retry budget exhausted on an unexplored edge -
+  //   the designed trade-off).
   bool CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                   uint8_t *out_dir, uint8_t rlimit,
                   uint32_t *out_veto_depth = nullptr,
                   NodeRef *out_veto_node = nullptr,
-                  uint8_t *out_veto_dir = nullptr);
+                  uint8_t *out_veto_dir = nullptr,
+                  uint8_t *out_veto_kind = nullptr);
 
   // Const replay: walk the event vector from kRoot and compare CID order
   // and predicate directions against the tree.  Never mutates any state.
