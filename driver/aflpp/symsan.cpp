@@ -217,6 +217,10 @@ struct my_mutator_t {
   // edge -- with the identical PCBT path. Both streams replayed through the
   // concolic target expose the decision the tree missed.
   FILE *pair_log = nullptr;
+  // SYMAFL_PROBE_GAINED_LOG: append-only list of queue filenames that were
+  // vetoed, probe-executed, and gained coverage. Used for end-of-run bitmap
+  // checks: does the gain survive to the final bitmap, or was it superseded?
+  FILE *probe_gained_log = nullptr;
   uint8_t last_veto_dir = 0;
 };
 
@@ -447,6 +451,13 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     }
     fprintf(stderr, "[pcbt] pair forensics log: %s\n", pl);
   }
+  if (const char *pgl = getenv("SYMAFL_PROBE_GAINED_LOG")) {
+    data->probe_gained_log = fopen(pgl, "w");
+    if (!data->probe_gained_log) {
+      FATAL("cannot open SYMAFL_PROBE_GAINED_LOG=%s", pgl);
+    }
+    fprintf(stderr, "[pcbt] probe-gained log: %s\n", pgl);
+  }
   if (const char *cd = getenv("SYMAFL_CONCOLIC_SECONDS")) {
     char *end = nullptr;
     unsigned long long parsed = strtoull(cd, &end, 10);
@@ -588,6 +599,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
     }
   }
   if (data->pair_log) fclose(data->pair_log);
+  if (data->probe_gained_log) fclose(data->probe_gained_log);
   delete data;
 }
 
@@ -1093,6 +1105,10 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   if (data->last_was_probe) {
     data->last_was_probe = false;
     data->veto_probe_gained += 1;
+    if (data->probe_gained_log) {
+      fprintf(data->probe_gained_log, "%s\n", filename_new_queue);
+      fflush(data->probe_gained_log);
+    }
     if (data->sat_window) data->sat_probe_gained += 1;
     if (data->probe_diag) {
       if (data->last_probe_suffix_nonempty) data->probe_gained_nonempty += 1;
@@ -1170,6 +1186,45 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
       disarm_capture(data);
     }
     data->last_node = pcbt::kUnexplored;
+  }
+
+  // Hard deadline: reproducible concolic-phase length. Evaluated on EVERY
+  // post_process call (not just the non-probe veto path - probe-every=1
+  // returns before the old position, which made the deadline unreachable).
+  // phase_start is initialized on the first check (queue_get may not run
+  // before the first screened candidate), so a deadline of N means N seconds
+  // after screening begins.
+  if (data->concolic_deadline && !data->saturation_logged) {
+    time_t now = time(nullptr);
+    if (data->phase_start == 0) {
+      data->phase_start = now;
+    } else if ((uint64_t)(now - data->phase_start) >=
+               data->concolic_deadline) {
+      data->saturation_logged = true;
+      fprintf(stderr,
+              "[pcbt-concolic-phase] screened=%llu admitted=%llu "
+              "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
+              "probe_gained=%llu admit_frontier=%llu admit_len_veto=%llu veto_terminal=%llu "
+              "traces=%llu nodes=%llu depth=%llu\n",
+              (unsigned long long)data->screened,
+              (unsigned long long)data->admitted,
+              (unsigned long long)data->vetoed,
+              (unsigned long long)data->traced_entries.size(),
+              (unsigned long long)data->veto_probe_admitted,
+              (unsigned long long)data->veto_probe_gained,
+              (unsigned long long)data->tree.check_admit_frontier,
+              (unsigned long long)data->tree.check_admit_len_veto,
+              (unsigned long long)data->tree.check_veto_terminal,
+              (unsigned long long)data->tree.num_traces,
+              (unsigned long long)data->tree.num_nodes,
+              (unsigned long long)data->tree.max_depth);
+      fprintf(stderr,
+              "[pcbt] concolic phase deadline (%llus) reached; "
+              "switching to concrete\n",
+              (unsigned long long)data->concolic_deadline);
+      data->screening = false;
+      data->afl->pcbt_switch_pending = 1;
+    }
   }
 
   if (!data->screening) {
@@ -1250,42 +1305,6 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     }
     *out_buf = buf;
     return buf_size;
-  }
-  // Hard deadline: reproducible concolic-phase length. phase_start is
-  // initialized on the first check (queue_get may not run before the first
-  // screened candidate, e.g. when the initial queue handling path differs),
-  // so a deadline of N means N seconds after screening begins.
-  if (data->concolic_deadline && !data->saturation_logged) {
-    time_t now = time(nullptr);
-    if (data->phase_start == 0) {
-      data->phase_start = now;
-    } else if ((uint64_t)(now - data->phase_start) >=
-               data->concolic_deadline) {
-    data->saturation_logged = true;
-    fprintf(stderr,
-            "[pcbt-concolic-phase] screened=%llu admitted=%llu "
-            "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
-            "probe_gained=%llu admit_frontier=%llu admit_len_veto=%llu veto_terminal=%llu "
-            "traces=%llu nodes=%llu depth=%llu\n",
-            (unsigned long long)data->screened,
-            (unsigned long long)data->admitted,
-            (unsigned long long)data->vetoed,
-            (unsigned long long)data->traced_entries.size(),
-            (unsigned long long)data->veto_probe_admitted,
-            (unsigned long long)data->veto_probe_gained,
-            (unsigned long long)data->tree.check_admit_frontier,
-            (unsigned long long)data->tree.check_admit_len_veto,
-            (unsigned long long)data->tree.check_veto_terminal,
-            (unsigned long long)data->tree.num_traces,
-            (unsigned long long)data->tree.num_nodes,
-            (unsigned long long)data->tree.max_depth);
-    fprintf(stderr,
-            "[pcbt] concolic phase deadline (%llus) reached; "
-            "switching to concrete\n",
-            (unsigned long long)data->concolic_deadline);
-    data->screening = false;
-    data->afl->pcbt_switch_pending = 1;
-    }
   }
   // Probe-gain saturation: the vetoed population stopped paying out.
   if (data->sat_window && data->sat_probe_total >= data->sat_window) {
