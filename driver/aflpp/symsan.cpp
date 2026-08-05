@@ -630,16 +630,13 @@ static void arm_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
-  // A candidate admitted on a constraint node's dir-1 (pinned-value) edge
-  // re-emits the parent's own decision event at the same stream position
-  // (multi-successor single-decision semantics); skip it so the pin
-  // branch's suffix starts at the candidate's first post-decision event —
-  // an empty capture then means the pinned value produced no further
-  // decisions and the edge is recorded as terminal. The value-fork
-  // direction (dir-0) keeps the parent's skipCnt so the candidate's own
-  // decision event is captured and extends the chain.
+  // A constraint node's dir-1 (pinned-value) edge is explored the moment
+  // the node is created (it holds the creating candidate's follow-up or is
+  // terminal), so an admission on that edge never occurs and the capture
+  // always starts at the parent's skipCnt. The value-fork direction
+  // (dir-0) captures the candidate's own decision event and extends the
+  // chain.
   control->skip_depth = data->tree.skip_for(node);
-  if (data->tree.is_constraint(node) && dir == 1) control->skip_depth += 1;
   __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_SHM, __ATOMIC_RELEASE);
   __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
   data->last_node = node;
@@ -654,7 +651,6 @@ static void arm_pipe_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
   control->skip_depth = data->tree.skip_for(node);
-  if (data->tree.is_constraint(node) && dir == 1) control->skip_depth += 1;
   __atomic_store_n(&control->mode, SYMAFL_TRACE_SUFFIX_PIPE,
                    __ATOMIC_RELEASE);
   __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);

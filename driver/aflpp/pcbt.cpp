@@ -180,15 +180,8 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     parent = cur;
     dir = edir;
     NodeRef nxt = node(parent).child[dir];
-    // Consume the stream event when the walk leaves a constraint node onto
-    // its pinned-value (dir-1) edge: the candidate re-emits the parent's own
-    // decision event at the same stream position, which is already modeled
-    // by the parent. Stepping into the value-fork chain (dir-0) or onto
-    // another constraint consumes nothing — the candidate's own decision
-    // event is re-evaluated at each chain node.
     if (!cn.constraint ||
-        (nxt != kUnexplored && nxt != kTerminal && !node(nxt).constraint) ||
-        (cn.constraint && edir == 1 && nxt == kUnexplored)) {
+        (nxt != kUnexplored && nxt != kTerminal && !node(nxt).constraint)) {
       k += 1;
       if (k == ev.count) {
         k = 0;
@@ -255,10 +248,14 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     }
   }
 
-  // A trace ending right after a constraint event has only observed the
-  // pinned value; the tail edge stays unexplored.
-  if (!events.back().constraint)
-    node(parent).child[dir] = kTerminal;
+  // The trace's last event terminates here. For a constraint event this
+  // records the pinned value's branch as terminal — the constraint node's
+  // dir-1 edge is explored the moment the node is created (either by the
+  // creating candidate's follow-up or by this terminal), so a later
+  // same-value candidate walks into the recorded edge and never admits on
+  // it. The value-fork direction (dir-0) of a chain node is untouched and
+  // stays unexplored.
+  node(parent).child[dir] = kTerminal;
   num_nodes += created;
   if (trace_depth > max_depth) max_depth = trace_depth;
   return created;
@@ -318,10 +315,10 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     }
   }
 
-  // A suffix ending right after a constraint event has only observed the
-  // pinned value; the tail edge stays unexplored.
-  if (!events.back().constraint)
-    node(cur).child[dir] = kTerminal;
+  // The suffix's last event terminates here (see the InsertTrace tail
+  // comment): a constraint tail records the pinned value's branch as
+  // terminal — the constraint node's dir-1 edge is explored at creation.
+  node(cur).child[dir] = kTerminal;
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
   return created;
