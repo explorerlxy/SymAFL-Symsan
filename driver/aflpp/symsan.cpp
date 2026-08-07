@@ -121,6 +121,9 @@ struct my_mutator_t {
   // AFL++ confirms the coverage gain.
   bool root_shm_capture = false;
   bool root_shm_enabled = true;
+  bool terminal_validation_pending = false;
+  pcbt::NodeRef terminal_validation_node = pcbt::kUnexplored;
+  uint8_t terminal_validation_dir = 0;
   int full_stream_read_fd = -1;
   int full_stream_write_fd = -1;
 
@@ -136,6 +139,7 @@ struct my_mutator_t {
   bool saturation_logged = false;
   uint64_t single_pass_captures = 0;
   uint64_t single_pass_overflows = 0;
+  uint64_t admit_terminal_validation = 0;
 
   // replay checker (SYMAFL_REPLAY_CHECK=1)
   bool replay_check = false;
@@ -247,6 +251,11 @@ struct my_mutator_t {
   // vetoed, probe-executed, and gained coverage. Used for end-of-run bitmap
   // checks: does the gain survive to the final bitmap, or was it superseded?
   FILE *probe_gained_log = nullptr;
+  // SYMAFL_ADMITTED_GAINED_LOG records PCBT admissions that created an AFL
+  // queue entry. Together with the veto-probe log it permits exact terminal
+  // bitmap accounting without treating seed or post-switch entries as PCBT
+  // admissions.
+  FILE *admitted_gained_log = nullptr;
   // Optional low-overhead progress stream for terminal-state experiments.
   // Rows are monotonic milliseconds and cumulative candidate counters; the
   // supervisor uses these rows to test five-minute throughput stability.
@@ -347,7 +356,7 @@ static void print_concolic_phase_snapshot(const my_mutator_t *data) {
   fprintf(stderr,
           "[pcbt-concolic-phase] screened=%llu admitted=%llu "
           "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
-          "probe_gained=%llu admit_frontier=%llu admit_len_veto=%llu "
+          "probe_gained=%llu admit_frontier=%llu admit_constraint_terminal=%llu admit_len_veto=%llu "
           "veto_terminal=%llu veto_rlimit=%llu "
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu "
           "traces=%llu nodes=%llu depth=%llu\n",
@@ -358,6 +367,7 @@ static void print_concolic_phase_snapshot(const my_mutator_t *data) {
           (unsigned long long)data->veto_probe_admitted,
           (unsigned long long)data->veto_probe_gained,
           (unsigned long long)t.check_admit_frontier,
+          (unsigned long long)t.check_admit_constraint_terminal,
           (unsigned long long)t.check_admit_len_veto,
           (unsigned long long)t.check_veto_terminal,
           (unsigned long long)t.check_veto_rlimit,
@@ -549,6 +559,13 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     }
     fprintf(stderr, "[pcbt] probe-gained log: %s\n", pgl);
   }
+  if (const char *agl = getenv("SYMAFL_ADMITTED_GAINED_LOG")) {
+    data->admitted_gained_log = fopen(agl, "w");
+    if (!data->admitted_gained_log) {
+      FATAL("cannot open SYMAFL_ADMITTED_GAINED_LOG=%s", agl);
+    }
+    fprintf(stderr, "[pcbt] admitted-gained log: %s\n", agl);
+  }
   if (const char *progress = getenv("SYMAFL_PROGRESS_LOG")) {
     data->progress_log = fopen(progress, "w");
     if (!data->progress_log) {
@@ -609,8 +626,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "[pcbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
           "opaque=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
           "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
-          "single_pass=%llu single_pass_overflow=%llu "
-          "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
+          "single_pass=%llu single_pass_overflow=%llu admit_terminal_validation=%llu "
+          "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_constraint_terminal=%llu admit_unstable=%llu "
           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu "
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
@@ -631,10 +648,13 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)(data->screening ? 0 : 1),
           (unsigned long long)data->single_pass_captures,
           (unsigned long long)data->single_pass_overflows,
+          (unsigned long long)data->admit_terminal_validation,
           (unsigned long long)t.check_admit_empty,
           (unsigned long long)t.check_admit_opaque,
           (unsigned long long)t.check_admit_eval_failure,
           (unsigned long long)t.check_admit_frontier,
+          (unsigned long long)t.check_admit_constraint_terminal,
+          (unsigned long long)t.check_admit_unstable,
           (unsigned long long)t.check_admit_len_veto,
           (unsigned long long)t.check_veto_terminal,
           (unsigned long long)t.check_veto_rlimit,
@@ -786,6 +806,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   }
   if (data->pair_log) fclose(data->pair_log);
   if (data->probe_gained_log) fclose(data->probe_gained_log);
+  if (data->admitted_gained_log) fclose(data->admitted_gained_log);
   delete data;
 }
 
@@ -999,6 +1020,9 @@ static bool replay_check_trace(my_mutator_t *data,
       break;
     default: break;
   }
+  if (report.mismatch_node != pcbt::kUnexplored) {
+    data->tree.mark_unstable(report.mismatch_node);
+  }
   WARNF("[pcbt-replay] %s mismatch %s at event=%zu verified=%zu "
         "expected_cid=%u observed_cid=%u eval_dir=%u obs_dir=%u %s\n",
         fname, err_name, report.event_index, report.verified_events,
@@ -1035,10 +1059,17 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   std::vector<pcbt::Event> events;
   events.reserve(4096);
   if (!decode_pipe_events(data, &events, fname)) {
+    if (data->terminal_validation_pending)
+      data->tree.mark_unstable(data->terminal_validation_node);
     disarm_capture(data);
     return false;
   }
+  if (events.empty() && data->terminal_validation_pending) {
+    data->tree.mark_unstable(data->terminal_validation_node);
+  }
   if (!replay_check_trace(data, events, buf, buf_size, fname, false)) {
+    if (data->terminal_validation_pending)
+      data->tree.mark_unstable(data->terminal_validation_node);
     disarm_capture(data);
     return false;
   }
@@ -1334,6 +1365,23 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
     if (!data->probe_capture_pending) disarm_capture(data);
     return;
   }
+  if (data->terminal_validation_pending) {
+    std::vector<u8> buf;
+    const bool have_input = read_cur_input(data, &buf);
+    bool validated = false;
+    if (have_input && data->single_pass_armed &&
+        __atomic_load_n(&data->single_pass_control->mode,
+                        __ATOMIC_ACQUIRE) == SYMAFL_TRACE_FULL_STREAM) {
+      validated = insert_full_stream(data, buf.data(), buf.size(),
+                                     "terminal-validation");
+    }
+    if (!validated)
+      data->tree.mark_unstable(data->terminal_validation_node);
+    data->terminal_validation_pending = false;
+    data->terminal_validation_node = pcbt::kUnexplored;
+    data->last_node = pcbt::kUnexplored;
+    return;
+  }
   if (data->bootstrap_done) {
     // Admitted-run diagnostic: does the frontier suffix carry decisions
     // (tree gain) even when the run gains no bitmap coverage?
@@ -1409,9 +1457,12 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     else
       data->probe_gained_rlimit += 1;
     if (data->probe_gained_log) {
-      fprintf(data->probe_gained_log, "kind=%u node=%u dir=%u %s\n",
+      fprintf(data->probe_gained_log, "kind=%u node=%u dir=%u %s suffix=%s\n",
               data->last_probe_veto_kind, data->last_veto_node,
-              data->last_veto_dir, filename_new_queue);
+              data->last_veto_dir, filename_new_queue,
+              data->last_probe_suffix_nonempty
+                  ? "nonempty"
+                  : data->last_probe_suffix_overflow ? "overflow" : "empty");
       fflush(data->probe_gained_log);
     }
     record_veto_probe_pair(data, (const char *)filename_new_queue);
@@ -1485,6 +1536,12 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   }
   // Seeds and post-saturation concrete-phase gains are not PCBT admissions.
   if (!data->bootstrap_done || !data->screening) return 0;
+  if (data->admitted_gained_log) {
+    fprintf(data->admitted_gained_log, "node=%u dir=%u root=%u %s\n",
+            data->last_node, data->last_dir,
+            data->root_shm_capture ? 1u : 0u, filename_new_queue);
+    fflush(data->admitted_gained_log);
+  }
   data->traced_entries.insert((const char *)filename_new_queue);
   // This admitted run gained coverage, so its suffix is tree material:
   // post_run inserts nothing (non-gaining runs only bump rCnt), and the
@@ -1529,6 +1586,14 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
 /// this candidate entirely.
 extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                           size_t buf_size, u8 **out_buf) {
+  // A timed-out validation child may not reach post_run.  Do not leave its
+  // terminal edge trusted for subsequent candidates.
+  if (data->terminal_validation_pending) {
+    if (data->single_pass_armed) disarm_capture(data);
+    data->tree.mark_unstable(data->terminal_validation_node);
+    data->terminal_validation_pending = false;
+    data->terminal_validation_node = pcbt::kUnexplored;
+  }
   // A probe capture is consumed by queue_new_entry only when AFL reports a
   // coverage gain. A non-gaining probe reaches this next callback with no
   // queue entry, so discard its suffix before screening the next candidate.
@@ -1586,9 +1651,29 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   data->screened += 1;
   pcbt::NodeRef node = pcbt::kUnexplored;
   uint8_t dir = 0;
-  if (check_input_timed(data, buf, (uint32_t)buf_size, &node, &dir,
-                        &data->last_veto_depth, &data->last_veto_node,
-                        &data->last_veto_dir, &data->last_veto_kind)) {
+  bool admitted = check_input_timed(data, buf, (uint32_t)buf_size, &node, &dir,
+                                    &data->last_veto_depth,
+                                    &data->last_veto_node,
+                                    &data->last_veto_dir,
+                                    &data->last_veto_kind);
+  bool terminal_validation =
+      !admitted && data->last_veto_kind == 0 &&
+      data->tree.terminal_needs_validation(data->last_veto_node,
+                                           data->last_veto_dir);
+  if (terminal_validation) {
+    // A terminal edge is not a proof until one complete later trace confirms
+    // that the candidate has no symbolic event beyond the edge.  Keep the
+    // API's terminal classification intact, but turn this first hit into a
+    // full-trace admission owned by the mutator.
+    admitted = true;
+    node = data->last_veto_node;
+    dir = data->last_veto_dir;
+    data->terminal_validation_pending = true;
+    data->terminal_validation_node = node;
+    data->terminal_validation_dir = dir;
+    data->admit_terminal_validation += 1;
+  }
+  if (admitted) {
     data->admitted += 1;
     data->vetoes_since_admit = 0;
     data->last_gained = false;
@@ -1600,7 +1685,11 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     // therefore reserved for bootstrap and confirmed overflow replays.
     // When replay_check is enabled, always use full-pipe so the complete
     // trace can be compared against the current tree before insertion.
-    if (!data->bootstrap_done || data->replay_check) {
+    if (terminal_validation) {
+      data->last_node = pcbt::kUnexplored;
+      data->last_dir = 0;
+      arm_full_capture(data);
+    } else if (!data->bootstrap_done || data->replay_check) {
       data->last_node = node;
       data->last_dir = dir;
       arm_full_capture(data);
@@ -1729,8 +1818,8 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu opaque=%llu "
            "failed=%llu timeouts=%llu memerr=%llu "
            "screened=%llu admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
-           "single_pass=%llu single_pass_overflow=%llu "
-           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu "
+           "single_pass=%llu single_pass_overflow=%llu admit_terminal_validation=%llu "
+           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_constraint_terminal=%llu admit_unstable=%llu "
            "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu "
            "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
            "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
@@ -1750,10 +1839,13 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)(data->screening ? 0 : 1),
            (unsigned long long)data->single_pass_captures,
            (unsigned long long)data->single_pass_overflows,
+           (unsigned long long)data->admit_terminal_validation,
            (unsigned long long)t.check_admit_empty,
            (unsigned long long)t.check_admit_opaque,
            (unsigned long long)t.check_admit_eval_failure,
            (unsigned long long)t.check_admit_frontier,
+           (unsigned long long)t.check_admit_constraint_terminal,
+           (unsigned long long)t.check_admit_unstable,
            (unsigned long long)t.check_admit_len_veto,
            (unsigned long long)t.check_veto_terminal,
            (unsigned long long)t.check_veto_rlimit,

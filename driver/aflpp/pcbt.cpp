@@ -179,13 +179,24 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   while (i < events.size() && cur != kUnexplored && cur != kTerminal) {
     const Event &ev = events[i];
     const Node &cn = node(cur);
+    if (cn.unstable) {
+      num_conflicts += 1;
+      return 0;
+    }
     uint64_t v = 0;
+    bool evaluated = false;
     uint8_t edir;
-    if (cn.pred.opaque || input == nullptr ||
-        !eval_predicate(pred_arena_, cn.pred, input, len, &v, &eval)) {
+    if (cn.pred.opaque || input == nullptr) {
       edir = ev.result ? 1 : 0;  // follow the recorded direction
     } else {
-      edir = v ? 1 : 0;
+      evaluated = eval_predicate(pred_arena_, cn.pred, input, len, &v, &eval);
+      edir = evaluated ? (v ? 1 : 0) : (ev.result ? 1 : 0);
+    }
+    if (cn.cid != ev.cid ||
+        (!cn.constraint && evaluated && edir != (ev.result ? 1 : 0))) {
+      node(cur).unstable = true;
+      num_conflicts += 1;
+      return 0;
     }
     trace_depth += 1;
     parent = cur;
@@ -214,6 +225,8 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     // The evaluated path reaches an explored-terminal edge while the trace
     // still has events: prefix drift (or a suffix-truncated earlier
     // insertion). Discard; never insert.
+    if (parent >= kRoot && parent < nodes_.size())
+      node(parent).unstable = true;
     num_conflicts += 1;
     return 0;
   }
@@ -224,6 +237,8 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       // constraint value) produced no further symbolic decisions, so the
       // branch terminates here.
       node(parent).child[dir] = kTerminal;
+    } else if (node(parent).child[dir] == kTerminal) {
+      node(parent).terminal_checked[dir] = true;
     }
     if (out_tail_node) *out_tail_node = parent;
     if (out_tail_dir) *out_tail_dir = dir;
@@ -277,6 +292,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   // it. The value-fork direction (dir-0) of a chain node is untouched and
   // stays unexplored.
   node(parent).child[dir] = kTerminal;
+  node(parent).terminal_checked[dir] = false;
   num_nodes += created;
   if (trace_depth > max_depth) max_depth = trace_depth;
   if (out_tail_node) *out_tail_node = parent;
@@ -316,6 +332,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     // of being hard-closed.
     if (!node(parent).constraint) {
       node(parent).child[direction] = kTerminal;
+      node(parent).terminal_checked[direction] = false;
     }
     // The edge this insertion closed (or left unexplored on a constraint
     // value-fork) is parent->direction.
@@ -362,6 +379,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   // comment): a constraint tail records the pinned value's branch as
   // terminal — the constraint node's dir-1 edge is explored at creation.
   node(cur).child[dir] = kTerminal;
+  node(cur).terminal_checked[dir] = false;
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
   if (out_tail_node) *out_tail_node = cur;
@@ -399,14 +417,23 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
   // values_/stamps_ was the profiled check cost at large arena sizes).
   EvalContext &eval = check_eval_;
   eval.Reset();
+  bool path_has_constraint = false;
   while (true) {
     walked += 1;
     const Node &current = node(cur);
+    path_has_constraint = path_has_constraint || current.constraint;
     if (debug_) {
       fprintf(stderr, "[eval] node=%u cid=%u skip=%u depth=%u cons=%d\n",
               cur, current.cid, current.skipCnt, current.depth,
               current.constraint ? 1 : 0);
       DebugPredicate(cur, input, len);
+    }
+    if (current.unstable) {
+      *out_node = kUnexplored;
+      *out_dir = 0;
+      check_admit_unstable += 1;
+      finish_profile(1, walked);
+      return true;
     }
     if (current.pred.opaque) {
       // Opaque nodes from return-value comparisons (compile-time
@@ -425,6 +452,13 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                            ? current.child[0]
                            : current.child[1];
         if (next == kTerminal) {
+          if (path_has_constraint) {
+            *out_node = kUnexplored;
+            *out_dir = 0;
+            check_admit_constraint_terminal += 1;
+            finish_profile(1, walked);
+            return true;
+          }
           *out_node = kUnexplored;
           *out_dir = 0;
           if (out_veto_depth) *out_veto_depth = current.depth;
@@ -467,6 +501,20 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
               next, current.child[0], current.child[1]);
     }
     if (next == kTerminal) {
+      // A constraint node represents a multi-successor decision whose
+      // symbolic event can be absent or change shape on another input.  Once
+      // a candidate has crossed such a node, the stored predicate path is
+      // not a complete termination proof: the candidate may emit a later
+      // event after the recorded terminal edge.  Admit with a root capture so
+      // the complete trace can validate or extend the tree.  The terminal
+      // edge remains unchanged and is never reopened speculatively.
+      if (path_has_constraint) {
+        *out_node = kUnexplored;
+        *out_dir = 0;
+        check_admit_constraint_terminal += 1;
+        finish_profile(1, walked);
+        return true;
+      }
       // Terminal vetoes at length/count-family nodes can be untrustworthy
       // (same-prefix candidates legitimately continue when their length
       // counter carries a symbolic shadow the traced path never had), but
@@ -506,13 +554,15 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
 void Tree::Dump(const char *path) const {
   FILE *f = fopen(path, "w");
   if (!f) return;
-  fprintf(f, "# pcbt tree dump v1\n");
-  fprintf(f, "# node cid depth skipCnt constraint len_related child0 child1 rcnt0 rcnt1\n");
+  fprintf(f, "# pcbt tree dump v2\n");
+  fprintf(f, "# node cid depth skipCnt constraint unstable checked0 checked1 len_related child0 child1 rcnt0 rcnt1\n");
   for (NodeRef ref = 0; ref < nodes_.size(); ++ref) {
     const Node &n = node(ref);
-    fprintf(f, "%u %u %u %u %u %u %u %u %u %u\n", ref, n.cid, n.depth,
-            n.skipCnt, n.constraint ? 1 : 0, n.len_related ? 1 : 0,
-            n.child[0], n.child[1], n.rCnt[0], n.rCnt[1]);
+    fprintf(f, "%u %u %u %u %u %u %u %u %u %u %u %u %u\n", ref, n.cid,
+            n.depth, n.skipCnt, n.constraint ? 1 : 0, n.unstable ? 1 : 0,
+            n.terminal_checked[0] ? 1 : 0, n.terminal_checked[1] ? 1 : 0,
+            n.len_related ? 1 : 0, n.child[0], n.child[1], n.rCnt[0],
+            n.rCnt[1]);
   }
   fclose(f);
 }
@@ -524,6 +574,7 @@ bool Tree::IsSaturated(uint8_t rlimit) const {
 
 bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit) const {
   const Node &current = node(ref);
+  if (current.unstable) return false;
   if (current.pred.opaque) return false;
   for (uint8_t direction = 0; direction != 2; ++direction) {
     NodeRef next = current.child[direction];
@@ -564,24 +615,6 @@ Tree::ReplayReport Tree::ReplayFullTrace(
       return false;
     }
     const Node &current = node(cur);
-    // A different CID is a legitimate replay boundary when the candidate's
-    // input evaluates the current known node toward an unexplored child. This
-    // is exactly the frontier CheckInput would admit: the observed event is
-    // the first event of the new suffix, so it must be left for InsertTrace
-    // rather than reported as collection drift. Only an already-explored
-    // direction makes a CID difference a replay mismatch.
-    auto frontier_on_cid_difference = [&](const Node &expected,
-                                           uint8_t dir) -> bool {
-      NodeRef next = expected.child[dir];
-      if (next != kUnexplored) return false;
-      r.event_index = i;
-      r.verified_events = logic - 1;
-      r.reached_frontier = true;
-      r.frontier_node = cur;
-      r.frontier_dir = dir;
-      r.suffix_begin = logic - 1;
-      return true;
-    };
     // A constraint frame represents one multi-successor decision. The tree
     // may contain several constraint nodes at this same stream position as a
     // value-fork chain (case1 -> case2 -> ...). Reuse this one logical event
@@ -599,8 +632,8 @@ Tree::ReplayReport Tree::ReplayFullTrace(
           dir = v ? 1 : 0;
         }
         if (constraint.cid != ev.cid) {
-          if (frontier_on_cid_difference(constraint, dir)) return false;
           if (debug_) DebugPredicate(cur, input, len);
+          r.mismatch_node = cur;
           r.error = ReplayError::CidMismatch;
           r.event_index = i;
           r.expected_cid = constraint.cid;
@@ -610,6 +643,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
         NodeRef next = constraint.child[dir];
         if (next == kTerminal) {
           if (logic < trace_total) {
+            r.mismatch_node = cur;
             r.error = ReplayError::AfterTerminal;
             r.event_index = i;
             r.verified_events = logic;
@@ -640,7 +674,9 @@ Tree::ReplayReport Tree::ReplayFullTrace(
       }
     }
     // Evaluate predicate before checking CID so an observed event at a new
-    // frontier is accepted as the start of the suffix.
+    // frontier is accepted as the start of the suffix.  A CID mismatch at an
+    // existing node is always a trace conflict, including when its evaluated
+    // child is unexplored: the event stream has already drifted at this node.
     if (current.pred.opaque) {
       r.event_index = i;
       r.verified_events = logic - 1;  // events before this opaque one
@@ -662,8 +698,8 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     }
     uint8_t dir = v ? 1 : 0;
     if (current.cid != ev.cid) {
-      if (frontier_on_cid_difference(current, dir)) return false;
       if (debug_) DebugPredicate(cur, input, len);
+      r.mismatch_node = cur;
       r.error = ReplayError::CidMismatch;
       r.event_index = i;
       r.expected_cid = current.cid;
@@ -673,6 +709,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     r.direction_checked = true;
     if (dir != ev.result) {
       if (debug_) DebugPredicate(cur, input, len);
+      r.mismatch_node = cur;
       r.error = ReplayError::DirectionMismatch;
       r.event_index = i;
       r.expected_cid = current.cid;
@@ -685,6 +722,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     if (next == kTerminal) {
       if (logic < trace_total) {
         // More events follow, but trace already consumed
+        r.mismatch_node = cur;
         r.error = ReplayError::AfterTerminal;
         r.event_index = i;
         r.verified_events = logic;
@@ -724,6 +762,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     // expects more conditions.  This can happen after the last event if
     // cur.child[dir] points to another node (not kTerminal/Unexplored).
     r.verified_events = logic;
+    r.mismatch_node = cur;
     r.event_index = i;
     r.error = ReplayError::TruncatedTrace;
     if (debug_) DebugPredicate(cur, input, len);

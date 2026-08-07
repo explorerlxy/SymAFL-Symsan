@@ -38,6 +38,12 @@ struct Node {
   // describes only the pinned value's behavior; dir-0 is the value-fork
   // chain for candidates that pin a different value.
   bool constraint = false;
+  // Prefix validation found incompatible symbolic event streams at this node.
+  // Descendants are not safe terminal proofs while this flag is set.
+  bool unstable = false;
+  // A terminal edge is validated by one later complete trace before the
+  // mutator is allowed to use it as a screening proof.
+  bool terminal_checked[2] = {false, false};
   // The stored predicate's decision depends on a length/count family leaf
   // (Len/EofRead/Count/CountNeg1/CountElems). Length-derived decisions are
   // path-dependent in label presence: a trace whose length counter was never
@@ -147,6 +153,7 @@ class Tree {
     bool reached_frontier = false;
     NodeRef frontier_node = kUnexplored;
     uint8_t frontier_dir = 0;
+    NodeRef mismatch_node = kUnexplored;
   };
   ReplayReport ReplayFullTrace(const std::vector<Event> &events,
                                const uint8_t *input, uint32_t len) const;
@@ -154,7 +161,8 @@ class Tree {
   bool IsSaturated(uint8_t rlimit) const;
 
   // Dump the tree topology (node id, cid, depth, skipCnt, constraint,
-  // len_related, children, rCnt) to a file for offline pair/terminal
+  // unstable, terminal validation, len_related, children, rCnt) to a file
+  // for offline pair/terminal
   // forensics. kUnexplored=0 / kTerminal=1 / kRoot=2 are dumped verbatim.
   void Dump(const char *path) const;
   uint32_t depth(NodeRef ref) const { return node(ref).depth; }
@@ -172,6 +180,17 @@ class Tree {
   // Constraint-node test for suffix-capture skip adjustment.
   bool is_constraint(NodeRef ref) const {
     return ref >= kRoot && ref < nodes_.size() ? node(ref).constraint : false;
+  }
+  bool is_unstable(NodeRef ref) const {
+    return ref >= kRoot && ref < nodes_.size() ? node(ref).unstable : false;
+  }
+  bool terminal_needs_validation(NodeRef ref, uint8_t direction) const {
+    return ref >= kRoot && ref < nodes_.size() &&
+           node(ref).child[direction & 1] == kTerminal &&
+           !node(ref).terminal_checked[direction & 1];
+  }
+  void mark_unstable(NodeRef ref) {
+    if (ref >= kRoot && ref < nodes_.size()) node(ref).unstable = true;
   }
   // Number of leading stream events to skip for a frontier edge. A constraint
   // value-fork (dir-0) starts with the re-emitted decision, while a pinned
@@ -210,6 +229,11 @@ class Tree {
   uint64_t check_admit_eval_failure = 0;
   uint64_t check_admit_frontier = 0;
   uint64_t check_admit_len_veto = 0;  // terminal veto downgraded to admit
+  // A terminal route crossed a multi-successor constraint.  Its stored
+  // predicate is not a complete proof of termination, so the candidate is
+  // admitted for a complete trace instead of being vetoed.
+  uint64_t check_admit_constraint_terminal = 0;
+  uint64_t check_admit_unstable = 0;
   uint64_t check_veto_terminal = 0;
   uint64_t check_veto_rlimit = 0;
   std::array<uint64_t, kPredErrorCount> opaque_by_error{};
