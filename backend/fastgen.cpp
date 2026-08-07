@@ -136,15 +136,10 @@ __taint_trace_switch_end(uint32_t cid) {
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
-  // DIAGNOSTIC ONLY: label==0 conditions are forwarded so the direct-run
-  // stream exposes whether branch sites were instrumented at all and what
-  // their runtime label is. Shipped mode re-adds the filter.
-  if (false && label == 0) {
-    // check for real loop exit
-    if (!(((flag & FalseBranchLoopExit) && !r) ||
-          ((flag & TrueBranchLoopExit) && r)))
-      return;
-  }
+  // Concrete conditions are not symbolic events. They must not reach the
+  // transport or consume suffix-depth positions.
+  if (label == 0)
+    return;
 
   void *addr = __builtin_return_address(0);
 

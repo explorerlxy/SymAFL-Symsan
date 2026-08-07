@@ -309,8 +309,17 @@ enum operators {
   // numeric Or (which the predicate converter would evaluate as a value):
   // the converter maps this op to opaque (conservative admission), keeping
   // the constraint collected without inventing a wrong branch result.
-  idx_merge       = last_llvm_op + 45, // 113
-  LastOp    = last_llvm_op + 46, // 114
+  // Keep the custom opcode values aligned with TaintPass's literal protocol
+  // IDs.  LLVM 18 reports last_llvm_op=67, while the custom range reserves
+  // 113 for idx_merge and starts integer min/max at 114.
+  idx_merge       = last_llvm_op + 46, // 113
+  // Integer min/max intrinsics. LLVM lowers source-level ternary minima (for
+  // example XZ's my_min) to these operations before TaintPass runs.
+  umin            = last_llvm_op + 47, // 114 llvm.umin
+  umax            = last_llvm_op + 48, // 115 llvm.umax
+  smin            = last_llvm_op + 49, // 116 llvm.smin
+  smax            = last_llvm_op + 50, // 117 llvm.smax
+  LastOp          = last_llvm_op + 51, // 118
 };
 
 // fmemcmp keeps its base opcode in the low byte. The high bits record whether
@@ -396,6 +405,10 @@ static inline bool is_commutative(uint16_t op) {
     case FMul:
     case fp_min:
     case fp_max:
+    case umin:
+    case umax:
+    case smin:
+    case smax:
     case fmemcmp:
     case fstrcmp:
       return true;

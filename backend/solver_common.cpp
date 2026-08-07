@@ -79,14 +79,16 @@ bool IsTraceStreamEnabled() {
 //
 // Long test inputs (e.g. a 64 KiB line without '\n') make getc loops emit one
 // condition event per byte (up to ~131K events), which dominates the pipe
-// transfer and the mutator's AST building. Consecutive events that share the
-// same cid, the same result and an identical predicate shape whose only
-// Read/EofRead leaf advances by one byte are collapsed into a single fold
-// frame; the mutator expands it back into one tree node per event. Loop-bound
-// comparisons against flen_count labels repeat the exact same label and are
-// folded the same way. Folding happens after the skip-depth filter, so the
-// logical event count (used for skip_depth and tree depth) is unchanged; the
-// SHM event_count only counts actual slots (a fold frame is one slot).
+// transfer and the mutator's AST building. Strictly consecutive events that
+// share the same cid, result, and predicate shape whose only Read/EofRead leaf
+// advances by one byte are collapsed into a single fold frame; the mutator
+// expands it back into one tree node per event. Loop-bound comparisons against
+// flen_count labels repeat the exact same label and are folded the same way.
+// There is only one pending frame: any event that interrupts a run flushes it
+// before being written or becoming a new run, preserving execution order.
+// Folding happens after the skip-depth filter, so the logical event count (used
+// for skip_depth and tree depth) is unchanged; the SHM event_count only counts
+// actual slots (a fold frame is one slot).
 
 namespace {
 
@@ -109,7 +111,10 @@ struct FoldSlot {
   bool valid;
 };
 
-static FoldSlot g_fold_slots[512];
+// Only one run may remain pending. A fold frame cannot represent interleaved
+// events from multiple shapes, so keeping several slots would reorder them
+// when the slots are flushed later.
+static FoldSlot g_fold_slot;
 
 // FNV-1a 64-bit mixing, byte-wise.
 static inline void fold_mix(uint64_t &h, uint64_t v) {
@@ -255,8 +260,8 @@ static void write_fold_frame(uint32_t cid, dfsan_label label, uint8_t result,
   }
 }
 
-static void flush_slot(size_t slot) {
-  FoldSlot &s = g_fold_slots[slot];
+static void flush_slot() {
+  FoldSlot &s = g_fold_slot;
   if (!s.valid || s.count == 0) return;
   write_fold_frame(s.cid, s.first_label, s.result, s.count, s.addr,
                    s.context);
@@ -264,31 +269,33 @@ static void flush_slot(size_t slot) {
 }
 
 // Returns true when the event was absorbed (folded into a pending sequence
-// or stored as its start); the caller must then skip writing it. Constraint
-// events are never folded.
+// or stored as its start); the caller must then skip writing it. Only a
+// strictly consecutive run may remain pending; an interrupt is flushed first.
 static bool fold_absorb(dfsan_label label, uint8_t result, uint8_t loop_flag,
                         uint32_t cid, void *addr) {
-  if (loop_flag & ConstraintFlag) return false;
+  if (loop_flag & ConstraintFlag) {
+    flush_slot();
+    return false;
+  }
   uint32_t offset = 0;
   uint64_t h = 0;
   FoldKind kind = classify_fold(label, &offset, &h);
-  if (kind == FOLD_NONE) return false;
-
-  // Slot key is (cid, shape_hash): clang may compile several comparisons over
-  // the same value into one switch sharing a single cid (e.g. `c != EOF` and
-  // `c == ';'`), and each shape must accumulate independently.
-  size_t slot = (((cid * 2654435761u) ^ (uint32_t)h) >> 23) & 511;
-  FoldSlot &s = g_fold_slots[slot];
-  if (s.valid && s.cid == cid && s.shape_hash == h) {
-    bool match = s.result == result && s.count < SYMAFL_MAX_FOLD_COUNT &&
-                 offset == s.last_offset + 1;
-    if (match) {
-      s.count += 1;
-      s.last_offset = offset;
-      return true;
-    }
-    flush_slot(slot);  // result/offset changed: emit the pending frame
+  if (kind == FOLD_NONE) {
+    flush_slot();
+    return false;
   }
+
+  FoldSlot &s = g_fold_slot;
+  if (s.valid && s.cid == cid && s.shape_hash == h &&
+      s.result == result && s.count < SYMAFL_MAX_FOLD_COUNT &&
+      offset == s.last_offset + 1) {
+    s.count += 1;
+    s.last_offset = offset;
+    return true;
+  }
+  // A fold frame cannot represent interleaved events. Emit the previous run
+  // before storing this event so the wire order matches execution order.
+  flush_slot();
   s.valid = true;
   s.cid = cid;
   s.kind = kind;
@@ -306,7 +313,7 @@ static bool fold_absorb(dfsan_label label, uint8_t result, uint8_t loop_flag,
 
 extern "C" void __dfsan_flush_trace_fold() {
   if (!__single_pass && __pipe_fd < 0) return;
-  for (size_t i = 0; i < 512; ++i) flush_slot(i);
+  flush_slot();
 }
 
 //===----------------------------------------------------------------------===//
@@ -316,6 +323,10 @@ extern "C" void __dfsan_flush_trace_fold() {
 extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
                                   uint8_t add_nested, uint8_t loop_flag,
                                   uint32_t cid, void *addr) {
+  // Only input-dependent, initialized labels are symbolic PCBT events. Keep
+  // this guard at the transport boundary as well as in fastgen.cpp because
+  // runtime custom hooks also call __taint_send_cond directly.
+  if (label == 0 || label == kInitializingLabel) return;
 
   // AFL's SymAFL extension selects one of four per-child modes through the
   // shared control block. FULL_STREAM writes bootstrap events to the pipe;

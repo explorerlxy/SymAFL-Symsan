@@ -189,6 +189,10 @@ enum {
   DfsanFpMin      = 93, // fp_min
   DfsanFpMax      = 94, // fp_max
   DfsanFpCopysign = 95, // fp_copysign
+  DfsanIntUMin    = 114, // umin (last_llvm_op + 46)
+  DfsanIntUMax    = 115, // umax
+  DfsanIntSMin    = 116, // smin
+  DfsanIntSMax    = 117, // smax
 };
 // Rounding-mode selector (must match __dfsan::fp_rounding_mode in dfsan.h).
 enum {
@@ -4654,6 +4658,40 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
     return;
 
   Intrinsic::ID IId = F->getIntrinsicID();
+
+  // LLVM lowers integer min/max expressions to these intrinsics. Preserve
+  // both operands as a first-class label instead of making the result clean.
+  if (CB.getType()->isIntegerTy() &&
+      CB.getType()->getIntegerBitWidth() <= 64) {
+    uint16_t MinMaxOp = 0;
+    switch (IId) {
+      case Intrinsic::umin: MinMaxOp = DfsanIntUMin; break;
+      case Intrinsic::umax: MinMaxOp = DfsanIntUMax; break;
+      case Intrinsic::smin: MinMaxOp = DfsanIntSMin; break;
+      case Intrinsic::smax: MinMaxOp = DfsanIntSMax; break;
+      default: break;
+    }
+    if (MinMaxOp != 0) {
+      IRBuilder<> IRB(&CB);
+      auto ToInt64 = [&](Value *V) {
+        return IRB.CreateZExtOrTrunc(V, TF.TT.Int64Ty);
+      };
+      Value *S1 = TF.getShadow(CB.getArgOperand(0));
+      Value *S2 = TF.getShadow(CB.getArgOperand(1));
+      uint16_t Size = static_cast<uint16_t>(
+          CB.getType()->getIntegerBitWidth());
+      CallInst *C = IRB.CreateCall(
+          TF.TT.TaintUnionFn,
+          {S1, S2, ConstantInt::get(TF.TT.Int16Ty, MinMaxOp),
+           ConstantInt::get(TF.TT.Int16Ty, Size),
+           ToInt64(CB.getArgOperand(0)), ToInt64(CB.getArgOperand(1))});
+      C->addRetAttr(Attribute::ZExt);
+      C->addParamAttr(0, Attribute::ZExt);
+      C->addParamAttr(1, Attribute::ZExt);
+      TF.setShadow(&CB, C);
+      return;
+    }
+  }
 
   // bswap: decompose into Extract-per-byte then Concat in reverse order.
   // __taint_union(l1=low, l2=high, Concat) → z3::concat(high, low) (little-endian)

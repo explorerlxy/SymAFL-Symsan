@@ -26,14 +26,12 @@ struct Node {
   Predicate pred;    // root view into Tree::pred_arena_
   NodeRef child[2] = {kUnexplored, kUnexplored};
   uint32_t depth = 0;                // root's children = 1 (topology stats)
-  // Event-stream position basis for suffix capture: when CheckInput admits a
-  // candidate at the unexplored edge below this node, the runtime must skip
-  // exactly skipCnt events so the candidate's own stream continues from this
-  // node's position. Constraint nodes (multi-successor single decisions:
-  // tainted GEP index / jump target == concrete) re-emit at the same stream
-  // position on candidates that pin a different value, so they do not
-  // advance the count: constraint -> skipCnt = parent.skipCnt; ordinary
-  // node -> parent.skipCnt + (parent.constraint ? 2 : 1).
+  // Event-stream position basis for suffix capture. Ordinary nodes store the
+  // number of logical events through the node; constraint nodes store the
+  // number before their event because a value-fork candidate re-emits that
+  // constraint at the same position. A constraint child on dir-1 is a new
+  // stream event and therefore advances by one; only a constraint child on a
+  // constraint parent's dir-0 value-fork shares the parent's position.
   uint32_t skipCnt = 0;
   uint8_t rCnt[2] = {0, 0};          // non-gaining admissions per direction
   // This node is a constraint event (see skipCnt above). Its dir-1 subtree
@@ -154,6 +152,11 @@ class Tree {
                                const uint8_t *input, uint32_t len) const;
 
   bool IsSaturated(uint8_t rlimit) const;
+
+  // Dump the tree topology (node id, cid, depth, skipCnt, constraint,
+  // len_related, children, rCnt) to a file for offline pair/terminal
+  // forensics. kUnexplored=0 / kTerminal=1 / kRoot=2 are dumped verbatim.
+  void Dump(const char *path) const;
   uint32_t depth(NodeRef ref) const { return node(ref).depth; }
   uint32_t cid_of(NodeRef ref) const { return node(ref).cid; }
   // Minimal topology accessors (diagnostics and unit tests).
@@ -166,18 +169,17 @@ class Tree {
   uint32_t skip_of(NodeRef ref) const {
     return ref < kRoot || ref >= nodes_.size() ? 0 : node(ref).skipCnt;
   }
-  // Constraint-node test for the suffix-capture skip adjustment: a candidate
-  // admitted on a constraint node's dir-1 (pinned-value) edge re-emits the
-  // parent's own decision event at the same stream position, so the capture
-  // must skip one extra event (the pin branch's suffix starts at the
-  // candidate's first post-decision event).
+  // Constraint-node test for suffix-capture skip adjustment.
   bool is_constraint(NodeRef ref) const {
     return ref >= kRoot && ref < nodes_.size() ? node(ref).constraint : false;
   }
-  // Number of leading stream events the runtime must skip so the candidate's
-  // own events from this frontier node's position onward are exported.
-  uint32_t skip_for(NodeRef frontier_parent) const {
-    return frontier_parent == kRoot ? 0 : node(frontier_parent).skipCnt;
+  // Number of leading stream events to skip for a frontier edge. A constraint
+  // value-fork (dir-0) starts with the re-emitted decision, while a pinned
+  // edge (dir-1) starts after that decision.
+  uint32_t skip_for(NodeRef frontier_parent, uint8_t direction = 0) const {
+    if (frontier_parent == kRoot) return 0;
+    const Node &parent = node(frontier_parent);
+    return parent.skipCnt + (parent.constraint && direction == 1 ? 1 : 0);
   }
   uint64_t num_pred_nodes() const { return pred_arena_.nodes.size(); }
   uint8_t &retry_count(NodeRef ref, uint8_t direction) {
@@ -192,6 +194,8 @@ class Tree {
   // members only; used by ReplayFullTrace's mismatch branches.
   void set_debug(bool enabled) { debug_ = enabled; }
   bool debug() const { return debug_; }
+  void set_profile(bool enabled) { profile_ = enabled; }
+  bool profile() const { return profile_; }
   void DebugPredicate(NodeRef ref, const uint8_t *input, uint32_t len) const;
 
   // stats
@@ -210,6 +214,18 @@ class Tree {
   uint64_t check_veto_rlimit = 0;
   std::array<uint64_t, kPredErrorCount> opaque_by_error{};
   std::unordered_map<uint16_t, uint64_t> opaque_by_op;
+  // Event-site census for opaque nodes. This is intentionally keyed by CID
+  // rather than source text: the instrumentation build can emit a separate
+  // CID map, while the mutator remains independent of debug information.
+  std::unordered_map<uint32_t, uint64_t> opaque_by_cid;
+  // CheckInput decomposition, populated only when profiling is enabled.
+  uint64_t profile_check_node_visits = 0;
+  uint64_t profile_check_predicate_calls = 0;
+  uint64_t profile_check_computed_nodes = 0;
+  uint64_t profile_check_cache_hits = 0;
+  uint64_t profile_check_read_nodes = 0;
+  uint64_t profile_check_read_bytes = 0;
+  uint64_t profile_check_exit_depth[6] = {};
 
  private:
   Node &node(NodeRef ref) { return nodes_[ref]; }
@@ -217,6 +233,7 @@ class Tree {
   NodeRef append(Node &&node);
   bool IsSaturated(NodeRef ref, uint8_t rlimit) const;
   bool debug_ = false;
+  bool profile_ = false;
   // Persistent eval context for CheckInput: the values_/stamps_ vectors are
   // keyed by arena index, so they must only grow (the arena is append-only
   // between checks); a fresh context per check zero-fills up to the arena

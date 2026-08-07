@@ -27,6 +27,28 @@ static inline bool is_flen_count_op(uint16_t op_lo) {
          op_lo == __dfsan::flen_count_elems;
 }
 
+// A symbolic operand may itself be derived from the flen label being lowered.
+// Reusing that operand as the Count clamp would create x < min(x, ...), which
+// is not the original comparison semantics. Keep the recorded request clamp
+// for this dependency case; splice only independent symbolic requests.
+static bool label_depends_on(const dfsan_label_info *table, size_t labels,
+                             uint32_t root, uint32_t target) {
+  if (root == 0 || target == 0 || root >= labels || target >= labels)
+    return false;
+  std::vector<uint32_t> stack = {root};
+  std::unordered_set<uint32_t> seen;
+  while (!stack.empty()) {
+    uint32_t label = stack.back();
+    stack.pop_back();
+    if (label == target) return true;
+    if (!seen.insert(label).second || label >= labels) continue;
+    const dfsan_label_info &info = table[label];
+    if (info.l1 != 0 && info.l1 < labels) stack.push_back(info.l1);
+    if (info.l2 != 0 && info.l2 < labels) stack.push_back(info.l2);
+  }
+  return false;
+}
+
 struct ConvertFrame {
   uint32_t label;
   bool expanded;
@@ -114,6 +136,8 @@ uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
   if (op == __dfsan::Concat || is_fmemcmp(op) || op_lo == ICmp ||
       op_lo == FCmp || op_lo == Add || op_lo == Sub || op_lo == Mul ||
       op_lo == UDiv || op_lo == SDiv || op_lo == URem || op_lo == SRem ||
+      op_lo == __dfsan::umin || op_lo == __dfsan::umax ||
+      op_lo == __dfsan::smin || op_lo == __dfsan::smax ||
       op_lo == Shl || op_lo == LShr || op_lo == AShr || op_lo == And ||
       op_lo == Or || op_lo == Xor)
     return 2;
@@ -152,7 +176,6 @@ uint32_t RunConverter::convert(uint32_t label) {
                                              : PredError::InvalidLabel);
       break;
     }
-
     const dfsan_label_info *info = &table_[frame.label];
     uint32_t op = info->op;
     uint32_t op_lo = op & 0xff;
@@ -266,6 +289,10 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     case SDiv: kind = PKind::SDiv; binary = true; break;
     case URem: kind = PKind::URem; binary = true; break;
     case SRem: kind = PKind::SRem; binary = true; break;
+    case __dfsan::umin: kind = PKind::UMin; binary = true; break;
+    case __dfsan::umax: kind = PKind::UMax; binary = true; break;
+    case __dfsan::smin: kind = PKind::SMin; binary = true; break;
+    case __dfsan::smax: kind = PKind::SMax; binary = true; break;
     case Shl: kind = PKind::Shl; binary = true; break;
     case LShr: kind = PKind::LShr; binary = true; break;
     case AShr: kind = PKind::AShr; binary = true; break;
@@ -368,13 +395,21 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
         is_flen_count_op(table_[info->l2].op & 0xff);
     if (left_flen && !right_flen && info->l2 != 0) {
       uint32_t other = conv_child(info->l2, info->op2.i, size);
-      uint32_t count = build_flen_count(table_[info->l1], size, other);
+      uint32_t clamp = label_depends_on(table_, table_labels_, info->l2,
+                                        info->l1)
+          ? add_const(table_[info->l1].op2.i & 0xFFFFFFFFull, size)
+          : other;
+      uint32_t count = build_flen_count(table_[info->l1], size, clamp);
       if (count == kInvalidNode || other == kInvalidNode) return kInvalidNode;
       return add(kind, size, count, other);
     }
     if (right_flen && !left_flen && info->l1 != 0) {
       uint32_t other = conv_child(info->l1, info->op1.i, size);
-      uint32_t count = build_flen_count(table_[info->l2], size, other);
+      uint32_t clamp = label_depends_on(table_, table_labels_, info->l1,
+                                        info->l2)
+          ? add_const(table_[info->l2].op2.i & 0xFFFFFFFFull, size)
+          : other;
+      uint32_t count = build_flen_count(table_[info->l2], size, clamp);
       if (count == kInvalidNode || other == kInvalidNode) return kInvalidNode;
       return add(kind, size, other, count);
     }
@@ -971,7 +1006,8 @@ inline int64_t sext_bits(uint64_t v, uint16_t bits) {
 
 bool eval_predicate(const PredArena &arena, const Predicate &pred,
                     const uint8_t *input, uint32_t len, uint64_t *out,
-                    EvalContext *context) {
+                    EvalContext *context, EvalStats *stats) {
+  if (stats) stats->predicate_calls += 1;
   if (pred.opaque || pred.root >= arena.nodes.size()) return false;
   const auto &nodes = arena.nodes;
   static thread_local EvalContext local_context;
@@ -994,7 +1030,10 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
     auto frame = context->stack_.back();
     context->stack_.pop_back();
     if (frame.first >= nodes.size()) return false;
-    if (context->stamps_[frame.first] == stamp) continue;
+    if (context->stamps_[frame.first] == stamp) {
+      if (stats) stats->cache_hits += 1;
+      continue;
+    }
     const PNode &nd = nodes[frame.first];
     if (!frame.second) {
       context->stack_.push_back({frame.first, true});
@@ -1018,6 +1057,13 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
     }
     uint16_t bits = nd.bits;
     uint64_t v;
+    if (stats) {
+      stats->computed_nodes += 1;
+      if (nd.kind == PKind::Read || nd.kind == PKind::EofRead) {
+        stats->read_nodes += 1;
+        stats->read_bytes += nd.kind == PKind::Read ? bits / 8 : 1;
+      }
+    }
     switch (nd.kind) {
       case PKind::Opaque: return false;
       case PKind::Read: {
@@ -1098,6 +1144,24 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
         }
         break;
       }
+      case PKind::UMin: {
+        uint64_t av = mask_bits(a, bits), bv = mask_bits(b, bits);
+        v = av < bv ? av : bv;
+        break;
+      }
+      case PKind::UMax: {
+        uint64_t av = mask_bits(a, bits), bv = mask_bits(b, bits);
+        v = av > bv ? av : bv;
+        break;
+      }
+      case PKind::SMin:
+        v = sext_bits(a, bits) < sext_bits(b, bits)
+                ? mask_bits(a, bits) : mask_bits(b, bits);
+        break;
+      case PKind::SMax:
+        v = sext_bits(a, bits) > sext_bits(b, bits)
+                ? mask_bits(a, bits) : mask_bits(b, bits);
+        break;
       case PKind::Neg: v = mask_bits(0 - a, bits); break;
       case PKind::Not: v = mask_bits(~a, bits); break;
       case PKind::And: v = mask_bits(a & b, bits); break;

@@ -29,7 +29,7 @@ enum class PKind : uint8_t {
   Opaque = 0,
   Read,   // input bytes: value=byte offset, nbytes=bits/8 (little-endian)
   Const,  // value=constant (masked to bits)
-  Add, Sub, Mul, UDiv, SDiv, URem, SRem, Neg,
+  Add, Sub, Mul, UDiv, SDiv, URem, SRem, UMin, UMax, SMin, SMax, Neg,
   Not, And, Or, Xor, Shl, LShr, AShr,
   Equal, Distinct, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge,
   ZExt, SExt, Extract, Concat, Memcmp,
@@ -172,6 +172,7 @@ class RunConverter {
 // A context shares values across root evaluations for one candidate.  PCBT
 // paths created from a single trace share PNodes, so this avoids re-evaluating
 // their common expression DAG at every depth.
+struct EvalStats;
 class EvalContext {
  public:
   void Reset();
@@ -187,7 +188,17 @@ class EvalContext {
   std::vector<std::pair<uint32_t, bool>> stack_;
   friend bool eval_predicate(const PredArena &, const Predicate &,
                              const uint8_t *, uint32_t, uint64_t *,
-                             EvalContext *);
+                             EvalContext *, EvalStats *);
+};
+
+// Optional counters for one candidate's predicate walk. The normal hot path
+// passes nullptr, so this adds no counter traffic unless profiling is enabled.
+struct EvalStats {
+  uint64_t predicate_calls = 0;
+  uint64_t computed_nodes = 0;
+  uint64_t cache_hits = 0;
+  uint64_t read_nodes = 0;
+  uint64_t read_bytes = 0;
 };
 
 // Evaluate only the root-reachable DAG against a concrete input. Returns false
@@ -196,6 +207,7 @@ class EvalContext {
 // earlier roots for the same input; callers must Reset() it for a new input.
 bool eval_predicate(const PredArena &arena, const Predicate &pred,
                     const uint8_t *input, uint32_t len, uint64_t *out,
-                    EvalContext *context = nullptr);
+                    EvalContext *context = nullptr,
+                    EvalStats *stats = nullptr);
 
 }  // namespace pcbt
