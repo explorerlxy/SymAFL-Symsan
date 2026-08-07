@@ -3497,8 +3497,11 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
   }
   if (tfsize) {
     // Length boundary: ret is the number of complete ELEMENTS read,
-    // min((len - offset) / size, nmemb). op2 packs (item_size << 32) | nmemb.
-    *ret_label = dfsan_union(0, 0, flen_count_elems, sizeof(ret) * 8,
+    // min((len - offset) / size, nmemb).  Preserve a symbolic nmemb in l1;
+    // op2 still carries the trace-time value and item size for diagnostics
+    // and the concrete fallback when nmemb is not tainted.
+    *ret_label = dfsan_union(nmemb_label, 0, flen_count_elems,
+                             sizeof(ret) * 8,
                              (uint64_t)offset,
                              ((uint64_t)size << 32) | (uint64_t)nmemb);
     // Multi-successor single-decision: pin the read count (elements), so
@@ -3554,8 +3557,10 @@ __dfsw_fread_unlocked(
   }
   if (tfsize) {
     // Length boundary: ret is the number of complete ELEMENTS read.
-    // op2 packs (item_size << 32) | nmemb.
-    *ret_label = dfsan_union(0, 0, flen_count_elems, sizeof(ret) * 8,
+    // Preserve symbolic nmemb in l1; op2 packs item size and its trace-time
+    // value for the concrete fallback.
+    *ret_label = dfsan_union(nmemb_label, 0, flen_count_elems,
+                             sizeof(ret) * 8,
                              (uint64_t)offset,
                              ((uint64_t)size << 32) | (uint64_t)nmemb);
     taint_report_read_constraint(*ret_label, (uint64_t)ret,

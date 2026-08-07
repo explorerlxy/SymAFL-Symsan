@@ -41,8 +41,9 @@ enum class PKind : uint8_t {
   Count,    // value=pre-read pos, a=Const(requested bytes); eval =
             //        len <= pos ? 0 : min(len - pos, n)
   CountNeg1, // same as Count, but EOF value is -1 (getline family)
-  CountElems, // value=pre-read pos, a=Const(nmemb), b=Const(item size);
-              // eval = len <= pos ? 0 : min((len - pos) / size, nmemb)
+  CountElems, // value=pre-read pos, a=nmemb expression (or Const fallback),
+              // b=Const(item size); eval = len <= pos ? 0 :
+              // min((len - pos) / size, nmemb)
 };
 
 // A conversion failure is never a predicate result.  It is retained as

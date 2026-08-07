@@ -484,6 +484,16 @@ uint32_t RunConverter::build_flen_count(const dfsan_label_info &info,
   if (op_lo == __dfsan::flen_count_neg1)
     return add(PKind::CountNeg1, bits, clamp, kNoChild, info.op1.i);
   if (op_lo == __dfsan::flen_count_elems) {
+    // fread's nmemb may itself depend on the candidate length (XZ passes
+    // fsize as nmemb).  The interceptor preserves that label in l1; use its
+    // expression instead of freezing the trace-time nmemb in op2.  An
+    // unsupported symbolic request fails conversion and is admitted
+    // conservatively rather than evaluated with a stale constant.
+    if (info.l1 != 0) {
+      uint32_t dynamic_clamp = convert(info.l1);
+      if (dynamic_clamp == kInvalidNode) return kInvalidNode;
+      clamp = dynamic_clamp;
+    }
     uint32_t item = add_const(info.op2.i >> 32, 32);
     return add(PKind::CountElems, bits, clamp, item, info.op1.i);
   }
