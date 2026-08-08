@@ -41,15 +41,9 @@ struct Node {
   // Prefix validation found incompatible symbolic event streams at this node.
   // Descendants are not safe terminal proofs while this flag is set.
   bool unstable = false;
-  // A terminal edge is validated by one later complete trace before the
-  // mutator is allowed to use it as a screening proof.
-  bool terminal_checked[2] = {false, false};
   // The stored predicate's decision depends on a length/count family leaf
-  // (Len/EofRead/Count/CountNeg1/CountElems). Length-derived decisions are
-  // path-dependent in label presence: a trace whose length counter was never
-  // symbolically updated contributes no event, while candidates on other
-  // paths do. Terminal vetoes at such nodes are therefore not trustworthy
-  // (same-prefix candidates legitimately continue); they admit conservatively.
+  // (Len/EofRead/Count/CountNeg1/CountElems). This is retained for diagnosis;
+  // terminal policy does not downgrade these edges to admissions.
   bool len_related = false;
 };
 
@@ -161,9 +155,8 @@ class Tree {
   bool IsSaturated(uint8_t rlimit) const;
 
   // Dump the tree topology (node id, cid, depth, skipCnt, constraint,
-  // unstable, terminal validation, len_related, children, rCnt) to a file
-  // for offline pair/terminal
-  // forensics. kUnexplored=0 / kTerminal=1 / kRoot=2 are dumped verbatim.
+  // unstable, len_related, children, rCnt) to a file for offline forensics.
+  // kUnexplored=0 / kTerminal=1 / kRoot=2 are dumped verbatim.
   void Dump(const char *path) const;
   uint32_t depth(NodeRef ref) const { return node(ref).depth; }
   uint32_t cid_of(NodeRef ref) const { return node(ref).cid; }
@@ -183,11 +176,6 @@ class Tree {
   }
   bool is_unstable(NodeRef ref) const {
     return ref >= kRoot && ref < nodes_.size() ? node(ref).unstable : false;
-  }
-  bool terminal_needs_validation(NodeRef ref, uint8_t direction) const {
-    return ref >= kRoot && ref < nodes_.size() &&
-           node(ref).child[direction & 1] == kTerminal &&
-           !node(ref).terminal_checked[direction & 1];
   }
   void mark_unstable(NodeRef ref) {
     if (ref >= kRoot && ref < nodes_.size()) node(ref).unstable = true;

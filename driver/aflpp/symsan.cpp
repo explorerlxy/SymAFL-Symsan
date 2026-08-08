@@ -28,6 +28,7 @@ extern "C" {
 #include <vector>
 
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -90,9 +91,18 @@ struct my_mutator_t {
     }
     if (full_stream_read_fd >= 0) close(full_stream_read_fd);
     if (full_stream_write_fd >= 0) close(full_stream_write_fd);
+    if (probe_case_dir) ck_free(probe_case_dir);
+    if (probe_terminal_dir) ck_free(probe_terminal_dir);
+    if (probe_rlimit_dir) ck_free(probe_rlimit_dir);
   }
 
   afl_state_t *afl;
+
+  // Probe inputs are retained for diagnosis, but never under AFL's queue.
+  char *probe_case_dir = nullptr;
+  char *probe_terminal_dir = nullptr;
+  char *probe_rlimit_dir = nullptr;
+  uint64_t probe_case_seq = 0;
 
   pcbt::Tree tree;
   std::unordered_set<std::string> traced_entries;
@@ -121,9 +131,6 @@ struct my_mutator_t {
   // AFL++ confirms the coverage gain.
   bool root_shm_capture = false;
   bool root_shm_enabled = true;
-  bool terminal_validation_pending = false;
-  pcbt::NodeRef terminal_validation_node = pcbt::kUnexplored;
-  uint8_t terminal_validation_dir = 0;
   int full_stream_read_fd = -1;
   int full_stream_write_fd = -1;
 
@@ -139,7 +146,6 @@ struct my_mutator_t {
   bool saturation_logged = false;
   uint64_t single_pass_captures = 0;
   uint64_t single_pass_overflows = 0;
-  uint64_t admit_terminal_validation = 0;
 
   // replay checker (SYMAFL_REPLAY_CHECK=1)
   bool replay_check = false;
@@ -534,15 +540,35 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     fprintf(stderr, "[pcbt] veto probe enabled: execute every %lluth "
             "vetoed candidate to measure incorrect-veto rate\n",
             (unsigned long long)parsed);
+
+    const char *probe_dir = getenv("SYMAFL_PROBE_CASE_DIR");
+    data->probe_case_dir = probe_dir && *probe_dir
+        ? (char *)ck_strdup((u8 *)probe_dir)
+        : alloc_printf("%s/probes", data->afl->out_dir);
+    if (mkdir(data->probe_case_dir, 0755) && errno != EEXIST) {
+      PFATAL("cannot create SYMAFL probe case directory %s",
+             data->probe_case_dir);
+    }
+    data->probe_terminal_dir = alloc_printf("%s/terminal", data->probe_case_dir);
+    data->probe_rlimit_dir = alloc_printf("%s/rlimit", data->probe_case_dir);
+    if (mkdir(data->probe_terminal_dir, 0755) && errno != EEXIST) {
+      PFATAL("cannot create terminal probe directory %s",
+             data->probe_terminal_dir);
+    }
+    if (mkdir(data->probe_rlimit_dir, 0755) && errno != EEXIST) {
+      PFATAL("cannot create rlimit probe directory %s",
+             data->probe_rlimit_dir);
+    }
+    fprintf(stderr, "[pcbt] probe cases: %s (queue/bitmap isolated)\n",
+            data->probe_case_dir);
   }
   if (getenv("SYMAFL_PROBE_DIAG")) {
     data->probe_diag = true;
     fprintf(stderr, "[pcbt] probe diagnostic enabled (SYMAFL_PROBE_DIAG=1)\n");
   }
   if (getenv("SYMAFL_PROBE_LEARN")) {
-    data->probe_learn = true;
-    fprintf(stderr, "[pcbt] rlimit probe learning enabled; terminal edges "
-                    "remain immutable\n");
+    fprintf(stderr, "[pcbt] SYMAFL_PROBE_LEARN is ignored: probes are "
+                    "measurement-only and cannot mutate the PCBT\n");
   }
   if (const char *pl = getenv("SYMAFL_PAIR_LOG")) {
     data->pair_log = fopen(pl, "w");
@@ -625,7 +651,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "[pcbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
           "opaque=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
           "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
-          "single_pass=%llu single_pass_overflow=%llu admit_terminal_validation=%llu "
+          "single_pass=%llu single_pass_overflow=%llu "
           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu "
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
@@ -647,7 +673,6 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)(data->screening ? 0 : 1),
           (unsigned long long)data->single_pass_captures,
           (unsigned long long)data->single_pass_overflows,
-          (unsigned long long)data->admit_terminal_validation,
           (unsigned long long)t.check_admit_empty,
           (unsigned long long)t.check_admit_opaque,
           (unsigned long long)t.check_admit_eval_failure,
@@ -1057,17 +1082,10 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   std::vector<pcbt::Event> events;
   events.reserve(4096);
   if (!decode_pipe_events(data, &events, fname)) {
-    if (data->terminal_validation_pending)
-      data->tree.mark_unstable(data->terminal_validation_node);
     disarm_capture(data);
     return false;
   }
-  if (events.empty() && data->terminal_validation_pending) {
-    data->tree.mark_unstable(data->terminal_validation_node);
-  }
   if (!replay_check_trace(data, events, buf, buf_size, fname, false)) {
-    if (data->terminal_validation_pending)
-      data->tree.mark_unstable(data->terminal_validation_node);
     disarm_capture(data);
     return false;
   }
@@ -1227,6 +1245,22 @@ static bool read_queue_file(const char *fname, std::vector<u8> *buf) {
   return got == (ssize_t)buf->size();
 }
 
+static char *save_probe_case(my_mutator_t *data, const u8 *buf, size_t len,
+                             uint8_t veto_kind) {
+  const char *dir = veto_kind == 0 ? data->probe_terminal_dir
+                                   : data->probe_rlimit_dir;
+  if (!dir) return nullptr;
+  char *path = alloc_printf("%s/probe-%06llu", dir,
+                            (unsigned long long)data->probe_case_seq++);
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) {
+    PFATAL("cannot create probe case %s", path);
+  }
+  ck_write(fd, buf, len, path);
+  close(fd);
+  return path;
+}
+
 // The bootstrap input is AFL's .cur_input; replay validation needs its real
 // bytes and length (Len nodes evaluate against the candidate length, so a
 // null buffer / zero length mispredicts length-boundary predicates).
@@ -1363,23 +1397,6 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
     if (!data->probe_capture_pending) disarm_capture(data);
     return;
   }
-  if (data->terminal_validation_pending) {
-    std::vector<u8> buf;
-    const bool have_input = read_cur_input(data, &buf);
-    bool validated = false;
-    if (have_input && data->single_pass_armed &&
-        __atomic_load_n(&data->single_pass_control->mode,
-                        __ATOMIC_ACQUIRE) == SYMAFL_TRACE_FULL_STREAM) {
-      validated = insert_full_stream(data, buf.data(), buf.size(),
-                                     "terminal-validation");
-    }
-    if (!validated)
-      data->tree.mark_unstable(data->terminal_validation_node);
-    data->terminal_validation_pending = false;
-    data->terminal_validation_node = pcbt::kUnexplored;
-    data->last_node = pcbt::kUnexplored;
-    return;
-  }
   if (data->bootstrap_done) {
     // Admitted-run diagnostic: does the frontier suffix carry decisions
     // (tree gain) even when the run gains no bitmap coverage?
@@ -1440,86 +1457,54 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   return 1;
 }
 
-extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
-                                         const u8 *filename_new_queue,
-                                         const u8 *filename_orig_queue) {
-  (void)filename_orig_queue;
-  // A veto-probe that gained coverage. Only an rlimit probe has a still-open
-  // frontier, so only that class may feed InsertSuffix. Terminal probe gains
-  // remain diagnostics; reopening a terminal would violate the tree contract.
-  if (data->last_was_probe) {
-    data->last_was_probe = false;
+// AFL++ calls this before its normal save/queue path for a SymAFL probe. The
+// probe result is measured against a temporary virgin bitmap in AFL++, then
+// retained outside the queue for replay diagnostics. It never updates the
+// PCBT, AFL virgin_bits, scheduler queue, or admitted-gain counters.
+extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
+                                         size_t buf_size, u8 new_bits) {
+  if (getenv("SYMAFL_MUTATOR_QUEUE_DIAG")) {
+    fprintf(stderr,
+            "[mutator-probe] marker=%u kind=%u new_bits=%u len=%zu pending=%u\n",
+            data->last_was_probe ? 1u : 0u,
+            (unsigned)data->afl->pcbt_candidate_kind, new_bits, buf_size,
+            data->probe_capture_pending ? 1u : 0u);
+  }
+  if (!data->last_was_probe) return;
+
+  char *probe_path = nullptr;
+  if (new_bits) {
+    probe_path = save_probe_case(data, buf, buf_size,
+                                 data->last_probe_veto_kind);
+    if (!probe_path) FATAL("probe case directory is not initialized");
     data->veto_probe_gained += 1;
     if (data->last_probe_veto_kind == 0)
       data->probe_gained_terminal += 1;
     else
       data->probe_gained_rlimit += 1;
     if (data->probe_gained_log) {
-      fprintf(data->probe_gained_log, "kind=%u node=%u dir=%u %s suffix=%s\n",
+      fprintf(data->probe_gained_log,
+              "kind=%u node=%u dir=%u %s suffix=%s\n",
               data->last_probe_veto_kind, data->last_veto_node,
-              data->last_veto_dir, filename_new_queue,
+              data->last_veto_dir, probe_path,
               data->last_probe_suffix_nonempty
                   ? "nonempty"
                   : data->last_probe_suffix_overflow ? "overflow" : "empty");
       fflush(data->probe_gained_log);
     }
-    record_veto_probe_pair(data, (const char *)filename_new_queue);
-
-    bool learned = false;
-    if (data->probe_learn && data->last_probe_veto_kind == 1 &&
-        data->probe_capture_pending &&
-        data->probe_capture_node != pcbt::kUnexplored) {
-      std::vector<u8> buf;
-      const bool have_input = read_queue_file(
-          (const char *)filename_new_queue, &buf);
-      const pcbt::NodeRef node = data->probe_capture_node;
-      const uint8_t dir = data->probe_capture_dir;
-      if (have_input && data->single_pass_armed) {
-        data->last_node = node;
-        data->last_dir = dir;
-        uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
-                                        __ATOMIC_ACQUIRE);
-        pcbt::NodeRef tail_node = pcbt::kUnexplored;
-        uint8_t tail_dir = 0;
-        learned = mode == SYMAFL_TRACE_SUFFIX_SHM
-            ? insert_suffix_capture(data, buf.data(), buf.size(),
-                                    (const char *)filename_new_queue,
-                                    &tail_node, &tail_dir)
-            : mode == SYMAFL_TRACE_SUFFIX_PIPE
-                  ? insert_pipe_suffix_capture(
-                        data, buf.data(), buf.size(),
-                        (const char *)filename_new_queue, &tail_node, &tail_dir)
-                  : false;
-        // SHM overflow is a confirmed coverage gain, so replay the same bytes
-        // with pipe-suffix using the same frontier before giving up.
-        if (!learned && !data->single_pass_armed) {
-          learned = replay_pipe_suffix(data, buf.data(), buf.size(),
-                                       (const char *)filename_new_queue,
-                                       node, dir);
-        }
-      }
-      data->last_node = pcbt::kUnexplored;
-      data->probe_capture_pending = false;
-      data->probe_capture_node = pcbt::kUnexplored;
-      if (learned) data->probe_learned += 1;
-      else data->probe_learn_failed += 1;
-    }
-    if (!data->probe_capture_pending && data->single_pass_armed)
-      disarm_capture(data);
+    record_veto_probe_pair(data, probe_path);
     if (data->sat_window) data->sat_probe_gained += 1;
     if (data->probe_diag) {
       if (data->last_probe_suffix_nonempty) data->probe_gained_nonempty += 1;
-      else if (data->last_probe_suffix_overflow) data->probe_gained_overflow += 1;
-      else data->probe_gained_empty += 1;
-      // Capture real vetoed-gainful cases for event-free divergence
-      // forensics: the queue file holds the input, the veto position
-      // identifies where the tree claimed termination, and the suffix class
-      // tells whether the real decision trace continued past it.
+      else if (data->last_probe_suffix_overflow)
+        data->probe_gained_overflow += 1;
+      else
+        data->probe_gained_empty += 1;
       fprintf(stderr,
-              "[pcbt-diag] gained-case probe file=%s len=%u veto_depth=%u "
+              "[pcbt-diag] gained-case probe file=%s len=%zu veto_depth=%u "
               "veto_node=%u veto_cid=%u veto_dir=%u veto_kind=%u suffix=%s\n",
-              filename_new_queue, data->last_probe_input_len,
-              data->last_veto_depth, data->last_veto_node,
+              probe_path, buf_size, data->last_veto_depth,
+              data->last_veto_node,
               data->last_veto_node != pcbt::kUnexplored
                   ? data->tree.cid_of(data->last_veto_node)
                   : 0u,
@@ -1528,28 +1513,61 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                   ? "nonempty"
                   : data->last_probe_suffix_overflow ? "overflow" : "empty");
     }
-    data->last_probe_suffix_overflow = false;
-    data->last_gained = true;
+  }
+
+  // Probe capture is diagnostic only. In particular, SYMAFL_PROBE_LEARN must
+  // not turn a measurement probe into a PCBT mutation or a future admit.
+  data->probe_capture_pending = false;
+  data->probe_capture_node = pcbt::kUnexplored;
+  if (data->single_pass_armed) disarm_capture(data);
+  data->last_probe_suffix_overflow = false;
+  data->last_was_probe = false;
+  data->last_gained = false;
+  if (probe_path) ck_free(probe_path);
+}
+
+extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
+                                         const u8 *filename_new_queue,
+                                         const u8 *filename_orig_queue) {
+  (void)filename_orig_queue;
+  if (getenv("SYMAFL_MUTATOR_QUEUE_DIAG")) {
+    fprintf(stderr,
+            "[mutator-queue] marker=%u bootstrap=%u screening=%u "
+            "concrete=%u fname=%s\n",
+            data->last_was_probe ? 1u : 0u, data->bootstrap_done ? 1u : 0u,
+            data->screening ? 1u : 0u,
+            data->afl->pcbt_concrete_active ? 1u : 0u,
+            filename_new_queue ? (const char *)filename_new_queue : "(null)");
+  }
+  // Probe results are consumed by afl_custom_probe_result before AFL creates a
+  // queue entry. Keep this defensive branch inert if an older AFL++ callback
+  // path invokes queue_new_entry unexpectedly.
+  if (data->last_was_probe) {
+    data->last_was_probe = false;
+    data->probe_capture_pending = false;
+    data->probe_capture_node = pcbt::kUnexplored;
+    if (data->single_pass_armed) disarm_capture(data);
     return 0;
   }
   // Seeds and post-saturation concrete-phase gains are not PCBT admissions.
   if (!data->bootstrap_done || !data->screening) return 0;
-  if (data->admitted_gained_log) {
-    fprintf(data->admitted_gained_log, "node=%u dir=%u root=%u %s\n",
-            data->last_node, data->last_dir,
-            data->root_shm_capture ? 1u : 0u, filename_new_queue);
-    fflush(data->admitted_gained_log);
-  }
-  data->traced_entries.insert((const char *)filename_new_queue);
   // This admitted run gained coverage, so its suffix is tree material:
   // post_run inserts nothing (non-gaining runs only bump rCnt), and the
   // run's SHM capture is still armed for us to consume here.
-  if (!data->single_pass_armed) return 0;
+  if (!data->single_pass_armed) {
+    data->last_gained = false;
+    data->failed_runs += 1;
+    WARNF("coverage-gaining admitted entry has no trace capture: %s\n",
+          filename_new_queue);
+    return 0;
+  }
   const char *fname = (const char *)filename_new_queue;
   std::vector<u8> buf;
   if (!read_queue_file(fname, &buf)) {
     WARNF("cannot read coverage-gaining queue entry %s\n", fname);
     disarm_capture(data);
+    data->last_gained = false;
+    data->failed_runs += 1;
     return 0;
   }
   uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
@@ -1569,13 +1587,26 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                   ? insert_full_stream(data, buf.data(), buf.size(), fname,
                                        &tail_node, &tail_dir)
                   : false;
-  if (inserted) record_admitted_pair(data, tail_node, tail_dir);
+  bool committed = inserted;
   if (!inserted && root_capture) {
-    (void)replay_full_capture(data, buf.data(), buf.size(), fname);
+    committed = replay_full_capture(data, buf.data(), buf.size(), fname);
   } else if (!inserted && node != pcbt::kUnexplored) {
-    (void)replay_pipe_suffix(data, buf.data(), buf.size(), fname, node, dir);
+    committed = replay_pipe_suffix(data, buf.data(), buf.size(), fname, node,
+                                   dir);
   }
-  data->last_gained = true;
+  if (committed) {
+    if (data->admitted_gained_log) {
+      fprintf(data->admitted_gained_log, "node=%u dir=%u root=%u %s\n",
+              data->last_node, data->last_dir,
+              data->root_shm_capture ? 1u : 0u, filename_new_queue);
+      fflush(data->admitted_gained_log);
+    }
+    data->traced_entries.insert((const char *)filename_new_queue);
+    record_admitted_pair(data, tail_node, tail_dir);
+  } else {
+    WARNF("coverage-gaining admitted entry was not inserted: %s\n", fname);
+  }
+  data->last_gained = committed;
   return 0;
 }
 
@@ -1584,14 +1615,9 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
 /// this candidate entirely.
 extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                           size_t buf_size, u8 **out_buf) {
-  // A timed-out validation child may not reach post_run.  Do not leave its
-  // terminal edge trusted for subsequent candidates.
-  if (data->terminal_validation_pending) {
-    if (data->single_pass_armed) disarm_capture(data);
-    data->tree.mark_unstable(data->terminal_validation_node);
-    data->terminal_validation_pending = false;
-    data->terminal_validation_node = pcbt::kUnexplored;
-  }
+  // Candidate kind is valid only for the current post_process decision.
+  data->afl->pcbt_probe_active = 0;
+  data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_NONE;
   // A probe capture is consumed by queue_new_entry only when AFL reports a
   // coverage gain. A non-gaining probe reaches this next callback with no
   // queue entry, so discard its suffix before screening the next candidate.
@@ -1641,6 +1667,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   if (!data->screening) {
     data->screened += 1;
     data->admitted += 1;
+    data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
     write_progress(data, false);
     *out_buf = buf;
     return buf_size;
@@ -1654,24 +1681,8 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                     &data->last_veto_node,
                                     &data->last_veto_dir,
                                     &data->last_veto_kind);
-  bool terminal_validation =
-      !admitted && data->last_veto_kind == 0 &&
-      data->tree.terminal_needs_validation(data->last_veto_node,
-                                           data->last_veto_dir);
-  if (terminal_validation) {
-    // A terminal edge is not a proof until one complete later trace confirms
-    // that the candidate has no symbolic event beyond the edge.  Keep the
-    // API's terminal classification intact, but turn this first hit into a
-    // full-trace admission owned by the mutator.
-    admitted = true;
-    node = data->last_veto_node;
-    dir = data->last_veto_dir;
-    data->terminal_validation_pending = true;
-    data->terminal_validation_node = node;
-    data->terminal_validation_dir = dir;
-    data->admit_terminal_validation += 1;
-  }
   if (admitted) {
+    data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
     data->admitted += 1;
     data->vetoes_since_admit = 0;
     data->last_gained = false;
@@ -1683,11 +1694,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     // therefore reserved for bootstrap and confirmed overflow replays.
     // When replay_check is enabled, always use full-pipe so the complete
     // trace can be compared against the current tree before insertion.
-    if (terminal_validation) {
-      data->last_node = pcbt::kUnexplored;
-      data->last_dir = 0;
-      arm_full_capture(data);
-    } else if (!data->bootstrap_done || data->replay_check) {
+    if (!data->bootstrap_done || data->replay_check) {
       data->last_node = node;
       data->last_dir = dir;
       arm_full_capture(data);
@@ -1707,6 +1714,9 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
 
   data->vetoed += 1;
   ++data->vetoes_since_admit;
+  data->afl->pcbt_candidate_kind =
+      data->last_veto_kind == 0 ? PCBT_CANDIDATE_VETO_TERMINAL
+                                : PCBT_CANDIDATE_VETO_RLIMIT;
   write_progress(data, false);
   if (data->probe_diag) {
     // Veto depth histogram (16-deep buckets; >=256 in the last).
@@ -1725,6 +1735,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     data->veto_probe_count = 0;
     data->veto_probe_admitted += 1;
     data->last_was_probe = true;
+    data->afl->pcbt_probe_active = 1;
     data->last_gained = false;
     data->last_node = pcbt::kUnexplored;
     data->last_probe_veto_kind = data->last_veto_kind;
@@ -1816,7 +1827,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu opaque=%llu "
            "failed=%llu timeouts=%llu memerr=%llu "
            "screened=%llu admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
-           "single_pass=%llu single_pass_overflow=%llu admit_terminal_validation=%llu "
+           "single_pass=%llu single_pass_overflow=%llu "
            "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
            "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu "
            "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
@@ -1837,7 +1848,6 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)(data->screening ? 0 : 1),
            (unsigned long long)data->single_pass_captures,
            (unsigned long long)data->single_pass_overflows,
-           (unsigned long long)data->admit_terminal_validation,
            (unsigned long long)t.check_admit_empty,
            (unsigned long long)t.check_admit_opaque,
            (unsigned long long)t.check_admit_eval_failure,

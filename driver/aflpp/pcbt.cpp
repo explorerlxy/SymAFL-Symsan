@@ -237,8 +237,6 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       // constraint value) produced no further symbolic decisions, so the
       // branch terminates here.
       node(parent).child[dir] = kTerminal;
-    } else if (node(parent).child[dir] == kTerminal) {
-      node(parent).terminal_checked[dir] = true;
     }
     if (out_tail_node) *out_tail_node = parent;
     if (out_tail_dir) *out_tail_dir = dir;
@@ -292,7 +290,6 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   // it. The value-fork direction (dir-0) of a chain node is untouched and
   // stays unexplored.
   node(parent).child[dir] = kTerminal;
-  node(parent).terminal_checked[dir] = false;
   num_nodes += created;
   if (trace_depth > max_depth) max_depth = trace_depth;
   if (out_tail_node) *out_tail_node = parent;
@@ -332,7 +329,6 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     // of being hard-closed.
     if (!node(parent).constraint) {
       node(parent).child[direction] = kTerminal;
-      node(parent).terminal_checked[direction] = false;
     }
     // The edge this insertion closed (or left unexplored on a constraint
     // value-fork) is parent->direction.
@@ -379,7 +375,6 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   // comment): a constraint tail records the pinned value's branch as
   // terminal — the constraint node's dir-1 edge is explored at creation.
   node(cur).child[dir] = kTerminal;
-  node(cur).terminal_checked[dir] = false;
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
   if (out_tail_node) *out_tail_node = cur;
@@ -532,12 +527,11 @@ void Tree::Dump(const char *path) const {
   FILE *f = fopen(path, "w");
   if (!f) return;
   fprintf(f, "# pcbt tree dump v2\n");
-  fprintf(f, "# node cid depth skipCnt constraint unstable checked0 checked1 len_related child0 child1 rcnt0 rcnt1\n");
+  fprintf(f, "# node cid depth skipCnt constraint unstable len_related child0 child1 rcnt0 rcnt1\n");
   for (NodeRef ref = 0; ref < nodes_.size(); ++ref) {
     const Node &n = node(ref);
-    fprintf(f, "%u %u %u %u %u %u %u %u %u %u %u %u %u\n", ref, n.cid,
+    fprintf(f, "%u %u %u %u %u %u %u %u %u %u %u\n", ref, n.cid,
             n.depth, n.skipCnt, n.constraint ? 1 : 0, n.unstable ? 1 : 0,
-            n.terminal_checked[0] ? 1 : 0, n.terminal_checked[1] ? 1 : 0,
             n.len_related ? 1 : 0, n.child[0], n.child[1], n.rCnt[0],
             n.rCnt[1]);
   }
