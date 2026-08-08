@@ -417,11 +417,9 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
   // values_/stamps_ was the profiled check cost at large arena sizes).
   EvalContext &eval = check_eval_;
   eval.Reset();
-  bool path_has_constraint = false;
   while (true) {
     walked += 1;
     const Node &current = node(cur);
-    path_has_constraint = path_has_constraint || current.constraint;
     if (debug_) {
       fprintf(stderr, "[eval] node=%u cid=%u skip=%u depth=%u cons=%d\n",
               cur, current.cid, current.skipCnt, current.depth,
@@ -452,13 +450,6 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                            ? current.child[0]
                            : current.child[1];
         if (next == kTerminal) {
-          if (path_has_constraint) {
-            *out_node = kUnexplored;
-            *out_dir = 0;
-            check_admit_constraint_terminal += 1;
-            finish_profile(1, walked);
-            return true;
-          }
           *out_node = kUnexplored;
           *out_dir = 0;
           if (out_veto_depth) *out_veto_depth = current.depth;
@@ -501,20 +492,6 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
               next, current.child[0], current.child[1]);
     }
     if (next == kTerminal) {
-      // A constraint node represents a multi-successor decision whose
-      // symbolic event can be absent or change shape on another input.  Once
-      // a candidate has crossed such a node, the stored predicate path is
-      // not a complete termination proof: the candidate may emit a later
-      // event after the recorded terminal edge.  Admit with a root capture so
-      // the complete trace can validate or extend the tree.  The terminal
-      // edge remains unchanged and is never reopened speculatively.
-      if (path_has_constraint) {
-        *out_node = kUnexplored;
-        *out_dir = 0;
-        check_admit_constraint_terminal += 1;
-        finish_profile(1, walked);
-        return true;
-      }
       // Terminal vetoes at length/count-family nodes can be untrustworthy
       // (same-prefix candidates legitimately continue when their length
       // counter carries a symbolic shadow the traced path never had), but

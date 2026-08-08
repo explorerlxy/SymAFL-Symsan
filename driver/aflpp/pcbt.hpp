@@ -229,10 +229,6 @@ class Tree {
   uint64_t check_admit_eval_failure = 0;
   uint64_t check_admit_frontier = 0;
   uint64_t check_admit_len_veto = 0;  // terminal veto downgraded to admit
-  // A terminal route crossed a multi-successor constraint.  Its stored
-  // predicate is not a complete proof of termination, so the candidate is
-  // admitted for a complete trace instead of being vetoed.
-  uint64_t check_admit_constraint_terminal = 0;
   uint64_t check_admit_unstable = 0;
   uint64_t check_veto_terminal = 0;
   uint64_t check_veto_rlimit = 0;
