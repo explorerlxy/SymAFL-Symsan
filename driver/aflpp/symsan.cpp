@@ -111,6 +111,7 @@ struct my_mutator_t {
   // screening state (post_process)
   bool screening = true;
   uint8_t rlimit = 16;
+  uint8_t len_rlimit = 16;
   pcbt::NodeRef last_node = pcbt::kUnexplored;
   uint8_t last_dir = 0;
   bool last_gained = true;
@@ -169,6 +170,9 @@ struct my_mutator_t {
   uint64_t profile_insert_calls = 0;
   uint64_t profile_replay_ns = 0;
   uint64_t profile_replay_calls = 0;
+  uint64_t profile_exec_ns = 0;      // forkserver target execution wall time
+  uint64_t profile_exec_calls = 0;
+  bool profile_exec_armed = false;   // current post_process admits a concolic run
 
   // Veto-probe (SYMAFL_VETO_PROBE_EVERY=N, default 0=off): execute every Nth
   // vetoed candidate as a measurement probe so we can observe whether the
@@ -351,10 +355,22 @@ static bool check_input_timed(my_mutator_t *data, const u8 *buf,
   uint64_t start = profile_start(data);
   bool admitted = data->tree.CheckInput(buf, buf_size, node, dir,
                                         data->rlimit, veto_depth, veto_node,
-                                        veto_dir, veto_kind);
+                                        veto_dir, veto_kind,
+                                        data->len_rlimit);
   profile_stop(data, start, &data->profile_check_ns,
                &data->profile_check_calls);
   return admitted;
+}
+
+// AFL++ measures exactly around afl_fsrv_run_target() and reports the result
+// here. Only an admitted concolic candidate arms this counter; veto probes and
+// post-saturation concrete executions are excluded from exec/s.
+extern "C" void afl_custom_exec_time(my_mutator_t *data,
+                                      uint64_t elapsed_ns) {
+  if (!data->profile_exec_armed) return;
+  data->profile_exec_ns += elapsed_ns;
+  data->profile_exec_calls += 1;
+  data->profile_exec_armed = false;
 }
 
 static void print_concolic_phase_snapshot(const my_mutator_t *data) {
@@ -529,6 +545,17 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     }
     data->rlimit = (uint8_t)parsed;
   }
+  data->len_rlimit = data->rlimit;
+  if (const char *lrl = getenv("SYMAFL_LEN_RCNT_LIMIT")) {
+    char *end = nullptr;
+    unsigned long parsed = strtoul(lrl, &end, 10);
+    if (end == lrl || *end != '\0' || parsed > UINT8_MAX) {
+      FATAL("Invalid SYMAFL_LEN_RCNT_LIMIT=%s (expected 0..255)", lrl);
+    }
+    data->len_rlimit = (uint8_t)parsed;
+  }
+  fprintf(stderr, "[pcbt] retry limits: base=%u len_constraint=%u\n",
+          (unsigned)data->rlimit, (unsigned)data->len_rlimit);
   if (const char *vp = getenv("SYMAFL_VETO_PROBE_EVERY")) {
     char *end = nullptr;
     unsigned long long parsed = strtoull(vp, &end, 10);
@@ -657,7 +684,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
           "replay_ns=%llu replay_calls=%llu decode_ns=%llu decode_calls=%llu "
-          "insert_ns=%llu insert_calls=%llu\n",
+          "insert_ns=%llu insert_calls=%llu exec_ns=%llu exec_calls=%llu\n",
           (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
           (unsigned long long)t.num_pred_nodes(),
           (unsigned long long)t.max_depth,
@@ -695,7 +722,9 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->profile_decode_ns,
           (unsigned long long)data->profile_decode_calls,
           (unsigned long long)data->profile_insert_ns,
-          (unsigned long long)data->profile_insert_calls);
+          (unsigned long long)data->profile_insert_calls,
+          (unsigned long long)data->profile_exec_ns,
+          (unsigned long long)data->profile_exec_calls);
   if (data->profile_enabled) {
     const uint64_t calls = data->profile_check_calls;
     fprintf(stderr,
@@ -795,7 +824,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
       uint8_t vdir = 0, vkind = 0;
       bool adm = data->tree.CheckInput(buf.data(), (uint32_t)buf.size(),
                                        &node, &dir, data->rlimit, &vdepth,
-                                       &vnode, &vdir, &vkind);
+                                       &vnode, &vdir, &vkind,
+                                       data->len_rlimit);
       fprintf(stderr,
               "[pcbt-eval] %s admitted=%d node=%u dir=%u veto_node=%u "
               "veto_dir=%u veto_depth=%u veto_kind=%u\n",
@@ -1008,7 +1038,11 @@ static bool replay_check_trace(my_mutator_t *data,
                                const u8 *buf, size_t buf_size,
                                const char *fname, bool is_suffix) {
   if (!data->replay_check) return true;
-  if (events.empty()) return true;  // empty trace, nothing to check
+  // A full capture must validate an empty stream against the learned tree:
+  // an empty child trace can be truncated before the next learned event. A
+  // suffix intentionally omits the known prefix and cannot use this replay
+  // walk without reconstructing that prefix.
+  if (events.empty() && is_suffix) return true;
 
   data->replay_checked += 1;
   auto report = data->tree.ReplayFullTrace(events, buf,
@@ -1478,10 +1512,13 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
                                  data->last_probe_veto_kind);
     if (!probe_path) FATAL("probe case directory is not initialized");
     data->veto_probe_gained += 1;
-    if (data->last_probe_veto_kind == 0)
+    if (data->last_probe_veto_kind == 0) {
       data->probe_gained_terminal += 1;
-    else
+      WARNF("terminal-veto-but-gain detected; stopping quality run\n");
+      data->afl->stop_soon = 1;
+    } else {
       data->probe_gained_rlimit += 1;
+    }
     if (data->probe_gained_log) {
       fprintf(data->probe_gained_log,
               "kind=%u node=%u dir=%u %s suffix=%s\n",
@@ -1615,6 +1652,7 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
 /// this candidate entirely.
 extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                           size_t buf_size, u8 **out_buf) {
+  data->profile_exec_armed = false;
   // Candidate kind is valid only for the current post_process decision.
   data->afl->pcbt_probe_active = 0;
   data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_NONE;
@@ -1667,6 +1705,8 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   if (!data->screening) {
     data->screened += 1;
     data->admitted += 1;
+    data->profile_exec_armed = data->profile_enabled &&
+                               !data->afl->pcbt_concrete_active;
     data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
     write_progress(data, false);
     *out_buf = buf;
@@ -1682,6 +1722,8 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                     &data->last_veto_dir,
                                     &data->last_veto_kind);
   if (admitted) {
+    data->profile_exec_armed = data->profile_enabled &&
+                               !data->afl->pcbt_concrete_active;
     data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
     data->admitted += 1;
     data->vetoes_since_admit = 0;
@@ -1802,7 +1844,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   // A saturated PCBT is a phase boundary, not a local screening fallback.
   // Let AFL++ perform the restart at its next scheduler boundary, where it
   // can safely replace the forkserver and rebuild its coverage state.
-  if (data->tree.IsSaturated(data->rlimit)) {
+  if (data->tree.IsSaturated(data->rlimit, data->len_rlimit)) {
     data->screening = false;
     data->afl->pcbt_switch_pending = 1;
     if (!data->saturation_logged) {
@@ -1832,7 +1874,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu probe_admitted=%llu probe_gained=%llu "
            "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
            "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
-           "replay_ns=%llu replay_calls=%llu",
+           "replay_ns=%llu replay_calls=%llu exec_ns=%llu exec_calls=%llu",
            (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
            (unsigned long long)t.num_pred_nodes(),
            (unsigned long long)t.max_depth,
@@ -1866,6 +1908,8 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)data->profile_trace_ns,
            (unsigned long long)data->profile_trace_calls,
            (unsigned long long)data->profile_replay_ns,
-           (unsigned long long)data->profile_replay_calls);
+           (unsigned long long)data->profile_replay_calls,
+           (unsigned long long)data->profile_exec_ns,
+           (unsigned long long)data->profile_exec_calls);
   return buf;
 }

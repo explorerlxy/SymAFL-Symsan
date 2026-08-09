@@ -33,6 +33,7 @@ enum class PKind : uint8_t {
   Not, And, Or, Xor, Shl, LShr, AShr,
   Equal, Distinct, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge,
   ZExt, SExt, Extract, Concat, Memcmp,
+  Ctlz, Cttz,
   // Input-length boundary nodes (flen_* labels). `len` is the eval-time
   // candidate length; a missing byte evaluates as EOF (masked -1 at width).
   Len,      // leaf: value ignored; eval = mask_bits(len, bits)

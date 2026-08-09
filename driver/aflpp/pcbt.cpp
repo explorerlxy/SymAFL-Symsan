@@ -42,6 +42,8 @@ const char *pkind_name(PKind kind) {
     case PKind::Extract: return "extract";
     case PKind::Concat: return "concat";
     case PKind::Memcmp: return "memcmp";
+    case PKind::Ctlz: return "ctlz";
+    case PKind::Cttz: return "cttz";
     case PKind::Len: return "len";
     case PKind::EofRead: return "eofread";
     case PKind::Count: return "count";
@@ -385,7 +387,9 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
 bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                       uint8_t *out_dir, uint8_t rlimit,
                       uint32_t *out_veto_depth, NodeRef *out_veto_node,
-                      uint8_t *out_veto_dir, uint8_t *out_veto_kind) {
+                      uint8_t *out_veto_dir, uint8_t *out_veto_kind,
+                      uint8_t len_rlimit) {
+  if (len_rlimit == 0) len_rlimit = rlimit;
   NodeRef cur = node(kRoot).child[0];
   uint32_t walked = 0;
   EvalStats eval_stats;
@@ -506,7 +510,10 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
     if (next == kUnexplored) {
       *out_node = cur;
       *out_dir = dir;
-      if (current.rCnt[dir] < rlimit) {
+      const uint8_t edge_rlimit = current.constraint && current.len_related
+                                       ? len_rlimit
+                                       : rlimit;
+      if (current.rCnt[dir] < edge_rlimit) {
         check_admit_frontier += 1;
         finish_profile(3, walked);
         return true;
@@ -538,12 +545,13 @@ void Tree::Dump(const char *path) const {
   fclose(f);
 }
 
-bool Tree::IsSaturated(uint8_t rlimit) const {
+bool Tree::IsSaturated(uint8_t rlimit, uint8_t len_rlimit) const {
+  if (len_rlimit == 0) len_rlimit = rlimit;
   NodeRef entry = node(kRoot).child[0];
-  return entry != kUnexplored && IsSaturated(entry, rlimit);
+  return entry != kUnexplored && IsSaturated(entry, rlimit, len_rlimit);
 }
 
-bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit) const {
+bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const {
   const Node &current = node(ref);
   if (current.unstable) return false;
   if (current.pred.opaque) return false;
@@ -551,10 +559,13 @@ bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit) const {
     NodeRef next = current.child[direction];
     if (next == kTerminal) continue;
     if (next == kUnexplored) {
-      if (current.rCnt[direction] < rlimit) return false;
+      const uint8_t edge_rlimit = current.constraint && current.len_related
+                                       ? len_rlimit
+                                       : rlimit;
+      if (current.rCnt[direction] < edge_rlimit) return false;
       continue;
     }
-    if (!IsSaturated(next, rlimit)) return false;
+    if (!IsSaturated(next, rlimit, len_rlimit)) return false;
   }
   return true;
 }

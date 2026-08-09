@@ -138,6 +138,10 @@ static cl::list<std::string> ClABIListFiles(
 // constant-table loads. Kept as a literal here since TaintPass does not
 // include the runtime header.
 static constexpr uint16_t kIdxMergeOp = 113;
+// Keep these literal protocol values aligned with dfsan.h. LLVM 18's
+// last_llvm_op is 67, so ctlz/cttz occupy 118/119.
+static constexpr uint16_t kCtlzOp = 118;
+static constexpr uint16_t kCttzOp = 119;
 
 static cl::opt<bool> ClCombinePointerLabelsOnLoad(
     "taint-combine-pointer-labels-on-load",
@@ -4857,6 +4861,31 @@ void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
       TF.setShadow(&CB, Result);
       return;
     }
+  }
+
+  // Integer bit-count intrinsics return a value derived from their operand;
+  // propagating the operand label as identity would freeze the decoded cursor.
+  if (IId == Intrinsic::ctlz || IId == Intrinsic::cttz) {
+    Type *RetTy = CB.getType();
+    if (!RetTy->isIntegerTy() || RetTy->getIntegerBitWidth() > 64)
+      return;  // unsupported width remains clean/conservative
+    Value *S = TF.getShadow(CB.getArgOperand(0));
+    if (TF.TT.isZeroShadow(S)) return;
+    IRBuilder<> IRB(&CB);
+    uint16_t Op = IId == Intrinsic::ctlz ? kCtlzOp : kCttzOp;
+    uint16_t Bits = static_cast<uint16_t>(RetTy->getIntegerBitWidth());
+    Value *Input = IRB.CreateZExtOrTrunc(CB.getArgOperand(0), TF.TT.Int64Ty);
+    Value *Zero = ConstantInt::get(TF.TT.Int64Ty, 0);
+    CallInst *C = IRB.CreateCall(
+        TF.TT.TaintUnionFn,
+        {S, TF.TT.ZeroPrimitiveShadow,
+         ConstantInt::get(TF.TT.Int16Ty, Op),
+         ConstantInt::get(TF.TT.Int16Ty, Bits), Input, Zero});
+    C->addRetAttr(Attribute::ZExt);
+    C->addParamAttr(0, Attribute::ZExt);
+    C->addParamAttr(1, Attribute::ZExt);
+    TF.setShadow(&CB, C);
+    return;
   }
 
   // Other intrinsics: symbolic propagation not yet implemented — skip.

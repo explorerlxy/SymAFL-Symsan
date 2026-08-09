@@ -319,7 +319,11 @@ enum operators {
   umax            = last_llvm_op + 48, // 115 llvm.umax
   smin            = last_llvm_op + 49, // 116 llvm.smin
   smax            = last_llvm_op + 50, // 117 llvm.smax
-  LastOp          = last_llvm_op + 51, // 118
+  // Integer bit-count intrinsics. Their results need first-class labels rather
+  // than propagating the operand shadow as if ctlz/cttz were identity ops.
+  ctlz            = last_llvm_op + 51, // 118 llvm.ctlz
+  cttz            = last_llvm_op + 52, // 119 llvm.cttz
+  LastOp          = last_llvm_op + 53, // 120
 };
 
 // fmemcmp keeps its base opcode in the low byte. The high bits record whether

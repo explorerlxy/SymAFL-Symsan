@@ -42,8 +42,9 @@ struct Node {
   // Descendants are not safe terminal proofs while this flag is set.
   bool unstable = false;
   // The stored predicate's decision depends on a length/count family leaf
-  // (Len/EofRead/Count/CountNeg1/CountElems). This is retained for diagnosis;
-  // terminal policy does not downgrade these edges to admissions.
+  // (Len/EofRead/Count/CountNeg1/CountElems). For constraint nodes this also
+  // selects the optional length retry budget; terminal policy does not
+  // downgrade these edges to admissions.
   bool len_related = false;
 };
 
@@ -120,7 +121,8 @@ class Tree {
                   uint32_t *out_veto_depth = nullptr,
                   NodeRef *out_veto_node = nullptr,
                   uint8_t *out_veto_dir = nullptr,
-                  uint8_t *out_veto_kind = nullptr);
+                  uint8_t *out_veto_kind = nullptr,
+                  uint8_t len_rlimit = 0);
 
   // Const replay: walk the event vector from kRoot and compare CID order
   // and predicate directions against the tree.  Never mutates any state.
@@ -152,7 +154,7 @@ class Tree {
   ReplayReport ReplayFullTrace(const std::vector<Event> &events,
                                const uint8_t *input, uint32_t len) const;
 
-  bool IsSaturated(uint8_t rlimit) const;
+  bool IsSaturated(uint8_t rlimit, uint8_t len_rlimit = 0) const;
 
   // Dump the tree topology (node id, cid, depth, skipCnt, constraint,
   // unstable, len_related, children, rCnt) to a file for offline forensics.
@@ -239,7 +241,7 @@ class Tree {
   Node &node(NodeRef ref) { return nodes_[ref]; }
   const Node &node(NodeRef ref) const { return nodes_[ref]; }
   NodeRef append(Node &&node);
-  bool IsSaturated(NodeRef ref, uint8_t rlimit) const;
+  bool IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const;
   bool debug_ = false;
   bool profile_ = false;
   // Persistent eval context for CheckInput: the values_/stamps_ vectors are

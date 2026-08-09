@@ -131,7 +131,8 @@ uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
                                   uint32_t op_lo) const {
   if (op == 0 || op_lo == Load) return 0;
   if (op == __dfsan::Extract || op_lo == Trunc ||
-      op_lo == Neg || op_lo == Not || op_lo == ZExt || op_lo == SExt)
+      op_lo == Neg || op_lo == Not || op_lo == ZExt || op_lo == SExt ||
+      op_lo == __dfsan::ctlz || op_lo == __dfsan::cttz)
     return 1;
   if (op == __dfsan::Concat || is_fmemcmp(op) || op_lo == ICmp ||
       op_lo == FCmp || op_lo == Add || op_lo == Sub || op_lo == Mul ||
@@ -296,6 +297,8 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     case Shl: kind = PKind::Shl; binary = true; break;
     case LShr: kind = PKind::LShr; binary = true; break;
     case AShr: kind = PKind::AShr; binary = true; break;
+    case __dfsan::ctlz: kind = PKind::Ctlz; unary = true; break;
+    case __dfsan::cttz: kind = PKind::Cttz; unary = true; break;
     case And: kind = PKind::And; binary = true; break;
     case Or: kind = PKind::Or; binary = true; break;
     case Xor: kind = PKind::Xor; binary = true; break;
@@ -1183,6 +1186,25 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
         v = b >= bits ? (sext_bits(a, bits) < 0 ? mask_bits(~0ull, bits) : 0)
                       : mask_bits((uint64_t)(sext_bits(a, bits) >> b), bits);
         break;
+      case PKind::Ctlz: {
+        uint64_t x = mask_bits(a, bits);
+        if (x == 0) v = bits;
+        else {
+          v = 0;
+          for (int i = (int)bits - 1; i >= 0 && ((x >> i) & 1) == 0; --i)
+            ++v;
+        }
+        break;
+      }
+      case PKind::Cttz: {
+        uint64_t x = mask_bits(a, bits);
+        if (x == 0) v = bits;
+        else {
+          v = 0;
+          while (((x >> v) & 1) == 0) ++v;
+        }
+        break;
+      }
       case PKind::ZExt: v = mask_bits(a, bits); break;
       case PKind::SExt:
         v = mask_bits((uint64_t)sext_bits(a, nodes[nd.a].bits), bits);
