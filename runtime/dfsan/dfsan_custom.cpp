@@ -78,6 +78,13 @@ static inline void clear_shadow_range(void *ptr, size_t bytes) {
   uptr end = start + len;
   uptr body_start = RoundUpTo(start, page);
   uptr body_end = RoundDownTo(end, page);
+  if (body_end <= body_start) {
+    // The allocation is wholly contained in one shadow page.  The head and
+    // tail ranges would overlap in this case; clearing both would erase
+    // neighboring allocations in the same page.
+    internal_memset((void *)start, 0, len);
+    return;
+  }
   if (body_end > body_start) {
     if (madvise((void *)body_start, body_end - body_start, MADV_DONTNEED) != 0) {
       // Fallback for an unmapped or unsupported shadow body: eager zeroing

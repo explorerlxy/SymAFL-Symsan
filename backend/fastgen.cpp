@@ -42,7 +42,7 @@ static inline void __send_ubi(dfsan_label label, uint64_t result,
 // Multi-successor single-decision state for switch statements. A switch over
 // a symbolic condition is one decision point: every candidate contributes
 // exactly one event — the hit case's comparison (or, for the default path, a
-// tautological (cond == cond) event) — at a single stream position, so the
+// pin to the observed switch value) — at a single stream position, so the
 // PCBT value-fork chain (case1 -> dir0 case2 -> dir0 ...) stays
 // position-aligned (skipCnt semantics).
 static struct switch_true_case {
@@ -50,6 +50,7 @@ static struct switch_true_case {
   dfsan_label cond_label;  // switch condition label (default-path event)
   uint32_t cid;            // in-flight switch's cid; 0 = no switch in flight
   uint32_t size;           // condition width in bits
+  uint64_t cond_value;      // concrete switch value on the observed path
 } __switch_true_case = {0};
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -89,8 +90,8 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
   // therefore NOT emitted (it would occupy the same position with a
   // different label, misaligning the stream positions that PCBT's skipCnt
   // semantics rely on). The hit case is kept and emitted as a constraint
-  // event at switch_end; a switch with no matching case emits a
-  // tautological (cond == cond) constraint event there (the default path).
+  // event at switch_end; a switch with no matching case emits a constraint
+  // pinning the observed value there (the default path).
   if (__switch_true_case.cid != cid) {
     // New switch in flight: reset the hit state (a previous switch's hit
     // must not leak into this one).
@@ -98,6 +99,7 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
     __switch_true_case.cond_label = op1;
     __switch_true_case.cid = cid;
     __switch_true_case.size = size;
+    __switch_true_case.cond_value = c1;
   }
   if (r) {
     __switch_true_case.label = temp;
@@ -114,13 +116,14 @@ __taint_trace_switch_end(uint32_t cid) {
 
   dfsan_label label = __switch_true_case.label;
   if (label == 0) {
-    // No case matched (default branch): emit a tautological (cond == cond)
-    // constraint event so the default path occupies the decision point's
-    // stream position and routes through the value-fork chain tail (the
-    // all-false direction of the last case node).
-    label = dfsan_union(__switch_true_case.cond_label,
-                        __switch_true_case.cond_label,
-                        (bveq << 8) | ICmp, __switch_true_case.size, 0, 0);
+    // No case matched (default branch). Pin the observed switch value rather
+    // than emitting cond == cond: the latter is tautological and merges a
+    // later candidate that reaches a real case into the default terminal.
+    // This is the same value-fork discipline used for tainted GEP indices.
+    label = dfsan_union(__switch_true_case.cond_label, 0,
+                        (bveq << 8) | ICmp, __switch_true_case.size,
+                        __switch_true_case.cond_value,
+                        __switch_true_case.cond_value);
   }
 
   AOUT("solving switch end: %u 0x%x @%p\n", label, cid, addr);
@@ -132,6 +135,7 @@ __taint_trace_switch_end(uint32_t cid) {
   __switch_true_case.label = 0;
   __switch_true_case.cond_label = 0;
   __switch_true_case.cid = 0;
+  __switch_true_case.cond_value = 0;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void

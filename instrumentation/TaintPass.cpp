@@ -467,6 +467,11 @@ class Taint {
   FunctionType *TaintSetLabelFnTy;
   FunctionType *TaintNonzeroLabelFnTy;
   FunctionType *TaintVarargWrapperFnTy;
+  FunctionType *TaintVarargPrepareFnTy;
+  FunctionType *TaintVarargStartFnTy;
+  FunctionType *TaintVarargCopyFnTy;
+  FunctionType *TaintVarargArgFnTy;
+  FunctionType *TaintVarargEndFnTy;
   FunctionType *TaintTraceCmpFnTy;
   FunctionType *TaintTraceCondFnTy;
   FunctionType *TaintTraceLoopFnTy;
@@ -493,6 +498,11 @@ class Taint {
   FunctionCallee TaintSetLabelFn;
   FunctionCallee TaintNonzeroLabelFn;
   FunctionCallee TaintVarargWrapperFn;
+  FunctionCallee TaintVarargPrepareFn;
+  FunctionCallee TaintVarargStartFn;
+  FunctionCallee TaintVarargCopyFn;
+  FunctionCallee TaintVarargArgFn;
+  FunctionCallee TaintVarargEndFn;
   FunctionCallee TaintTraceCmpFn;
   FunctionCallee TaintTraceCondFn;
   FunctionCallee TaintTraceLoopFn;
@@ -592,6 +602,7 @@ struct TaintFunction {
   AllocaInst *LabelReturnAlloca = nullptr;
   DenseMap<Value *, Value *> ValShadowMap;
   DenseMap<AllocaInst *, AllocaInst *> AllocaShadowMap;
+  DenseMap<LoadInst *, Value *> VarArgLoadLists;
 
   struct PHIFixupElement {
     PHINode *Phi;
@@ -623,6 +634,7 @@ struct TaintFunction {
         IsForceZeroLabels(IsForceZeroLabels) {
     DT.recalculate(*F);
     LI = new LoopInfo(DT);
+    findVarArgLoads();
     // initialize the pseudo-random number generator with the function name
     srandom(std::hash<std::string>{}(F->getName().str()));
   }
@@ -640,6 +652,7 @@ struct TaintFunction {
   Value *getShadow(Value *V);
   void setShadow(Instruction *I, Value *Shadow);
   Value *combineOperandShadows(CallBase &CB);
+  void findVarArgLoads();
 
   /// Handle nosanitize __dfsw_* calls from UCSan:
   /// emit minimize hints for alloc size args and load retval TLS for non-void.
@@ -742,6 +755,7 @@ public:
   void visitAtomicCmpXchgInst(AtomicCmpXchgInst &I);
   void visitReturnInst(ReturnInst &RI);
   void visitFreezeInst(FreezeInst &FI);
+  void visitVAArgInst(VAArgInst &I);
   void visitCallBase(CallBase &CB);
   void visitPHINode(PHINode &PN);
   void visitExtractElementInst(ExtractElementInst &I);
@@ -1057,6 +1071,17 @@ bool Taint::initializeModule(Module &M) {
       Type::getVoidTy(*Ctx), std::nullopt, /*isVarArg=*/false);
   TaintVarargWrapperFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), PointerType::getUnqual(*Ctx), /*isVarArg=*/false);
+  TaintVarargPrepareFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), {PointerType::getUnqual(*Ctx), Int32Ty}, false);
+  TaintVarargStartFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), PointerType::getUnqual(*Ctx), false);
+  TaintVarargCopyFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx),
+      {PointerType::getUnqual(*Ctx), PointerType::getUnqual(*Ctx)}, false);
+  TaintVarargArgFnTy = FunctionType::get(
+      PrimitiveShadowTy, PointerType::getUnqual(*Ctx), false);
+  TaintVarargEndFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), PointerType::getUnqual(*Ctx), false);
   Type *TaintTraceCmpArgs[7] = { PrimitiveShadowTy, PrimitiveShadowTy,
       Int32Ty, Int32Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceCmpFnTy = FunctionType::get(
@@ -1286,6 +1311,18 @@ void Taint::initializeRuntimeFunctions(Module &M) {
                                                     TaintVarargWrapperFnTy);
   }
   {
+    TaintVarargPrepareFn = Mod->getOrInsertFunction(
+        "__dfsan_vararg_prepare", TaintVarargPrepareFnTy);
+    TaintVarargStartFn =
+        Mod->getOrInsertFunction("__dfsan_vararg_start", TaintVarargStartFnTy);
+    TaintVarargCopyFn =
+        Mod->getOrInsertFunction("__dfsan_vararg_copy", TaintVarargCopyFnTy);
+    TaintVarargArgFn =
+        Mod->getOrInsertFunction("__dfsan_vararg_arg", TaintVarargArgFnTy);
+    TaintVarargEndFn =
+        Mod->getOrInsertFunction("__dfsan_vararg_end", TaintVarargEndFnTy);
+  }
+  {
     TaintDebugFn =
         Mod->getOrInsertFunction("__taint_debug", TaintDebugFnTy);
   }
@@ -1315,6 +1352,16 @@ void Taint::initializeRuntimeFunctions(Module &M) {
       TaintNonzeroLabelFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintVarargWrapperFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintVarargPrepareFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintVarargStartFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintVarargCopyFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintVarargArgFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintVarargEndFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintDebugFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -1783,6 +1830,73 @@ bool Taint::runImpl(Module &M) {
 
   return Changed || !FnsToInstrument.empty() ||
          M.global_size() != InitialGlobalSize || M.size() != InitialModuleSize;
+}
+
+static bool isVaListStructType(Type *T) {
+  auto *ST = dyn_cast<StructType>(T);
+  return ST && ST->getName().contains("__va_list_tag");
+}
+
+static Value *getVaListFieldBase(Value *V) {
+  V = V->stripPointerCasts();
+  auto *GEP = dyn_cast<GetElementPtrInst>(V);
+  if (!GEP || !isVaListStructType(GEP->getSourceElementType()) ||
+      GEP->getNumIndices() == 0)
+    return nullptr;
+
+  auto It = GEP->idx_end();
+  --It;
+  auto *CI = dyn_cast<ConstantInt>(*It);
+  if (!CI || (CI->getZExtValue() != 2 && CI->getZExtValue() != 3))
+    return nullptr;
+  return GEP->getPointerOperand();
+}
+
+static Value *findVaListForDataPointer(Value *V,
+                                       DenseSet<Value *> &Visited) {
+  V = V->stripPointerCasts();
+  if (!Visited.insert(V).second)
+    return nullptr;
+
+  if (auto *LI = dyn_cast<LoadInst>(V)) {
+    if (!LI->getType()->isPointerTy())
+      return nullptr;
+    if (Value *List = getVaListFieldBase(LI->getPointerOperand()))
+      return List;
+    return nullptr;
+  }
+
+  if (auto *GEP = dyn_cast<GetElementPtrInst>(V))
+    return findVaListForDataPointer(GEP->getPointerOperand(), Visited);
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    Value *List = nullptr;
+    for (Value *Incoming : PN->incoming_values()) {
+      Value *IncomingList = findVaListForDataPointer(Incoming, Visited);
+      if (!IncomingList)
+        continue;
+      if (!List)
+        List = IncomingList;
+    }
+    return List;
+  }
+  if (auto *SI = dyn_cast<SelectInst>(V)) {
+    Value *TrueList = findVaListForDataPointer(SI->getTrueValue(), Visited);
+    Value *FalseList = findVaListForDataPointer(SI->getFalseValue(), Visited);
+    return TrueList ? TrueList : FalseList;
+  }
+  return nullptr;
+}
+
+void TaintFunction::findVarArgLoads() {
+  for (Instruction &I : instructions(F)) {
+    auto *LI = dyn_cast<LoadInst>(&I);
+    if (!LI || LI->getType()->isPointerTy())
+      continue;
+    DenseSet<Value *> Visited;
+    if (Value *List = findVaListForDataPointer(LI->getPointerOperand(),
+                                               Visited))
+      VarArgLoadLists[LI] = List;
+  }
 }
 
 Value *TaintFunction::getArgTLS(Type *T, unsigned ArgOffset, IRBuilder<> &IRB) {
@@ -3447,6 +3561,24 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
     return;
   }
 
+  // On x86_64 clang lowers va_arg before the LLVM pass runs.  The resulting
+  // load comes from the register-save/overflow area selected through fields 2
+  // or 3 of __va_list_tag; recover that list and consume its parallel shadow
+  // cursor instead of consulting ordinary application shadow memory.
+  auto VarArgIt = TF.VarArgLoadLists.find(&LI);
+  if (VarArgIt != TF.VarArgLoadLists.end()) {
+    if (ClTraceBound)
+      TF.checkBounds(LI.getPointerOperand(),
+                     ConstantInt::get(TF.TT.Int64Ty, Size), &LI);
+    IRBuilder<> IRB(&LI);
+    Value *List = IRB.CreatePointerCast(VarArgIt->second, TF.TT.VoidPtrTy);
+    CallInst *Shadow = IRB.CreateCall(TF.TT.TaintVarargArgFn, {List});
+    Shadow->addRetAttr(Attribute::ZExt);
+    TF.NonZeroChecks.push_back(Shadow);
+    TF.setShadow(&LI, Shadow);
+    return;
+  }
+
   // When an application load is atomic, increase atomic ordering between
   // atomic application loads and stores to ensure happen-before order; load
   // shadow data after application data; store zero shadow data before
@@ -4079,6 +4211,18 @@ void TaintVisitor::visitFreezeInst(FreezeInst &FI) {
   TF.setShadow(&FI, TF.getShadow(FI.getOperand(0)));
 }
 
+void TaintVisitor::visitVAArgInst(VAArgInst &I) {
+  // The native ABI carries the real varargs, while the shadow values are
+  // staged by the caller and associated with this va_list at va_start.  A
+  // va_arg consumes one shadow in the same order as the concrete ABI.
+  IRBuilder<> IRB(&I);
+  Value *List = IRB.CreatePointerCast(I.getPointerOperand(),
+                                     TF.TT.VoidPtrTy);
+  CallInst *Shadow = IRB.CreateCall(TF.TT.TaintVarargArgFn, {List});
+  Shadow->addRetAttr(Attribute::ZExt);
+  TF.setShadow(&I, Shadow);
+}
+
 void TaintVisitor::visitReturnInst(ReturnInst &RI) {
   Value *RV = RI.getReturnValue();
   if (!TF.IsNativeABI && RV) {
@@ -4451,6 +4595,33 @@ bool TaintVisitor::visitWrappedCallBase(Function *F, CallBase &CB) {
 void TaintVisitor::visitIntrinsicCallBase(Function *F, CallBase &CB) {
   // filter some obvious ones
   StringRef FN = F->getName();
+
+  // Keep the concrete va_list ABI untouched, but maintain a parallel shadow
+  // cursor for each list.  The pending vararg shadow array is installed by
+  // the caller immediately before a native variadic call.
+  switch (F->getIntrinsicID()) {
+  case Intrinsic::vastart: {
+    IRBuilder<> IRB(&CB);
+    Value *List = IRB.CreatePointerCast(CB.getArgOperand(0), TF.TT.VoidPtrTy);
+    IRB.CreateCall(TF.TT.TaintVarargStartFn, {List});
+    return;
+  }
+  case Intrinsic::vaend: {
+    IRBuilder<> IRB(&CB);
+    Value *List = IRB.CreatePointerCast(CB.getArgOperand(0), TF.TT.VoidPtrTy);
+    IRB.CreateCall(TF.TT.TaintVarargEndFn, {List});
+    return;
+  }
+  case Intrinsic::vacopy: {
+    IRBuilder<> IRB(&CB);
+    Value *Dest = IRB.CreatePointerCast(CB.getArgOperand(0), TF.TT.VoidPtrTy);
+    Value *Src = IRB.CreatePointerCast(CB.getArgOperand(1), TF.TT.VoidPtrTy);
+    IRB.CreateCall(TF.TT.TaintVarargCopyFn, {Dest, Src});
+    return;
+  }
+  default:
+    break;
+  }
 
   // Constrained FP intrinsics (llvm.experimental.constrained.*) carry an
   // explicit rounding-mode operand.  Default (non-strict) compilation never
@@ -4974,6 +5145,38 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
                            TF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
                            ShadowTLSAlignment);
     ArgOffset += alignTo(Size, ShadowTLSAlignment);
+  }
+
+  // Native varargs do not have LLVM SSA arguments for their shadow values.
+  // Keep a caller-owned shadow array alive across the call and let the
+  // callee's va_start bind it to its va_list.  This also survives va_list
+  // forwarding through fixed-argument helpers such as TIFFVSetField.
+  if (FT->isVarArg() && F) {
+    unsigned VarArgCount = CB.arg_size() - FT->getNumParams();
+    if (VarArgCount != 0) {
+      auto *LabelVATy = ArrayType::get(TF.TT.PrimitiveShadowTy, VarArgCount);
+      auto *LabelVAAlloca = new AllocaInst(
+          LabelVATy, getDataLayout().getAllocaAddrSpace(), "labelva",
+          &TF.F->getEntryBlock().front());
+      for (unsigned N = 0; N < VarArgCount; ++N) {
+        Value *Shadow = TF.getShadow(CB.getArgOperand(
+            FT->getNumParams() + N));
+        if (Shadow->getType() != TF.TT.PrimitiveShadowTy)
+          Shadow = TF.TT.ZeroPrimitiveShadow;
+        Value *LabelVAPtr = IRB.CreateInBoundsGEP(
+            LabelVATy, LabelVAAlloca,
+            {ConstantInt::get(TF.TT.Int32Ty, 0),
+             ConstantInt::get(TF.TT.Int32Ty, N)});
+        IRB.CreateStore(Shadow, LabelVAPtr);
+      }
+      Value *LabelVAPtr = IRB.CreateInBoundsGEP(
+          LabelVATy, LabelVAAlloca,
+          {ConstantInt::get(TF.TT.Int32Ty, 0),
+           ConstantInt::get(TF.TT.Int32Ty, 0)});
+      IRB.CreateCall(TF.TT.TaintVarargPrepareFn,
+                     {IRB.CreatePointerCast(LabelVAPtr, TF.TT.VoidPtrTy),
+                      ConstantInt::get(TF.TT.Int32Ty, VarArgCount)});
+    }
   }
 
   Instruction *Next = nullptr;

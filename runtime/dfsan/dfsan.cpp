@@ -89,6 +89,32 @@ SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
 SANITIZER_INTERFACE_ATTRIBUTE THREADLOCAL dfsan_label
     __dfsan_arg_tls[kArgTlsSize / sizeof(dfsan_label)];
 
+// A variadic call keeps its native ABI.  The instrumentation therefore stages
+// one shadow label per actual vararg in a caller-owned array and associates
+// that array with the callee's va_list at llvm.va_start.  Fixed-size TLS slots
+// avoid allocator activity in the runtime hot path and support forwarding and
+// va_copy without changing the target ABI.
+struct dfsan_vararg_pending {
+  const dfsan_label *labels;
+  uptr count;
+};
+
+struct dfsan_vararg_state {
+  const void *list;
+  const dfsan_label *labels;
+  uptr count;
+  uptr next;
+  bool active;
+};
+
+static constexpr uptr kDfsanMaxVarargPending = 32;
+static constexpr uptr kDfsanMaxVarargStates = 64;
+static THREADLOCAL dfsan_vararg_pending
+    __dfsan_vararg_pending[kDfsanMaxVarargPending];
+static THREADLOCAL uptr __dfsan_vararg_pending_size;
+static THREADLOCAL dfsan_vararg_state
+    __dfsan_vararg_states[kDfsanMaxVarargStates];
+
 SANITIZER_INTERFACE_ATTRIBUTE uptr __dfsan_shadow_ptr_mask;
 
 // On Linux/x86_64, memory is laid out as follows:
@@ -1252,6 +1278,87 @@ __dfsan_vararg_wrapper(const char *fname) {
   Report("FATAL: DataFlowSanitizer: unsupported indirect call to vararg "
          "function %s\n", fname);
   Die();
+}
+
+static dfsan_vararg_state *dfsan_find_vararg_state(const void *list) {
+  for (uptr i = 0; i < kDfsanMaxVarargStates; ++i) {
+    if (__dfsan_vararg_states[i].active &&
+        __dfsan_vararg_states[i].list == list)
+      return &__dfsan_vararg_states[i];
+  }
+  return nullptr;
+}
+
+static dfsan_vararg_state *dfsan_alloc_vararg_state(const void *list) {
+  if (dfsan_vararg_state *state = dfsan_find_vararg_state(list))
+    return state;
+  for (uptr i = 0; i < kDfsanMaxVarargStates; ++i) {
+    if (!__dfsan_vararg_states[i].active) {
+      __dfsan_vararg_states[i] = {list, nullptr, 0, 0, true};
+      return &__dfsan_vararg_states[i];
+    }
+  }
+  return nullptr;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __dfsan_vararg_prepare(
+    const dfsan_label *labels, uint32_t count) {
+  if (__dfsan_vararg_pending_size < kDfsanMaxVarargPending) {
+    __dfsan_vararg_pending[__dfsan_vararg_pending_size++] = {labels, count};
+  } else {
+    // Preserve the newest call boundary if a malformed target overflows the
+    // bounded pending stack; an unavailable shadow is conservatively clean.
+    __dfsan_vararg_pending[kDfsanMaxVarargPending - 1] = {labels, count};
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __dfsan_vararg_start(
+    const void *list) {
+  dfsan_vararg_state *state = dfsan_alloc_vararg_state(list);
+  if (!state)
+    return;
+
+  if (__dfsan_vararg_pending_size != 0) {
+    dfsan_vararg_pending pending =
+        __dfsan_vararg_pending[--__dfsan_vararg_pending_size];
+    state->labels = pending.labels;
+    state->count = pending.count;
+  } else {
+    state->labels = nullptr;
+    state->count = 0;
+  }
+  state->next = 0;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __dfsan_vararg_copy(
+    void *dest, const void *src) {
+  dfsan_vararg_state *dst = dfsan_alloc_vararg_state(dest);
+  if (!dst)
+    return;
+  dfsan_vararg_state *source = dfsan_find_vararg_state(src);
+  if (source) {
+    dst->labels = source->labels;
+    dst->count = source->count;
+    dst->next = source->next;
+  } else {
+    dst->labels = nullptr;
+    dst->count = 0;
+    dst->next = 0;
+  }
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE dfsan_label __dfsan_vararg_arg(
+    const void *list) {
+  dfsan_vararg_state *state = dfsan_find_vararg_state(list);
+  if (!state || state->next >= state->count)
+    return 0;
+  return state->labels[state->next++];
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void __dfsan_vararg_end(
+    const void *list) {
+  if (dfsan_vararg_state *state = dfsan_find_vararg_state(list))
+    state->active = false;
 }
 
 // Like __dfsan_union, but for use from the client or custom functions.  Hence
