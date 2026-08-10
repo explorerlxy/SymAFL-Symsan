@@ -152,6 +152,12 @@ struct my_mutator_t {
 
   // replay checker (SYMAFL_REPLAY_CHECK=1)
   bool replay_check = false;
+  // SYMAFL_REPLAY_ALL=1: replay EVERY admitted run's full stream against the
+  // tree (including non-gaining runs), not only coverage-gaining runs.
+  bool replay_all = false;
+  // Set by post_run after it replayed the current run; consumed by
+  // queue_new_entry's insert so a gaining run is not replayed twice.
+  bool replay_run_done = false;
   uint64_t replay_checked = 0;
   uint64_t replay_cid_mismatch = 0;
   uint64_t replay_direction_mismatch = 0;
@@ -556,6 +562,13 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->replay_check = true;
     fprintf(stderr, "[pcbt] replay check enabled: all admitted candidates "
             "use full-pipe capture and trace replay validation\n");
+  }
+  if (getenv("SYMAFL_REPLAY_ALL")) {
+    data->replay_all = true;
+    data->replay_check = true;
+    fprintf(stderr, "[pcbt] replay-all enabled: EVERY admitted run (gaining "
+            "and non-gaining) is full-pipe captured and replayed against "
+            "the tree; mismatches mark nodes unstable and are counted\n");
   }
   if (getenv("SYMAFL_NO_SCREEN")) {
     data->screening = false;
@@ -1091,6 +1104,12 @@ static bool replay_check_trace(my_mutator_t *data,
                                const u8 *buf, size_t buf_size,
                                const char *fname, bool is_suffix) {
   if (!data->replay_check) return true;
+  // post_run already replayed this run's full stream (SYMAFL_REPLAY_ALL);
+  // queue_new_entry's insert must not count it a second time.
+  if (data->replay_run_done) {
+    data->replay_run_done = false;
+    return true;
+  }
   // A full capture must validate an empty stream against the learned tree:
   // an empty child trace can be truncated before the next learned event. A
   // suffix intentionally omits the known prefix and cannot use this replay
@@ -1639,7 +1658,34 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
   // Probe diagnostic: classify what a sampled vetoed candidate executed past
   // the known terminal prefix. Nonempty suffix = screening defect (the tree
   // claimed the decision trace terminates, but it does not).
-  if (data->last_was_probe && data->probe_diag && data->single_pass_armed) {
+  if (data->last_was_probe && data->single_pass_armed) {
+    uint32_t probe_mode = __atomic_load_n(&data->single_pass_control->mode,
+                                          __ATOMIC_ACQUIRE);
+    // Replay-all veto coverage: every vetoed candidate ran under FULL
+    // capture; validate its complete event stream against the tree. A
+    // cid/direction mismatch means the veto path itself disagrees with the
+    // candidate's actual stream; an after_terminal error means the
+    // candidate carried events past a tree terminal — both are
+    // symbolic-decision-event omission signals. The stream is never
+    // inserted (probes do not grow the tree); mismatches mark the reached
+    // node unstable so later candidates are not screened against a
+    // self-contradictory model.
+    if (data->replay_all && probe_mode == SYMAFL_TRACE_FULL_STREAM) {
+      std::vector<u8> buf;
+      if (read_cur_input(data, &buf)) {
+        std::vector<pcbt::Event> events;
+        if (decode_pipe_events(data, &events, "replay-all-veto")) {
+          (void)replay_check_trace(data, events, buf.data(), buf.size(),
+                                   "replay-all-veto", false);
+        }
+      }
+      disarm_capture(data);
+      return;
+    }
+    if (!data->probe_diag) {
+      if (!data->probe_capture_pending) disarm_capture(data);
+      return;
+    }
     symafl_single_pass_control *control = data->single_pass_control;
     uint32_t count = __atomic_load_n(&control->event_count, __ATOMIC_ACQUIRE);
     bool over = __atomic_load_n(&control->overflow, __ATOMIC_ACQUIRE) ||
@@ -1699,6 +1745,31 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
     return;
   }
   if (data->bootstrap_done) {
+    // Replay-all quality mode: validate EVERY admitted run's full stream
+    // against the current tree, not only coverage-gaining runs. This is the
+    // census for symbolic-decision-event omissions: cid/direction mismatches
+    // mark the reached node unstable and are counted, and an
+    // after_terminal error means a later candidate carried events past a
+    // terminal that an earlier (empty-suffix) run closed. The capture stays
+    // armed so queue_new_entry can still insert a gaining run's suffix; the
+    // insert skips the duplicate replay via replay_run_done.
+    if (data->replay_all && data->single_pass_armed &&
+        data->last_node != pcbt::kUnexplored) {
+      data->replay_run_done = false;
+      uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
+                                      __ATOMIC_ACQUIRE);
+      if (mode == SYMAFL_TRACE_FULL_STREAM) {
+        std::vector<u8> buf;
+        if (read_cur_input(data, &buf)) {
+          std::vector<pcbt::Event> events;
+          if (decode_pipe_events(data, &events, "replay-all")) {
+            (void)replay_check_trace(data, events, buf.data(), buf.size(),
+                                     "replay-all", false);
+            data->replay_run_done = true;
+          }
+        }
+      }
+    }
     // Admitted-run diagnostic: does the frontier suffix carry decisions
     // (tree gain) even when the run gains no bitmap coverage?
     if (data->probe_diag && data->single_pass_armed &&
@@ -1992,6 +2063,9 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   // Clear the veto-probe marker for every new candidate; it is only true
   // between a probe admission and that probe's own coverage outcome.
   data->last_was_probe = false;
+  // Defensive: a stale replay-all marker (queue_new_entry never consumed it)
+  // must not suppress the next run's replay.
+  data->replay_run_done = false;
   // rCnt bookkeeping for the previously admitted candidate
   if (data->last_node != pcbt::kUnexplored) {
     if (!data->last_gained) {
@@ -2097,9 +2171,16 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   // probe does not arm capture, so it never grows the tree; its coverage gain
   // (if any) is counted in veto_probe_gained. With SYMAFL_PROBE_DIAG it arms
   // suffix capture at the veto depth so post_run can classify the suffix.
-  if (data->veto_probe_every &&
-      ++data->veto_probe_count >= data->veto_probe_every) {
-    data->veto_probe_count = 0;
+  // With SYMAFL_REPLAY_ALL every vetoed candidate is probed under FULL
+  // capture so its complete event stream can be replayed against the tree:
+  // a mismatch or an after_terminal error on a vetoed stream is an omission
+  // signal (the veto itself was based on a tree that disagrees with the
+  // candidate's actual stream).
+  bool replay_all_probe = data->replay_all;
+  if (replay_all_probe ||
+      (data->veto_probe_every &&
+       ++data->veto_probe_count >= data->veto_probe_every)) {
+    if (data->veto_probe_every) data->veto_probe_count = 0;
     data->veto_probe_admitted += 1;
     data->last_was_probe = true;
     data->afl->pcbt_probe_active = 1;
@@ -2112,27 +2193,37 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     memcpy(data->last_probe_input, buf, data->last_probe_input_len);
     if (data->sat_window) data->sat_probe_total += 1;
     if (data->single_pass_armed) disarm_capture(data);
-    const bool forensic_terminal_capture =
-        data->forensics_dir && data->last_probe_veto_kind == 0 &&
-        data->last_veto_depth > 0;
-    if ((data->probe_diag || forensic_terminal_capture) &&
-        data->last_veto_depth > 0) {
-      arm_suffix_capture(data, data->last_veto_node, data->last_veto_dir);
-      data->probe_capture_pending =
-          (data->probe_learn && data->last_probe_veto_kind == 1) ||
-          forensic_terminal_capture;
-      data->probe_capture_node = data->last_veto_node;
-      data->probe_capture_dir = data->last_veto_dir;
+    if (data->replay_all) {
+      // Full-stream capture for the vetoed candidate's complete replay.
+      arm_full_capture(data);
       // Probe capture is not an admitted candidate: do not let the normal
       // post_run retry bookkeeping treat it as last_node/last_dir.
       data->last_node = pcbt::kUnexplored;
-    } else if (data->probe_learn && data->last_probe_veto_kind == 1 &&
-               data->last_veto_depth > 0) {
-      arm_suffix_capture(data, data->last_veto_node, data->last_veto_dir);
-      data->probe_capture_pending = true;
-      data->probe_capture_node = data->last_veto_node;
-      data->probe_capture_dir = data->last_veto_dir;
-      data->last_node = pcbt::kUnexplored;
+      data->probe_capture_pending = false;
+      data->probe_capture_node = pcbt::kUnexplored;
+    } else {
+      const bool forensic_terminal_capture =
+          data->forensics_dir && data->last_probe_veto_kind == 0 &&
+          data->last_veto_depth > 0;
+      if ((data->probe_diag || forensic_terminal_capture) &&
+          data->last_veto_depth > 0) {
+        arm_suffix_capture(data, data->last_veto_node, data->last_veto_dir);
+        data->probe_capture_pending =
+            (data->probe_learn && data->last_probe_veto_kind == 1) ||
+            forensic_terminal_capture;
+        data->probe_capture_node = data->last_veto_node;
+        data->probe_capture_dir = data->last_veto_dir;
+        // Probe capture is not an admitted candidate: do not let the normal
+        // post_run retry bookkeeping treat it as last_node/last_dir.
+        data->last_node = pcbt::kUnexplored;
+      } else if (data->probe_learn && data->last_probe_veto_kind == 1 &&
+                 data->last_veto_depth > 0) {
+        arm_suffix_capture(data, data->last_veto_node, data->last_veto_dir);
+        data->probe_capture_pending = true;
+        data->probe_capture_node = data->last_veto_node;
+        data->probe_capture_dir = data->last_veto_dir;
+        data->last_node = pcbt::kUnexplored;
+      }
     }
     *out_buf = buf;
     return buf_size;
