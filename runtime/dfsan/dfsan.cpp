@@ -232,7 +232,9 @@ static inline dfsan_label add_taint_info(dfsan_label_info *info) {
 // caller must ensure op is valid, handle commutative conventions
 static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
                                   uint16_t size, uint64_t op1, uint64_t op2,
-                                  uint64_t op1_hi = 0, uint64_t op2_hi = 0) {
+                                  uint64_t op1_hi = 0, uint64_t op2_hi = 0,
+                                  uint64_t op1_h2 = 0, uint64_t op2_h2 = 0,
+                                  uint64_t op1_h3 = 0, uint64_t op2_h3 = 0) {
   // dedup
   uint32_t h1 = l1 ? __dfsan_label_info[l1].hash : 0;
   uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
@@ -247,11 +249,20 @@ static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   uint32_t h5 = (uint32_t)(op2 ^ (op2 >> 32));
   uint32_t h6 = (uint32_t)(op1_hi ^ (op1_hi >> 32));
   uint32_t h7 = (uint32_t)(op2_hi ^ (op2_hi >> 32));
-  uint32_t hash = xxhash(xxhash(h1, h4, h5), h6, h7);
+  uint32_t h8 = (uint32_t)(op1_h2 ^ (op1_h2 >> 32));
+  uint32_t h9 = (uint32_t)(op2_h2 ^ (op2_h2 >> 32));
+  uint32_t h10 = (uint32_t)(op1_h3 ^ (op1_h3 >> 32));
+  uint32_t h11 = (uint32_t)(op2_h3 ^ (op2_h3 >> 32));
+  uint32_t hash =
+      xxhash(xxhash(xxhash(h1, h4, h5), h6, h7),
+             xxhash(h8, h9, h10), h11);
 
   struct dfsan_label_info label_info = {
     .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2},
-    .op1_hi = op1_hi, .op2_hi = op2_hi, .op = op, .size = size,
+    .op1_hi = op1_hi, .op2_hi = op2_hi,
+    .op1_h2 = op1_h2, .op2_h2 = op2_h2,
+    .op1_h3 = op1_h3, .op2_h3 = op2_h3,
+    .op = op, .size = size,
     .hash = hash};
 
   __taint::option res = __union_table.lookup(label_info);
@@ -285,16 +296,17 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   if (l1 > l2 && is_commutative(op)) {
     // needs to swap both labels and concretes. fmemcmp capture bits follow
     // their operand values, not their normalized label positions.
-    bool fmemcmp_op1_captured =
-        is_fmemcmp(op) && fmemcmp_operand_captured(op, false);
-    bool fmemcmp_op2_captured =
-        is_fmemcmp(op) && fmemcmp_operand_captured(op, true);
+    const bool capture_family = is_fmemcmp(op) || is_fstrcmp_family(op);
+    bool capture_op1 =
+        capture_family && fmemcmp_operand_captured(op, false);
+    bool capture_op2 =
+        capture_family && fmemcmp_operand_captured(op, true);
     Swap(l1, l2);
     Swap(op1, op2);
-    if (is_fmemcmp(op)) {
+    if (capture_family) {
       op &= ~kFmemcmpCaptureMask;
-      if (fmemcmp_op2_captured) op |= kFmemcmpOperand1Captured;
-      if (fmemcmp_op1_captured) op |= kFmemcmpOperand2Captured;
+      if (capture_op2) op |= kFmemcmpOperand1Captured;
+      if (capture_op1) op |= kFmemcmpOperand2Captured;
     }
   }
   if (l1 == 0 && l2 < CONST_OFFSET &&
@@ -375,6 +387,73 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
       .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2},
       .op1_hi = op1_hi, .op2_hi = op2_hi, .op = op, .size = size,
       .hash = hash};
+
+    __taint::option res = __union_table.lookup(label_info);
+    if (res != __taint::none()) {
+      dfsan_label label = *res;
+      AOUT("%u found\n", label);
+      return label;
+    }
+
+    dfsan_label label = add_taint_info(&label_info);
+    __union_table.insert(&__dfsan_label_info[label], label);
+    return label;
+  } else if (is_fstrcmp_family(op)) {
+    // strcmp/strncmp/strcasecmp/strncasecmp wrappers pass the string
+    // addresses in op1/op2.  The scalar PCBT grammar needs the actual bytes
+    // of both sides to lower the comparison exactly, so materialize up to 32
+    // bytes per operand after verifying readability.  A failed probe leaves
+    // the address unmarked and the converter rejects the predicate as opaque
+    // instead of inventing a byte value.
+    uint16_t len = size > 32 ? 32 : size;
+    uint64_t op1_hi = 0, op2_hi = 0;
+    uint64_t op1_h2 = 0, op2_h2 = 0;
+    uint64_t op1_h3 = 0, op2_h3 = 0;
+    op &= ~kFmemcmpCaptureMask;
+    auto capture_side = [&](uint64_t &dst, uint64_t &dst_hi,
+                            uint64_t &dst_h2, uint64_t &dst_h3,
+                            uint64_t address) {
+      if (len == 0 || address == 0 ||
+          !IsAccessibleMemoryRange((uptr)address, len))
+        return false;
+      const char *p = (const char *)address;
+      uint16_t remaining = len;
+      uint64_t *words[4] = {&dst, &dst_hi, &dst_h2, &dst_h3};
+      for (unsigned w = 0; w < 4 && remaining > 0; ++w) {
+        uint16_t chunk = remaining > 8 ? 8 : remaining;
+        internal_memcpy(words[w], p, chunk);
+        p += chunk;
+        remaining -= chunk;
+      }
+      return true;
+    };
+    bool op1_captured = capture_side(op1, op1_hi, op1_h2, op1_h3, op1);
+    bool op2_captured = capture_side(op2, op2_hi, op2_h2, op2_h3, op2);
+    if (op1_captured) op |= kFmemcmpOperand1Captured;
+    if (op2_captured) op |= kFmemcmpOperand2Captured;
+
+    uint32_t h1 = l1 ? __dfsan_label_info[l1].hash : 0;
+    uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
+    uint32_t h3 = (op << 16) | size;
+    h1 = xxhash(h1, h2, h3);
+    uint32_t h4 = (uint32_t)(op1 ^ (op1 >> 32));
+    uint32_t h5 = (uint32_t)(op2 ^ (op2 >> 32));
+    uint32_t h6 = (uint32_t)(op1_hi ^ (op1_hi >> 32));
+    uint32_t h7 = (uint32_t)(op2_hi ^ (op2_hi >> 32));
+    uint32_t h8 = (uint32_t)(op1_h2 ^ (op1_h2 >> 32));
+    uint32_t h9 = (uint32_t)(op2_h2 ^ (op2_h2 >> 32));
+    uint32_t h10 = (uint32_t)(op1_h3 ^ (op1_h3 >> 32));
+    uint32_t h11 = (uint32_t)(op2_h3 ^ (op2_h3 >> 32));
+    uint32_t hash =
+        xxhash(xxhash(xxhash(h1, h4, h5), h6, h7),
+               xxhash(h8, h9, h10), h11);
+
+    struct dfsan_label_info label_info = {
+      .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2},
+      .op1_hi = op1_hi, .op2_hi = op2_hi,
+      .op1_h2 = op1_h2, .op2_h2 = op2_h2,
+      .op1_h3 = op1_h3, .op2_h3 = op2_h3,
+      .op = op, .size = size, .hash = hash};
 
     __taint::option res = __union_table.lookup(label_info);
     if (res != __taint::none()) {

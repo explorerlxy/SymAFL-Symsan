@@ -186,6 +186,8 @@ class RunConverter {
                               const dfsan_label_info &strstr_info);
   uint32_t convert_fmemcmp_cmp(const dfsan_label_info *info, uint32_t op,
                                const dfsan_label_info &memcmp_info);
+  uint32_t convert_fstrcmp_cmp(const dfsan_label_info *info, uint32_t op,
+                               const dfsan_label_info &cmp_info);
   uint32_t convert_fcmp(const dfsan_label_info *info, uint32_t op);
 
   // Length-boundary lowering (flen_* ops). Builds a Count-family node with

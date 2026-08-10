@@ -23,6 +23,7 @@ constexpr size_t kMaxPredicateNodes = 2'000'000;
 // the shared arena budget.
 constexpr size_t kMaxStrlenBytes = 256;
 constexpr size_t kMaxSearchBytes = 512;
+constexpr size_t kFstrcmpCaptureBytes = 32;
 
 // Length-boundary count ops (flen_count family). They share the Count-family
 // node lowering; flen_eof and fsize are handled separately.
@@ -212,7 +213,14 @@ uint32_t RunConverter::convert(uint32_t label) {
           info->l1 < table_labels_) {
         uint16_t so = table_[info->l1].op & 0xff;
         if (so == __dfsan::fstrlen || so == __dfsan::fstrchr ||
-            so == __dfsan::fstrrchr || so == __dfsan::fstrstr)
+            so == __dfsan::fstrrchr || so == __dfsan::fstrstr ||
+            so == __dfsan::fstrcmp || so == __dfsan::fstrcasecmp)
+          count = 0;
+      }
+      if (op_lo == ICmp && info->l1 == 0 && info->l2 != 0 &&
+          info->l2 < table_labels_) {
+        uint16_t so = table_[info->l2].op & 0xff;
+        if (so == __dfsan::fstrcmp || so == __dfsan::fstrcasecmp)
           count = 0;
       }
       // A wide load/concat can be immediately projected by Extract or Trunc.
@@ -760,6 +768,23 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
         table_[info->l1].size > 8) {
       return convert_fmemcmp_cmp(info, op, table_[info->l1]);
     }
+    // fstrcmp/fstrcasecmp results are lowered byte-wise from the string
+    // shadows plus the operand bytes captured by the comparison wrappers.
+    const bool left_fstrcmp =
+        info->l1 != 0 && info->l1 < table_labels_ &&
+        is_fstrcmp_family(table_[info->l1].op);
+    const bool right_fstrcmp =
+        info->l2 != 0 && info->l2 < table_labels_ &&
+        is_fstrcmp_family(table_[info->l2].op);
+    if ((left_fstrcmp && (info->l2 != 0 || info->op2.i != 0)) ||
+        (right_fstrcmp && (info->l1 != 0 || info->op1.i != 0))) {
+      fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    if (left_fstrcmp && info->l2 == 0)
+      return convert_fstrcmp_cmp(info, op, table_[info->l1]);
+    if (right_fstrcmp && info->l1 == 0)
+      return convert_fstrcmp_cmp(info, op, table_[info->l2]);
     // String-op vs constant comparison: expand into byte reads so the scalar
     // interpreter can evaluate it (strlen > n, strchr/strstr != NULL).
     if (info->l1 != 0 && info->l1 < table_labels_ && info->l2 == 0) {
@@ -1347,6 +1372,115 @@ uint32_t RunConverter::convert_fmemcmp_cmp(
     case bvule: case bvsle: return add(PKind::Or, 8, less, equal_prefix);
     case bvugt: case bvsgt: return greater;
     case bvuge: case bvsge: return add(PKind::Or, 8, greater, equal_prefix);
+    default:
+      fail(PredError::UnsupportedCompare, static_cast<uint16_t>(op));
+      return kInvalidNode;
+  }
+}
+
+// Lower strcmp/strncmp/strcasecmp/strncasecmp (and memcmp with a string-op
+// side) consumed by an ICmp against zero.  Each byte comes from the string
+// shadow when tainted, otherwise from the bytes the comparison wrapper
+// captured into op1/op2(+_hi/_h2/_h3) at trace time.  A byte with neither
+// source is rejected (opaque) rather than guessed.  fstrcasecmp folds ASCII
+// A-Z before comparing, matching the C wrappers' tolower semantics.
+uint32_t RunConverter::convert_fstrcmp_cmp(
+    const dfsan_label_info *info, uint32_t op,
+    const dfsan_label_info &cmp_info) {
+  const uint32_t n = cmp_info.size;
+  if (n == 0 || n > kFstrcmpCaptureBytes) {
+    fail(PredError::InvalidWidth, static_cast<uint16_t>(cmp_info.op));
+    return kInvalidNode;
+  }
+  const bool case_insensitive =
+      (cmp_info.op & 0xff) == __dfsan::fstrcasecmp;
+
+  auto captured_byte = [&](bool operand2, uint32_t i) -> int {
+    if (!fmemcmp_operand_captured(cmp_info.op, operand2)) return -1;
+    uint64_t word;
+    if (i < 8) word = operand2 ? cmp_info.op2.i : cmp_info.op1.i;
+    else if (i < 16) word = operand2 ? cmp_info.op2_hi : cmp_info.op1_hi;
+    else if (i < 24) word = operand2 ? cmp_info.op2_h2 : cmp_info.op1_h2;
+    else word = operand2 ? cmp_info.op2_h3 : cmp_info.op1_h3;
+    return static_cast<int>((word >> (8 * (i % 8))) & 0xff);
+  };
+
+  auto side_bytes = [&](dfsan_label label, bool operand2,
+                        std::vector<StringByte> &out) -> bool {
+    std::vector<StringByte> shadow;
+    // The shadow may be longer than the comparison window (strcmp uses
+    // strlen+1 but the buffer's content label can cover the whole object).
+    // Extract with a generous cap and consume only the first n bytes.
+    if (label != 0 && !string_bytes(label, kMaxSearchBytes, shadow))
+      return false;
+    for (uint32_t i = 0; i < n; ++i) {
+      if (i < shadow.size()) {
+        out.push_back(shadow[i]);
+        continue;
+      }
+      int byte = captured_byte(operand2, i);
+      if (byte < 0) return false;
+      out.push_back({add_const(static_cast<uint32_t>(byte), 8), 0});
+    }
+    return true;
+  };
+
+  std::vector<StringByte> lhs, rhs;
+  if (!side_bytes(cmp_info.l1, false, lhs) ||
+      !side_bytes(cmp_info.l2, true, rhs)) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(cmp_info.op));
+    return kInvalidNode;
+  }
+  if (lhs.size() != n || rhs.size() != n) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(cmp_info.op));
+    return kInvalidNode;
+  }
+
+  auto fold = [&](uint32_t node) -> uint32_t {
+    if (!case_insensitive) return node;
+    // ASCII tolower: x + ((x >= 'A' && x <= 'Z') ? 0x20 : 0).
+    uint32_t upper = add(PKind::And, 8,
+        add(PKind::Uge, 8, node, add_const('A', 8)),
+        add(PKind::Ule, 8, node, add_const('Z', 8)));
+    return add(PKind::Add, 8, node,
+               add(PKind::Mul, 8, upper, add_const(0x20, 8)));
+  };
+
+  // The C strcmp/strncmp family stops at the first NUL byte in either
+  // operand, so a byte pair only decides the result when every earlier pair
+  // was equal and no earlier byte was NUL.  (memcmp uses a separate
+  // full-window lowering above.)  Build the three mutually exclusive
+  // outcomes without a wide integer node.
+  uint32_t equal_prefix = add_const(1, 8);
+  uint32_t no_early_nul = add_const(1, 8);
+  uint32_t less = add_const(0, 8);
+  uint32_t greater = add_const(0, 8);
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t a = fold(lhs[i].node);
+    uint32_t b = fold(rhs[i].node);
+    uint32_t eq = add(PKind::Equal, 8, a, b);
+    uint32_t lt = add(PKind::Ult, 8, a, b);
+    uint32_t gt = add(PKind::Ugt, 8, a, b);
+    uint32_t decide = add(PKind::And, 8, equal_prefix, no_early_nul);
+    less = add(PKind::Or, 8, less, add(PKind::And, 8, decide, lt));
+    greater = add(PKind::Or, 8, greater, add(PKind::And, 8, decide, gt));
+    equal_prefix = add(PKind::And, 8, equal_prefix, eq);
+    no_early_nul = add(PKind::And, 8,
+        add(PKind::And, 8, no_early_nul,
+            add(PKind::Distinct, 8, a, add_const(0, 8))),
+        add(PKind::Distinct, 8, b, add_const(0, 8)));
+  }
+
+  uint32_t zero = add_const(0, 8);
+  uint32_t not_less = add(PKind::Equal, 8, less, zero);
+  uint32_t not_greater = add(PKind::Equal, 8, greater, zero);
+  switch (op >> 8) {
+    case bveq: return add(PKind::And, 8, not_less, not_greater);
+    case bvneq: return add(PKind::Or, 8, less, greater);
+    case bvult: case bvslt: return less;
+    case bvule: case bvsle: return not_greater;
+    case bvugt: case bvsgt: return greater;
+    case bvuge: case bvsge: return not_less;
     default:
       fail(PredError::UnsupportedCompare, static_cast<uint16_t>(op));
       return kInvalidNode;

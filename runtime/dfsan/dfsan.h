@@ -46,11 +46,16 @@ struct dfsan_label_info {
   dfsan_label l2;
   data op1;
   data op2;
-  // fmemcmp may compare more than one machine word. op1/op2 retain the first
-  // eight bytes; *_hi retain bytes 8..15 when the complete operand is known
-  // to be readable.
+  // fmemcmp and the fstrcmp family may compare more than one machine word.
+  // op1/op2 retain the first eight bytes; *_hi, *_h2, and *_h3 retain bytes
+  // 8..15, 16..23, and 24..31 when the complete operand is known to be
+  // readable. The scalar converter consumes up to 32 captured bytes per side.
   uint64_t op1_hi;
   uint64_t op2_hi;
+  uint64_t op1_h2;
+  uint64_t op2_h2;
+  uint64_t op1_h3;
+  uint64_t op2_h3;
   uint16_t op;
   uint16_t size; // FIXME: this limit the size of the operand to 65535 bits or bytes (in case of memcmp)
   uint32_t hash;
@@ -324,14 +329,19 @@ enum operators {
   // than propagating the operand shadow as if ctlz/cttz were identity ops.
   ctlz            = last_llvm_op + 51, // 118 llvm.ctlz
   cttz            = last_llvm_op + 52, // 119 llvm.cttz
-  LastOp          = last_llvm_op + 53, // 120
+  // Case-insensitive string comparison (strcasecmp/strncasecmp). Like
+  // fstrcmp, it returns the sign of the first differing byte; the converter
+  // lowers it with ASCII tolower folding instead of the plain byte equality.
+  fstrcasecmp     = last_llvm_op + 53, // 120
+  LastOp          = last_llvm_op + 54, // 121
 };
 
-// fmemcmp keeps its base opcode in the low byte. The high bits record whether
-// the corresponding op value was materialized from a readable target address
-// into concrete bytes in op1/op2 (and, for bytes 8..15, op1_hi/op2_hi). A
-// consumer must never treat an unmarked constant operand as bytes: it is still
-// an address in the target process.
+// fmemcmp and the fstrcmp family keep their base opcode in the low byte. The
+// high bits record whether the corresponding op value was materialized from a
+// readable target address into concrete bytes in op1/op2 (+ op1_hi/op2_hi and
+// op1_h2/op2_h2/op1_h3/op2_h3 for bytes 8..31). A consumer must never treat an
+// unmarked constant operand as bytes: it is still an address in the target
+// process.
 constexpr uint16_t kFmemcmpOperand1Captured = 1u << 14;
 constexpr uint16_t kFmemcmpOperand2Captured = 1u << 15;
 constexpr uint16_t kFmemcmpCaptureMask =
@@ -339,6 +349,11 @@ constexpr uint16_t kFmemcmpCaptureMask =
 
 static inline bool is_fmemcmp(uint16_t op) {
   return (op & 0xff) == fmemcmp;
+}
+
+static inline bool is_fstrcmp_family(uint16_t op) {
+  uint16_t lo = op & 0xff;
+  return lo == fstrcmp || lo == fstrcasecmp;
 }
 
 static inline bool fmemcmp_operand_captured(uint16_t op, bool operand2) {

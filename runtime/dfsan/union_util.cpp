@@ -48,7 +48,11 @@ operator==(const dfsan_label_info& lhs, const dfsan_label_info& rhs) {
       && lhs.op1.i == rhs.op1.i
       && lhs.op2.i == rhs.op2.i
       && lhs.op1_hi == rhs.op1_hi
-      && lhs.op2_hi == rhs.op2_hi;
+      && lhs.op2_hi == rhs.op2_hi
+      && lhs.op1_h2 == rhs.op1_h2
+      && lhs.op2_h2 == rhs.op2_h2
+      && lhs.op1_h3 == rhs.op1_h3
+      && lhs.op2_h3 == rhs.op2_h3;
 }
 
 }
