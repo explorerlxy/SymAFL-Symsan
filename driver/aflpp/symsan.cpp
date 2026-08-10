@@ -1345,6 +1345,9 @@ static void capture_opaque_if_new(
   meta.opaque_after = opaque_after;
   capture_forensic_snapshot(data, "opaque", events, table, table_labels, input,
                             input_len, meta);
+  WARNF("opaque predicate encountered; forensic evidence captured; "
+        "stopping run\n");
+  data->afl->stop_soon = 1;
 }
 
 static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
