@@ -272,13 +272,6 @@ static void add_taint_pass() {
     cc_params[cc_par_cnt++] = "-taint-emit-cid-map=true";
   }
 
-  // Tainted pointer: keep `const_table[sym]` load results input-dependent by
-  // merging the GEP index shadow (fixes the crc32 constraint-collection gap).
-  if (getenv("KO_COMBINE_PTR_LABELS")) {
-    cc_params[cc_par_cnt++] = "-mllvm";
-    cc_params[cc_par_cnt++] = "-taint-combine-pointer-labels-on-load=true";
-  }
-
   if (getenv("KO_NO_TRACE_BOUND")) {
     cc_params[cc_par_cnt++] = "-mllvm";
     cc_params[cc_par_cnt++] = "-taint-trace-bound=false";

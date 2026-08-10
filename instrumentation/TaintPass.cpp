@@ -132,22 +132,10 @@ static cl::list<std::string> ClABIListFiles(
     cl::desc("File listing native ABI functions and how the pass treats them"),
     cl::Hidden);
 
-// Controls whether the pass includes or ignores the labels of pointers in load
-// instructions.
-// Matches __dfsan::idx_merge (runtime/dfsan/dfsan.h): pointer-index merge for
-// constant-table loads. Kept as a literal here since TaintPass does not
-// include the runtime header.
-static constexpr uint16_t kIdxMergeOp = 113;
 // Keep these literal protocol values aligned with dfsan.h. LLVM 18's
 // last_llvm_op is 67, so ctlz/cttz occupy 118/119.
 static constexpr uint16_t kCtlzOp = 118;
 static constexpr uint16_t kCttzOp = 119;
-
-static cl::opt<bool> ClCombinePointerLabelsOnLoad(
-    "taint-combine-pointer-labels-on-load",
-    cl::desc("Combine the label of the pointer with the label of the data when "
-             "loading from memory."),
-    cl::Hidden, cl::init(false));
 
 // Controls whether the pass includes or ignores the labels of pointers in
 // stores instructions.
@@ -663,13 +651,6 @@ struct TaintFunction {
 
   /// Returns the shadow value of a global variable GV.
   Value *getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB);
-
-  /// Returns the union of the shadows of all non-constant indices along a
-  /// GEP chain (after stripping pointer casts), or nullptr when none exist.
-  /// Used by ClCombinePointerLabelsOnLoad to keep `const_table[sym]` loads
-  /// input-dependent: the loaded value is a constant, but its address depends
-  /// on a symbolic index, so the result depends on the input.
-  Value *getGEPIndexShadow(Value *Ptr);
 
   // Op Shadow
   Value *combineShadows(Value *V1, Value *V2,
@@ -1973,49 +1954,6 @@ Value *TaintFunction::getShadowForGlobal(GlobalVariable *GV, IRBuilder<> &IRB) {
     return IRB.CreateCall(TT.TaintTraceGlobalFn, {Addr, Size});
   }
   return TT.ZeroPrimitiveShadow; // GV is always a ptr
-}
-
-Value *TaintFunction::getGEPIndexShadow(Value *Ptr) {
-  // Only merge index labels when the GEP chain's base is a constant global
-  // (e.g. lzma_crc32_table): the loaded value is a pure function of the
-  // index. Heap/stack buffers are themselves symbolic - merging their index
-  // would over-approximate and generates the IR that crashes LLVM 18's
-  // register allocator on large encoder functions.
-  Value *Base = Ptr;
-  while (auto *GEP = dyn_cast<GetElementPtrInst>(Base->stripPointerCasts()))
-    Base = GEP->getPointerOperand();
-  auto *GV = dyn_cast<GlobalVariable>(Base->stripPointerCasts());
-  if (!GV || !GV->isConstant()) return nullptr;
-
-  Value *Acc = nullptr;
-  Value *Cur = Ptr->stripPointerCasts();
-  while (auto *GEP = dyn_cast<GetElementPtrInst>(Cur)) {
-    for (auto &Idx : GEP->indices()) {
-      Value *Index = &*Idx;
-      if (!Index->getType()->isIntegerTy() || isa<ConstantInt>(Index))
-        continue;
-      Value *IdxShadow = getShadow(Index);
-      if (!IdxShadow || TT.isZeroShadow(IdxShadow))
-        continue;
-      if (Acc) {
-        // Minimal union without operand materialization: the Or op's op1/op2
-        // are irrelevant to the predicate converter (it maps the op to opaque).
-        // combineShadows would emit PtrToInt/ZExt chains here that trigger an
-        // LLVM 18 Register Coalescer crash on -O3 builds.
-        IRBuilder<> IRB(GEP);
-        Acc = IRB.CreateCall(TT.TaintUnionFn,
-            {Acc, IdxShadow,
-             ConstantInt::get(TT.Int16Ty, kIdxMergeOp),
-             ConstantInt::get(TT.Int16Ty, 64),
-             ConstantInt::get(TT.Int64Ty, 0),
-             ConstantInt::get(TT.Int64Ty, 0)});
-      } else {
-        Acc = IdxShadow;
-      }
-    }
-    Cur = GEP->getPointerOperand()->stripPointerCasts();
-  }
-  return Acc;
 }
 
 Value *TaintFunction::getShadow(Value *V) {
@@ -3613,29 +3551,6 @@ void TaintVisitor::visitLoadInst(LoadInst &LI) {
   Value *Shadow =
       TF.loadShadow(LI.getType(), LI.getPointerOperand(), Size,
                     LI.getAlign(), Pos);
-  // Tainted pointer: merge the shadows of non-constant GEP indices into the
-  // load result so `const_table[sym]` loads stay input-dependent (e.g. crc32
-  // lookup tables). The loaded memory shadow of a constant table is zero, and
-  // the GEP result shadow only carries the base address, so without this the
-  // value's dependence on the symbolic index is lost and downstream compares
-  // are collected against a pinned constant (or dropped as double-zero).
-  if (ClCombinePointerLabelsOnLoad) {
-    Value *IdxShadow = TF.getGEPIndexShadow(LI.getPointerOperand());
-    if (IdxShadow) {
-      // Minimal union (see getGEPIndexShadow): the Or op's operand values are
-      // irrelevant to the predicate converter; avoid the PtrToInt/ZExt chains
-      // of combineShadows (LLVM 18 Register Coalescer crash on -O3).
-      uint64_t bits = Size * 8;
-      if (bits > 64) bits = 64;
-      IRBuilder<> IRB(Pos);
-      Shadow = IRB.CreateCall(TF.TT.TaintUnionFn,
-          {Shadow, IdxShadow,
-           ConstantInt::get(TF.TT.Int16Ty, kIdxMergeOp),
-           ConstantInt::get(TF.TT.Int16Ty, bits),
-           ConstantInt::get(TF.TT.Int64Ty, 0),
-           ConstantInt::get(TF.TT.Int64Ty, 0)});
-    }
-  }
   if (!TF.TT.isZeroShadow(Shadow))
     TF.NonZeroChecks.push_back(Shadow);
 

@@ -304,14 +304,10 @@ enum operators {
   flen_count      = last_llvm_op + 42, // 109
   flen_count_neg1 = last_llvm_op + 43, // 110
   flen_count_elems = last_llvm_op + 44, // 111
-  // Pointer-index merge (ClCombinePointerLabelsOnLoad): the load result of a
-  // constant table depends on the symbolic GEP index. Deliberately NOT a
-  // numeric Or (which the predicate converter would evaluate as a value):
-  // the converter maps this op to opaque (conservative admission), keeping
-  // the constraint collected without inventing a wrong branch result.
-  // Keep the custom opcode values aligned with TaintPass's literal protocol
-  // IDs.  LLVM 18 reports last_llvm_op=67, while the custom range reserves
-  // 113 for idx_merge and starts integer min/max at 114.
+  // Reserved pointer-index merge opcode. Constant-table selection is modeled
+  // by the tainted-GEP equality constraint in fastgen, so the instrumentation
+  // no longer emits this load-label merge. Keep its numeric slot reserved to
+  // avoid shifting the following custom opcode protocol.
   idx_merge       = last_llvm_op + 46, // 113
   // Integer min/max intrinsics. LLVM lowers source-level ternary minima (for
   // example XZ's my_min) to these operations before TaintPass runs.
