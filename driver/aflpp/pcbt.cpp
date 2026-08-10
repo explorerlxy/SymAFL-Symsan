@@ -269,10 +269,20 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.constraint = ev.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
-        num_opaque += 1;
+        // Unsupported semantics are a conservative insertion boundary, not
+        // a PCBT node. Keep the supported prefix, leave this edge unexplored,
+        // and let screening admit candidates at that frontier. Inserting an
+        // opaque node would make topology appear learned while CheckInput has
+        // no sound direction to evaluate, and would also pollute the opaque
+        // node metric.
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
         if (pred.error_op) opaque_by_op[pred.error_op] += 1;
         opaque_by_cid[ev.cid] += 1;
+        num_nodes += created;
+        if (trace_depth > max_depth) max_depth = trace_depth;
+        if (out_tail_node) *out_tail_node = parent;
+        if (out_tail_dir) *out_tail_dir = dir;
+        return created;
       }
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) return created;
@@ -359,10 +369,16 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.constraint = event.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       if (pred.opaque) {
-        num_opaque += 1;
+        // See InsertTrace: do not materialize an unsupported predicate as a
+        // node. The saved frontier remains unexplored for later admission.
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
         if (pred.error_op) opaque_by_op[pred.error_op] += 1;
         opaque_by_cid[event.cid] += 1;
+        num_nodes += created;
+        if (node(cur).depth > max_depth) max_depth = node(cur).depth;
+        if (out_tail_node) *out_tail_node = cur;
+        if (out_tail_dir) *out_tail_dir = dir;
+        return created;
       }
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) return created;
