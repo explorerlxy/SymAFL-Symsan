@@ -344,23 +344,35 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   for (const Event &ev : events) num_events += ev.count;
 
   if (events.empty()) {
-    // An empty suffix proves only that THIS candidate produced no further
-    // symbolic decision past the edge; it is not a termination proof for
-    // the edge itself. Collection gaps (a length/count shadow that never
-    // carried a symbolic label for this candidate, an early-terminating
-    // invalid input, an invisible read, ...) let same-prefix candidates
-    // legitimately continue with nonempty suffixes, so hard-closing the
-    // edge would fabricate a terminal proof and veto those candidates
-    // (terminal-veto-but-gain; observed at libxml2 node 97023 where a
-    // 1-3-byte-different sibling carried 53 further events). The edge
-    // stays unexplored and the rCnt/rlimit budget governs repeated
-    // mining, the same policy constraint parents already use. Nonempty
-    // suffixes still close their tail as terminal: that records a
-    // candidate's observed final decision, a strictly stronger
-    // termination signal.
-    // The edge this insertion left unexplored is parent->direction.
+    if (node(parent).constraint) {
+      // Constraint value-fork: a candidate walking a constraint node's
+      // dir-0 re-emits its own multi-successor decision event at the same
+      // stream position, so a complete suffix can never be empty here. An
+      // empty suffix on a constraint parent is an incomplete-capture
+      // boundary and must leave the value-fork unexplored (the rCnt/rlimit
+      // budget governs mining); a different pinned value could still carry
+      // further decisions.
+      if (out_tail_node) *out_tail_node = parent;
+      if (out_tail_dir) *out_tail_dir = direction;
+      return 0;
+    }
+    // An empty suffix on an ordinary edge records the observed candidate's
+    // final decision: it produced no further symbolic decision past this
+    // edge, so the branch terminates here (identical to InsertTrace's
+    // trace-ends-at-edge rule). Closing terminal is deliberate: if a later
+    // same-prefix candidate carries symbolic events this candidate lost (a
+    // collection gap - an invisible read, an early-terminating invalid
+    // input, a length/count shadow absent for this candidate), it is vetoed
+    // at this terminal and surfaces as terminal-veto-but-gain. Leaving the
+    // edge unexplored would silently admit and re-insert those events,
+    // self-healing the symptom while the omission stays invisible and the
+    // tree silently diverges from the theoretical SEDBT tree. Exposure via
+    // tvbg is preferred over silent divergence; the collection-gap repair
+    // then fixes the root cause so the tree becomes correct instead of
+    // merely consistent.
     if (out_tail_node) *out_tail_node = parent;
     if (out_tail_dir) *out_tail_dir = direction;
+    node(parent).child[direction] = kTerminal;
     return 0;
   }
 
