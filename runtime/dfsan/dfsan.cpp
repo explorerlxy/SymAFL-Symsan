@@ -293,6 +293,40 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     AOUT("WARNING: invalid op %d\n", op);
     return 0;
   }
+  // Width normalization for scalar integer arithmetic / logic / shift /
+  // compare: the instruction consumes only the low `size` bits of its
+  // operands (LLVM scalar semantics). SIMD folds collapse a 128-bit vector
+  // load into one label and the folded lane-0 operation arrives here with
+  // size = element width but a 128-bit operand (openjpeg opj_mct_decode via
+  // _mm_load_si128 / _mm_add_epi32); truncating keeps the lane-0 dependency
+  // exact and stops the wide concat from leaking into 32-bit predicates
+  // where the converter would fold it to 0 and mis-predict the branch.
+  const uint16_t base_op = op & 0xff;
+  switch (base_op) {
+    case __dfsan::Add:
+    case __dfsan::Sub:
+    case __dfsan::Mul:
+    case __dfsan::UDiv:
+    case __dfsan::SDiv:
+    case __dfsan::URem:
+    case __dfsan::SRem:
+    case __dfsan::Shl:
+    case __dfsan::LShr:
+    case __dfsan::AShr:
+    case __dfsan::And:
+    case __dfsan::Or:
+    case __dfsan::Xor:
+    case __dfsan::ICmp:
+      if (l1 != 0 && l1 != kInitializingLabel &&
+          get_label_info(l1)->size > size)
+        l1 = do_taint_union(l1, CONST_LABEL, Trunc, size, 0, 0);
+      if (l2 != 0 && l2 != kInitializingLabel &&
+          get_label_info(l2)->size > size)
+        l2 = do_taint_union(l2, CONST_LABEL, Trunc, size, 0, 0);
+      break;
+    default:
+      break;
+  }
   if (l1 > l2 && is_commutative(op)) {
     // needs to swap both labels and concretes. fmemcmp capture bits follow
     // their operand values, not their normalized label positions.
@@ -1077,6 +1111,15 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
 
   // default fall through
   for (uptr i = 0; i < n; ++i) {
+    // Extracting beyond the source label's width is out of range (a wide
+    // store of a folded lane-0 label, e.g. openjpeg's _mm_store_si128 of a
+    // 32-bit SIMD-folded value). Those bytes carry no modeled dependency;
+    // leave them clean instead of fabricating an out-of-range Extract that
+    // the PCBT converter would fold to 0 and mis-predict.
+    if (i * 8 >= info->size) {
+      ls[i] = 0;
+      continue;
+    }
     ls[i] = do_taint_union(l, CONST_LABEL, Extract, 8, 0, i * 8);
   }
 }
