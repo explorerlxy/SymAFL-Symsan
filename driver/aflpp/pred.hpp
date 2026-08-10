@@ -151,8 +151,11 @@ class RunConverter {
   // input-dependent (never using the label's concrete op1/op2 as a constant).
   bool string_bytes(dfsan_label content, size_t max_bytes,
                     std::vector<StringByte> &out);
+  bool collect_string_nodes(dfsan_label label, size_t cap,
+                            std::vector<StringByte> &out);
   bool collect_byte_offsets(dfsan_label label, size_t cap,
                             std::vector<uint64_t> &offs);
+  uint32_t convert_strlen_expr(const dfsan_label_info &strlen_info);
   uint32_t convert_strlen_cmp(const dfsan_label_info *info, uint32_t op,
                               const dfsan_label_info &strlen_info);
   uint32_t convert_strchr_cmp(const dfsan_label_info *info, uint32_t op,

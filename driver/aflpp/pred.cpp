@@ -369,6 +369,12 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     return a == kInvalidNode || b == kInvalidNode
                ? kInvalidNode : add(PKind::Concat, size, a, b);
   }
+  // strlen is a numeric value, not only a comparison operand. Lower it to
+  // the exact prefix-nonzero sum so wrappers such as add/trunc/zext remain
+  // input-dependent instead of falling through to opaque admission.
+  if (op == __dfsan::fstrlen) {
+    return convert_strlen_expr(*info);
+  }
   if (op_lo == ICmp) {
     // A C memcmp result is specified only by its sign.  The scalar Memcmp node
     // therefore has a total canonical sign representation, but it is sound
@@ -572,19 +578,145 @@ bool RunConverter::collect_byte_offsets(dfsan_label label, size_t cap,
 // Expand a content label into an ordered byte list (string position i ==
 // out[i]).  Only consecutive input-byte spans are supported; anything else is
 // rejected so the caller marks the predicate opaque (conservative admission).
+bool RunConverter::collect_string_nodes(dfsan_label label, size_t cap,
+                                         std::vector<StringByte> &out) {
+  if (label == 0 || label >= table_labels_) return false;
+  const dfsan_label_info &info = table_[label];
+  const uint32_t op = info.op;
+  const uint32_t op_lo = op & 0xff;
+
+  auto append_const_bytes = [&](uint64_t value, size_t bytes) {
+    if (bytes == 0 || bytes > cap - out.size()) return false;
+    for (size_t i = 0; i < bytes; ++i) {
+      uint32_t nd = add(PKind::Const, 8, kNoChild, kNoChild,
+                        (value >> (8 * i)) & 0xff);
+      if (nd == kInvalidNode) return false;
+      out.push_back({nd, 0});
+    }
+    return true;
+  };
+
+  if (op == 0) {
+    if (out.size() >= cap || info.size != 8) return false;
+    uint32_t nd = add(PKind::Read, 8, kNoChild, kNoChild, info.op1.i);
+    if (nd == kInvalidNode) return false;
+    out.push_back({nd, (uint32_t)info.op1.i});
+    return true;
+  }
+  if (op_lo == Load) {
+    if (info.l1 == 0 || info.l1 >= table_labels_ || info.l2 == 0 ||
+        info.l2 > cap - out.size() || table_[info.l1].op != 0)
+      return false;
+    const uint64_t start = table_[info.l1].op1.i;
+    for (uint64_t i = 0; i < info.l2; ++i) {
+      uint32_t nd = add(PKind::Read, 8, kNoChild, kNoChild, start + i);
+      if (nd == kInvalidNode) return false;
+      out.push_back({nd, (uint32_t)(start + i)});
+    }
+    return true;
+  }
+  if (op_lo == Concat) {
+    if (info.size == 0 || (info.size & 7) != 0) return false;
+    uint16_t low_bits = 0;
+    uint16_t high_bits = 0;
+    if (info.l1 != 0) {
+      if (info.l1 >= table_labels_) return false;
+      low_bits = table_[info.l1].size;
+    }
+    if (info.l2 != 0) {
+      if (info.l2 >= table_labels_) return false;
+      high_bits = table_[info.l2].size;
+    }
+    if (info.l1 == 0) low_bits = info.size - high_bits;
+    if (info.l2 == 0) high_bits = info.size - low_bits;
+    if (low_bits == 0 || high_bits == 0 ||
+        static_cast<uint32_t>(low_bits) + high_bits != info.size)
+      return false;
+    if (info.l1 != 0) {
+      size_t before = out.size();
+      if (!collect_string_nodes(info.l1, cap, out) ||
+          out.size() - before != low_bits / 8)
+        return false;
+    } else if (!append_const_bytes(info.op1.i, low_bits / 8)) {
+      return false;
+    }
+    if (info.l2 != 0) {
+      size_t before = out.size();
+      if (!collect_string_nodes(info.l2, cap, out) ||
+          out.size() - before != high_bits / 8)
+        return false;
+    } else if (!append_const_bytes(info.op2.i, high_bits / 8)) {
+      return false;
+    }
+    return true;
+  }
+  if (op_lo == Trunc || op_lo == BitCast) {
+    dfsan_label child = info.l1 ? info.l1 : info.l2;
+    if (child == 0 || child >= table_labels_ || (info.size & 7) != 0)
+      return false;
+    std::vector<StringByte> child_bytes;
+    if (!collect_string_nodes(child, cap, child_bytes) ||
+        child_bytes.size() < info.size / 8)
+      return false;
+    out.insert(out.end(), child_bytes.begin(),
+               child_bytes.begin() + info.size / 8);
+    return out.size() <= cap;
+  }
+  if (op_lo == __dfsan::fsubstr && info.op2.i == 0) {
+    if (!collect_string_nodes(info.l1, cap, out) ||
+        out.size() < info.op1.i)
+      return false;
+    out.resize((size_t)info.op1.i);
+    return true;
+  }
+  return false;
+}
+
 bool RunConverter::string_bytes(dfsan_label content, size_t max_bytes,
                                 std::vector<StringByte> &out) {
-  std::vector<uint64_t> offs;
-  if (!collect_byte_offsets(content, max_bytes, offs)) return false;
-  if (offs.empty() || offs.size() > max_bytes) return false;
-  std::sort(offs.begin(), offs.end());
-  for (size_t i = 0; i < offs.size(); ++i) {
-    if (i > 0 && offs[i] != offs[i - 1] + 1) return false;
-    uint32_t nd = add(PKind::Read, 8, kNoChild, kNoChild, offs[i]);
-    if (nd == kInvalidNode) return false;
-    out.push_back({nd, (uint32_t)offs[i]});
+  out.clear();
+  return collect_string_nodes(content, max_bytes, out) && !out.empty();
+}
+
+uint32_t RunConverter::convert_strlen_expr(
+    const dfsan_label_info &strlen_info) {
+  const uint16_t bits = strlen_info.size;
+  if (bits == 0 || bits > 64) {
+    fail(PredError::InvalidWidth, static_cast<uint16_t>(strlen_info.op));
+    return kInvalidNode;
   }
-  return true;
+  // A program-provided terminator makes the length concrete by definition;
+  // only input-derived terminators need the byte-level expression below.
+  if (strlen_info.op1.i == 0)
+    return add_const(strlen_info.op2.i, bits);
+  if (strlen_info.op2.i > kMaxStrlenBytes) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(strlen_info.op));
+    return kInvalidNode;
+  }
+
+  std::vector<StringByte> bytes;
+  if (!string_bytes(strlen_info.l2, kMaxStrlenBytes, bytes) ||
+      strlen_info.op2.i >= bytes.size()) {
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(strlen_info.op));
+    return kInvalidNode;
+  }
+
+  uint32_t length = add_const(0, bits);
+  uint32_t prefix = add_const(1, 8);
+  uint32_t zero = add_const(0, 8);
+  if (length == kInvalidNode || prefix == kInvalidNode ||
+      zero == kInvalidNode)
+    return kInvalidNode;
+  for (const StringByte &byte : bytes) {
+    uint32_t term = add(PKind::ZExt, bits, prefix, kNoChild);
+    length = add(PKind::Add, bits, length, term);
+    uint32_t nonzero = add(PKind::Distinct, 8, byte.node, zero);
+    prefix = add(PKind::And, 8, prefix, nonzero);
+    if (length == kInvalidNode || nonzero == kInvalidNode ||
+        prefix == kInvalidNode)
+      return kInvalidNode;
+  }
+  return length;
 }
 
 // strlen(s) OP n, expanded into byte-nonzero constraints over the string's
