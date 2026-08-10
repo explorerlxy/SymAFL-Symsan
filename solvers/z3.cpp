@@ -127,6 +127,7 @@ static inline bool __solve_task(uint64_t task_id) {
 static struct switch_true_case {
   dfsan_label label;
   uint32_t cid;
+  bool matched;
 } __switch_true_case = {0};
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
@@ -183,17 +184,27 @@ __taint_trace_cmp(dfsan_label op1, dfsan_label op2, uint32_t size, uint32_t pred
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_switch_end(uint32_t cid) {
-  if (__switch_true_case.label == 0) {
-    // filtering should have been done before
-    return;
-  } else if (__switch_true_case.cid != cid) {
+  if (__switch_true_case.cid != cid) {
     AOUT("WARNING: switch end cid mismatch %u vs %u\n",
          __switch_true_case.cid, cid);
     return;
   }
 
+  if (__switch_true_case.label == 0) {
+    // The default path is already represented by the last false case.
+    __switch_true_case.cid = 0;
+    __switch_true_case.matched = false;
+    return;
+  }
+
   void *addr = __builtin_return_address(0);
   dfsan_label label = __switch_true_case.label;
+  // Do not let a parser failure leave the previous switch in flight. The
+  // native dispatch has already completed; this state is only suppression
+  // bookkeeping for the current instrumented switch.
+  __switch_true_case.label = 0;
+  __switch_true_case.cid = 0;
+  __switch_true_case.matched = false;
 
   AOUT("solving switch end: %u 0x%x @%p\n", label, cid, addr);
 
@@ -214,8 +225,23 @@ __taint_trace_switch_end(uint32_t cid) {
 
   // mark as flipped
   __solved_labels.insert(label);
-  // reset the switch label
-  __switch_true_case.label = 0;
+}
+
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_switch_cmp(dfsan_label op1, dfsan_label op2, uint32_t size,
+                         uint32_t predicate, uint64_t c1, uint64_t c2,
+                         uint32_t cid) {
+  if (__switch_true_case.cid != cid) {
+    __switch_true_case.label = 0;
+    __switch_true_case.cid = cid;
+    __switch_true_case.matched = false;
+  }
+  if (__switch_true_case.matched)
+    return;
+
+  __taint_trace_cmp(op1, op2, size, predicate, c1, c2, cid);
+  if (get_const_result(c1, c2, predicate))
+    __switch_true_case.matched = true;
 }
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void

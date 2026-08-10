@@ -473,6 +473,7 @@ class Taint {
   FunctionType *TaintVarargArgFnTy;
   FunctionType *TaintVarargEndFnTy;
   FunctionType *TaintTraceCmpFnTy;
+  FunctionType *TaintTraceSwitchCmpFnTy;
   FunctionType *TaintTraceCondFnTy;
   FunctionType *TaintTraceLoopFnTy;
   FunctionType *TaintTraceSwitchEndFnTy;
@@ -504,6 +505,7 @@ class Taint {
   FunctionCallee TaintVarargArgFn;
   FunctionCallee TaintVarargEndFn;
   FunctionCallee TaintTraceCmpFn;
+  FunctionCallee TaintTraceSwitchCmpFn;
   FunctionCallee TaintTraceCondFn;
   FunctionCallee TaintTraceLoopFn;
   FunctionCallee TaintTraceSwitchEndFn;
@@ -1086,6 +1088,8 @@ bool Taint::initializeModule(Module &M) {
       Int32Ty, Int32Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceCmpFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceCmpArgs, false);
+  TaintTraceSwitchCmpFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx), TaintTraceCmpArgs, false);
   Type *TaintTraceCondArgs[4] = { PrimitiveShadowTy, IntegerType::get(*Ctx, 1),
       Int8Ty, Int32Ty };
   TaintTraceCondFnTy = FunctionType::get(
@@ -1385,6 +1389,16 @@ void Taint::initializeCallbackFunctions(Module &M) {
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
+    TaintTraceSwitchCmpFn =
+        Mod->getOrInsertFunction("__taint_trace_switch_cmp",
+                                 TaintTraceSwitchCmpFnTy, AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    AL = AL.addParamAttribute(M.getContext(), 1, Attribute::ZExt);
     TaintTraceCondFn =
         Mod->getOrInsertFunction("__taint_trace_cond", TaintTraceCondFnTy, AL);
   }
@@ -1494,6 +1508,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
 
   TaintRuntimeFunctions.insert(
       TaintTraceCmpFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintTraceSwitchCmpFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintTraceCondFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -3851,7 +3867,8 @@ void TaintFunction::visitSwitchInst(SwitchInst *I) {
 
     Cond = IRB.CreateZExtOrTrunc(Cond, TT.Int64Ty);
     CV = IRB.CreateZExtOrTrunc(CV, TT.Int64Ty);
-    IRB.CreateCall(TT.TaintTraceCmpFn, {CondShadow, TT.ZeroPrimitiveShadow,
+    IRB.CreateCall(TT.TaintTraceSwitchCmpFn,
+                   {CondShadow, TT.ZeroPrimitiveShadow,
                    Size, Predicate, Cond, CV, CID});
   }
   IRB.CreateCall(TT.TaintTraceSwitchEndFn, {CID});

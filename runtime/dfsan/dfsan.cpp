@@ -2177,6 +2177,9 @@ SANITIZER_INTERFACE_WEAK_DEF(void, InitializeSymSanSolver, void) {}
 // Default empty implementations (weak) for hooks
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cmp, dfsan_label, dfsan_label,
                              uint32_t, uint32_t, uint64_t, uint64_t, uint32_t) {}
+SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_switch_cmp, dfsan_label,
+                             dfsan_label, uint32_t, uint32_t, uint64_t,
+                             uint64_t, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_cond, dfsan_label, bool,
                              uint8_t, uint32_t) {}
 SANITIZER_INTERFACE_WEAK_DEF(void, __taint_trace_loop, uint32_t, uint32_t) {}
