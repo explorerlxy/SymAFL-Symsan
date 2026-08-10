@@ -344,26 +344,21 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   for (const Event &ev : events) num_events += ev.count;
 
   if (events.empty()) {
-    // The candidate produced no further symbolic decisions past this edge.
-    // For a pinned constraint value (dir-1) this records the branch
-    // terminating here; the value-fork direction (dir-0) of a constraint
-    // node is only ever marked terminal when a candidate actually walked it
-    // with no follow-up (any divergence would have been collected).
-    // A constraint node's value-fork can never legitimately reach here: a
-    // candidate that evaluates dir-0 at a constraint node re-emits its own
-    // multi-successor decision event at the same stream position (suffix
-    // capture starts at the parent's skipCnt), so its captured suffix always
-    // contains that constraint event and is never empty. Reaching here on a
-    // constraint node therefore means the decision was invisible for this
-    // candidate (label==0, e.g. an EOF/zero-count read) — a
-    // collection-completeness gap, not a real termination — so the edge
-    // stays unexplored and the normal rCnt/rlimit budget governs it instead
-    // of being hard-closed.
-    if (!node(parent).constraint) {
-      node(parent).child[direction] = kTerminal;
-    }
-    // The edge this insertion closed (or left unexplored on a constraint
-    // value-fork) is parent->direction.
+    // An empty suffix proves only that THIS candidate produced no further
+    // symbolic decision past the edge; it is not a termination proof for
+    // the edge itself. Collection gaps (a length/count shadow that never
+    // carried a symbolic label for this candidate, an early-terminating
+    // invalid input, an invisible read, ...) let same-prefix candidates
+    // legitimately continue with nonempty suffixes, so hard-closing the
+    // edge would fabricate a terminal proof and veto those candidates
+    // (terminal-veto-but-gain; observed at libxml2 node 97023 where a
+    // 1-3-byte-different sibling carried 53 further events). The edge
+    // stays unexplored and the rCnt/rlimit budget governs repeated
+    // mining, the same policy constraint parents already use. Nonempty
+    // suffixes still close their tail as terminal: that records a
+    // candidate's observed final decision, a strictly stronger
+    // termination signal.
+    // The edge this insertion left unexplored is parent->direction.
     if (out_tail_node) *out_tail_node = parent;
     if (out_tail_dir) *out_tail_dir = direction;
     return 0;

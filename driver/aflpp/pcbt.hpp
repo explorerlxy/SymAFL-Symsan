@@ -85,14 +85,15 @@ class Tree {
 
   // Insert the suffix known to follow parent.child[direction]. The caller has
   // already established the PCBT prefix during screening, so this performs no
-  // root replay or prefix matching. An empty suffix records the terminal node
-  // on ordinary nodes. On a constraint parent it is never a valid
-  // termination: a candidate that walked the value-fork (dir-0) re-emits its
-  // own multi-successor decision event at the parent's stream position, so
-  // the captured suffix always contains that event and is never empty — an
-  // empty suffix there only arises from a collection-completeness gap (the
-  // decision was invisible for this candidate), and the edge stays
-  // unexplored for the rCnt/rlimit budget instead of being closed.
+  // root replay or prefix matching. An empty suffix never closes the edge: it
+  // proves only that THIS candidate produced no further symbolic decision,
+  // not that the edge terminates. Collection gaps (a length/count shadow
+  // absent for this candidate, an early-terminating invalid input, an
+  // invisible read) let same-prefix candidates continue with nonempty
+  // suffixes, so hard-closing would fabricate a terminal proof and veto them
+  // (terminal-veto-but-gain). The edge stays unexplored for the rCnt/rlimit
+  // budget instead of being closed, on ordinary and constraint parents alike.
+  // Nonempty suffixes close their tail as terminal.
   // When the suffix inserts any node, *out_tail_node / *out_tail_dir
   // (optional) receive the LAST inserted edge — the edge that becomes
   // terminal (or that a later insertion continues from). This is the edge a
