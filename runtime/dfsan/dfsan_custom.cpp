@@ -1019,6 +1019,29 @@ __dfsw_strlen(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   return ret;
 }
 
+// strnlen: bounded strlen. The return value (first NUL position capped at n)
+// drives caller control flow (e.g. `strnlen(s, n) != n` overflow checks), so
+// it must stay symbolic when the scanned window is input-derived; same model
+// as strlen (fstrlen length label). When the scan hits the bound without a
+// NUL the true length is n, but the conservative fstrlen label keeps the
+// branch input-dependent, which is the safe direction.
+SANITIZER_INTERFACE_ATTRIBUTE size_t
+__dfsw_strnlen(const char *s, size_t n, dfsan_label s_label,
+               dfsan_label n_label, dfsan_label *ret_label) {
+  size_t ret = strnlen(s, n);
+  dfsan_label str_label = dfsan_read_label(s, ret + 1);
+  if (str_label == 0) {
+    *ret_label = 0;
+  } else {
+    dfsan_label null_label = dfsan_read_label(s + ret, 1);
+    bool null_from_input = (null_label != 0);
+    *ret_label = dfsan_union(0, str_label, fstrlen,
+                             sizeof(size_t) * 8,
+                             null_from_input ? 1 : 0, ret);
+  }
+  return ret;
+}
+
 // When USE_UCSAN_CUSTOM is defined, ucsan_custom.cpp provides these functions
 // which handle both UCSan and SymSan shadow memory via the bridge.
 #ifndef USE_UCSAN_CUSTOM
