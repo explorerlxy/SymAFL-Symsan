@@ -17,6 +17,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <iconv.h>
 #include <link.h>
 #include <malloc.h>
 #include <math.h>
@@ -4679,6 +4680,58 @@ __dfsw_assume_cond(bool result, uint64_t id, dfsan_label result_label, dfsan_lab
     exit(201);
   }
   __taint_add_constraint(result_label, 1);
+}
+
+// iconv family: control-flow-relevant black-box conversion. libc iconv is
+// uninstrumented, so without a wrapper the conversion outcome (ret/errno)
+// and the produced output bytes lose their shadow. Callers that branch on
+// the outcome (e.g. libxml2 xmlIconvWrapper's `errno == EILSEQ` check)
+// then emit no symbolic event and the PCBT misses the encoding-success/
+// failure fork — observed as a libxml2 terminal-veto-but-gain where the
+// vetoed input's UCS-4 conversion failed while the tree's path was built
+// from a succeeding sibling. This is a deliberately conservative boundary
+// model: we restore input-dependence of the output window, of errno on
+// failure, and of the return value; we do not reconstruct the exact
+// conversion relation inside libc.
+SANITIZER_INTERFACE_ATTRIBUTE
+iconv_t __dfsw_iconv_open(const char *tocode, const char *fromcode,
+                          dfsan_label tocode_label,
+                          dfsan_label fromcode_label) {
+  return iconv_open(tocode, fromcode);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+int __dfsw_iconv_close(iconv_t cd, dfsan_label cd_label) {
+  return iconv_close(cd);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE
+size_t __dfsw_iconv(iconv_t cd, char **inbuf, size_t *inbytesleft,
+                    char **outbuf, size_t *outbytesleft,
+                    dfsan_label cd_label, dfsan_label inbuf_label,
+                    dfsan_label inbytesleft_label, dfsan_label outbuf_label,
+                    dfsan_label outbytesleft_label, dfsan_label *ret_label) {
+  const size_t orig_in = (inbytesleft != nullptr) ? *inbytesleft : 0;
+  const size_t orig_out = (outbytesleft != nullptr) ? *outbytesleft : 0;
+  // The first conversion unit's shadow is the dependency for this call's
+  // failure state. UCS-4-style encodings convert one character (<= 4 bytes)
+  // at a time and stop at the first invalid unit, so a small fixed window
+  // covers the EILSEQ decision while keeping the generated label DAG shallow
+  // (a full-window union of a 30-byte input produced opaque predicates).
+  dfsan_label input_label = 0;
+  if (inbuf != nullptr && *inbuf != nullptr && orig_in > 0) {
+    const size_t window = orig_in < 4 ? orig_in : 4;
+    input_label = dfsan_read_label(*inbuf, window);
+  }
+  size_t ret = iconv(cd, inbuf, inbytesleft, outbuf, outbytesleft);
+  // On failure the caller's `errno == EILSEQ`-style branches must stay
+  // symbolic: set errno's shadow to the input taint.
+  if (ret == (size_t)-1 && input_label)
+    dfsan_set_label(input_label, __errno_location(), sizeof(int));
+  // The return value stays unmodeled (a full-window dependency would be
+  // opaque); the caller's `errno == EILSEQ` branch carries the failure fork.
+  *ret_label = 0;
+  return ret;
 }
 
 }  // extern "C"
