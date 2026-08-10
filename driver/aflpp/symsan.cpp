@@ -631,8 +631,10 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     fprintf(stderr, "[pcbt] probe diagnostic enabled (SYMAFL_PROBE_DIAG=1)\n");
   }
   if (getenv("SYMAFL_PROBE_LEARN")) {
-    fprintf(stderr, "[pcbt] SYMAFL_PROBE_LEARN is ignored: probes are "
-                    "measurement-only and cannot mutate the PCBT\n");
+    data->probe_learn = true;
+    fprintf(stderr, "[pcbt] probe learn enabled (SYMAFL_PROBE_LEARN=1): "
+                    "a coverage-gaining rlimit probe inserts its suffix and "
+                    "refreshes the frontier edge's retry budget\n");
   }
   if (const char *pl = getenv("SYMAFL_PAIR_LOG")) {
     data->pair_log_path = (char *)ck_strdup((u8 *)pl);
@@ -1811,6 +1813,36 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
       }
     } else {
       data->probe_gained_rlimit += 1;
+      // Probe learn: a vetoed candidate that gains coverage proves the
+      // frontier edge still pays out. Insert its captured suffix into the
+      // tree and refresh the edge's retry budget so subsequent candidates
+      // on the same edge can reach that coverage instead of being vetoed at
+      // the exhausted budget. Non-gaining probes never mutate the tree, so
+      // non_gain_filter is preserved.
+      if (data->probe_learn && data->probe_capture_pending &&
+          data->probe_capture_node != pcbt::kUnexplored &&
+          data->last_probe_suffix_nonempty) {
+        std::vector<pcbt::Event> events;
+        uint32_t raw_event_count = 0;
+        bool trace_overflow = false;
+        decode_probe_capture(data, &events, &raw_event_count,
+                             &trace_overflow);
+        if (!trace_overflow && !events.empty()) {
+          uint32_t created = data->tree.InsertSuffix(
+              data->probe_capture_node, data->probe_capture_dir, events,
+              __dfsan_label_info, MAX_LABEL, nullptr, nullptr);
+          if (created > 0) {
+            // A nonempty learned suffix proves the edge has real follow-up
+            // paths; refresh the budget so later candidates can reach them.
+            // Empty-suffix gains are un-symbolized coverage differences and
+            // are NOT learned: refreshing there admitted 8.6x more no-ops
+            // (non_gain_filter 0.92 -> 0.12 in the libtiff experiment).
+            data->tree.retry_count(data->probe_capture_node,
+                                   data->probe_capture_dir) = 0;
+            data->probe_learned += 1;
+          }
+        }
+      }
     }
     if (data->probe_gained_log) {
       fprintf(data->probe_gained_log,
