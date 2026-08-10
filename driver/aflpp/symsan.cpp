@@ -94,6 +94,8 @@ struct my_mutator_t {
     if (probe_case_dir) ck_free(probe_case_dir);
     if (probe_terminal_dir) ck_free(probe_terminal_dir);
     if (probe_rlimit_dir) ck_free(probe_rlimit_dir);
+    if (forensics_dir) ck_free(forensics_dir);
+    if (pair_log_path) ck_free(pair_log_path);
   }
 
   afl_state_t *afl;
@@ -223,6 +225,20 @@ struct my_mutator_t {
   uint8_t last_probe_veto_kind = 0;   // veto kind of the last probe candidate
   uint8_t last_probe_input[64] = {};
   uint32_t last_probe_input_len = 0;
+
+  // Immediate forensic snapshots.  The first few instances of each hard
+  // diagnostic are persisted from the current child/table before either is
+  // reused; later instances remain counters so diagnostics cannot dominate
+  // throughput.
+  char *forensics_dir = nullptr;
+  uint64_t forensic_limit = 8;
+  uint64_t forensic_seq = 0;
+  uint64_t forensic_opaque_seen = 0;
+  uint64_t forensic_opaque_captured = 0;
+  uint64_t forensic_opaque_suppressed = 0;
+  uint64_t forensic_terminal_seen = 0;
+  uint64_t forensic_terminal_captured = 0;
+  uint64_t forensic_terminal_suppressed = 0;
   // Saturation via probe-gain windows (SYMAFL_SAT_WINDOW / SYMAFL_SAT_MIN_GAINS,
   // default off): once a window of probe outcomes yields fewer than
   // sat_min_gains coverage gains, the vetoed population no longer carries
@@ -257,6 +273,7 @@ struct my_mutator_t {
   // edge -- with the identical PCBT path. Both streams replayed through the
   // concolic target expose the decision the tree missed.
   FILE *pair_log = nullptr;
+  char *pair_log_path = nullptr;
   // SYMAFL_PROBE_GAINED_LOG: append-only list of queue filenames that were
   // vetoed, probe-executed, and gained coverage. Used for end-of-run bitmap
   // checks: does the gain survive to the final bitmap, or was it superseded?
@@ -515,6 +532,26 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   }
   init_forkserver_capture(data);
 
+  if (const char *forensics = getenv("SYMAFL_FORENSICS_DIR")) {
+    if (!*forensics) FATAL("SYMAFL_FORENSICS_DIR must not be empty");
+    data->forensics_dir = (char *)ck_strdup((u8 *)forensics);
+    if (mkdir(data->forensics_dir, 0755) && errno != EEXIST) {
+      PFATAL("cannot create SYMAFL forensic directory %s",
+             data->forensics_dir);
+    }
+    if (const char *limit = getenv("SYMAFL_FORENSICS_LIMIT")) {
+      char *end = nullptr;
+      unsigned long long parsed = strtoull(limit, &end, 10);
+      if (end == limit || *end != '\0' || parsed == 0) {
+        FATAL("Invalid SYMAFL_FORENSICS_LIMIT=%s", limit);
+      }
+      data->forensic_limit = parsed;
+    }
+    fprintf(stderr, "[pcbt] immediate forensics: %s (limit=%llu per reason)\n",
+            data->forensics_dir,
+            (unsigned long long)data->forensic_limit);
+  }
+
   if (getenv("SYMAFL_REPLAY_CHECK")) {
     data->replay_check = true;
     fprintf(stderr, "[pcbt] replay check enabled: all admitted candidates "
@@ -598,6 +635,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
                     "measurement-only and cannot mutate the PCBT\n");
   }
   if (const char *pl = getenv("SYMAFL_PAIR_LOG")) {
+    data->pair_log_path = (char *)ck_strdup((u8 *)pl);
     data->pair_log = fopen(pl, "w");
     if (!data->pair_log) {
       FATAL("cannot open SYMAFL_PAIR_LOG=%s", pl);
@@ -725,6 +763,19 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->profile_insert_calls,
           (unsigned long long)data->profile_exec_ns,
           (unsigned long long)data->profile_exec_calls);
+  if (data->forensics_dir) {
+    fprintf(stderr,
+            "[pcbt-forensics] dir=%s opaque_seen=%llu opaque_captured=%llu "
+            "opaque_suppressed=%llu terminal_seen=%llu "
+            "terminal_captured=%llu terminal_suppressed=%llu\n",
+            data->forensics_dir,
+            (unsigned long long)data->forensic_opaque_seen,
+            (unsigned long long)data->forensic_opaque_captured,
+            (unsigned long long)data->forensic_opaque_suppressed,
+            (unsigned long long)data->forensic_terminal_seen,
+            (unsigned long long)data->forensic_terminal_captured,
+            (unsigned long long)data->forensic_terminal_suppressed);
+  }
   if (data->profile_enabled) {
     const uint64_t calls = data->profile_check_calls;
     fprintf(stderr,
@@ -1107,6 +1158,195 @@ static bool replay_check_trace(my_mutator_t *data,
   return false;  // discard mismatched trace
 }
 
+struct ForensicSnapshotMeta {
+  const char *trace_mode = "unknown";
+  uint32_t skip_depth = 0;
+  uint32_t raw_event_count = 0;
+  bool trace_overflow = false;
+  uint64_t opaque_before = 0;
+  uint64_t opaque_after = 0;
+  pcbt::NodeRef veto_node = pcbt::kUnexplored;
+  uint8_t veto_dir = 0;
+  uint8_t veto_kind = 0;
+  uint32_t veto_depth = 0;
+  uint8_t new_bits = 0;
+  const char *pair_log = nullptr;
+};
+
+static void write_forensic_input(const std::string &path, const u8 *input,
+                                 size_t input_len) {
+  int fd = open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) PFATAL("cannot create forensic input %s", path.c_str());
+  if (input_len) ck_write(fd, const_cast<u8 *>(input), input_len, path.c_str());
+  close(fd);
+}
+
+// Persist the current candidate's raw event stream and the complete label DAG
+// reachable from those events.  This runs while the child-owned shared union
+// table is still valid; a later forensic replay is deliberately unnecessary.
+static bool capture_forensic_snapshot(
+    my_mutator_t *data, const char *reason,
+    const std::vector<pcbt::Event> &events, const dfsan_label_info *table,
+    size_t table_labels, const u8 *input, size_t input_len,
+    const ForensicSnapshotMeta &meta) {
+  if (!data->forensics_dir) return false;
+
+  uint64_t *seen_count = nullptr;
+  uint64_t *captured_count = nullptr;
+  uint64_t *suppressed_count = nullptr;
+  if (strcmp(reason, "opaque") == 0) {
+    seen_count = &data->forensic_opaque_seen;
+    captured_count = &data->forensic_opaque_captured;
+    suppressed_count = &data->forensic_opaque_suppressed;
+  } else if (strcmp(reason, "terminal-veto-but-gain") == 0) {
+    seen_count = &data->forensic_terminal_seen;
+    captured_count = &data->forensic_terminal_captured;
+    suppressed_count = &data->forensic_terminal_suppressed;
+  } else {
+    FATAL("unknown forensic snapshot reason: %s", reason);
+  }
+  *seen_count += 1;
+  if (*captured_count >= data->forensic_limit) {
+    *suppressed_count += 1;
+    return false;
+  }
+
+  const uint64_t sequence = data->forensic_seq++;
+  char *suffix = alloc_printf("%06llu-%s", (unsigned long long)sequence,
+                               reason);
+  std::string base = std::string(data->forensics_dir) + "/snapshot-" + suffix;
+  ck_free(suffix);
+  std::string input_path = base + "-input.bin";
+  std::string events_path = base + "-events.tsv";
+  std::string labels_path = base + "-labels.tsv";
+  std::string tree_path = base + "-tree.tsv";
+  std::string meta_path = base + "-meta.txt";
+
+  write_forensic_input(input_path, input, input_len);
+
+  FILE *event_file = fopen(events_path.c_str(), "w");
+  if (!event_file) PFATAL("cannot create forensic events %s",
+                          events_path.c_str());
+  fprintf(event_file, "index\tcid\tlabel\tresult\tconstraint\tcount\n");
+  for (size_t i = 0; i < events.size(); ++i) {
+    const pcbt::Event &event = events[i];
+    fprintf(event_file, "%zu\t%u\t%u\t%u\t%u\t%u\n", i, event.cid,
+            event.label, event.result, event.constraint, event.count);
+  }
+  fclose(event_file);
+
+  FILE *label_file = fopen(labels_path.c_str(), "w");
+  if (!label_file) PFATAL("cannot create forensic labels %s",
+                          labels_path.c_str());
+  fprintf(label_file,
+          "label\top\tsize\tl1\tl2\top1\top2\top1_hi\top2_hi\thash\n");
+  std::unordered_set<dfsan_label> seen;
+  std::vector<dfsan_label> pending;
+  pending.reserve(events.size());
+  for (const pcbt::Event &event : events) pending.push_back(event.label);
+  while (!pending.empty()) {
+    dfsan_label label = pending.back();
+    pending.pop_back();
+    if (label == 0 || label == kInitializingLabel || label >= table_labels) {
+      continue;
+    }
+    if (!seen.insert(label).second) continue;
+    const dfsan_label_info &info = table[label];
+    fprintf(label_file, "%u\t%u\t%u\t%u\t%u\t%llu\t%llu\t%llu\t%llu\t%u\n",
+            label, info.op, info.size, info.l1, info.l2,
+            (unsigned long long)info.op1.i, (unsigned long long)info.op2.i,
+            (unsigned long long)info.op1_hi, (unsigned long long)info.op2_hi,
+            info.hash);
+    if (info.l2) pending.push_back(info.l2);
+    if (info.l1) pending.push_back(info.l1);
+  }
+  fclose(label_file);
+
+  data->tree.Dump(tree_path.c_str());
+
+  FILE *meta_file = fopen(meta_path.c_str(), "w");
+  if (!meta_file) PFATAL("cannot create forensic metadata %s",
+                         meta_path.c_str());
+  const pcbt::Tree &tree = data->tree;
+  fprintf(meta_file, "snapshot_version=1\nreason=%s\nsequence=%llu\n",
+          reason, (unsigned long long)sequence);
+  fprintf(meta_file, "input=%s\nevents=%s\nlabels=%s\ntree=%s\n",
+          input_path.c_str(), events_path.c_str(), labels_path.c_str(),
+          tree_path.c_str());
+  fprintf(meta_file,
+          "trace_mode=%s\nskip_depth=%u\nraw_event_count=%u\n"
+          "captured_event_count=%zu\ntrace_overflow=%u\ninput_len=%zu\n",
+          meta.trace_mode, meta.skip_depth, meta.raw_event_count, events.size(),
+          meta.trace_overflow ? 1u : 0u, input_len);
+  fprintf(meta_file,
+          "opaque_before=%llu\nopaque_after=%llu\nopaque_delta=%llu\n"
+          "tree_nodes=%llu\ntree_depth=%llu\n",
+          (unsigned long long)meta.opaque_before,
+          (unsigned long long)meta.opaque_after,
+          (unsigned long long)(meta.opaque_after >= meta.opaque_before
+                                   ? meta.opaque_after - meta.opaque_before
+                                   : 0),
+          (unsigned long long)tree.num_nodes,
+          (unsigned long long)tree.max_depth);
+  fprintf(meta_file,
+          "veto_node=%u\nveto_cid=%u\nveto_dir=%u\nveto_kind=%u\n"
+          "veto_depth=%u\nnew_bits=%u\n",
+          meta.veto_node, meta.veto_node != pcbt::kUnexplored
+                              ? tree.cid_of(meta.veto_node)
+                              : 0u,
+          meta.veto_dir, meta.veto_kind, meta.veto_depth, meta.new_bits);
+  fprintf(meta_file, "pair_log=%s\n", meta.pair_log ? meta.pair_log : "");
+  fclose(meta_file);
+  *captured_count += 1;
+  fprintf(stderr, "[pcbt-forensics] reason=%s snapshot=%s events=%zu labels=%zu\n",
+          reason, meta_path.c_str(), events.size(), seen.size());
+  return true;
+}
+
+static bool decode_probe_capture(my_mutator_t *data,
+                                 std::vector<pcbt::Event> *events,
+                                 uint32_t *raw_count, bool *overflow) {
+  if (!data->single_pass_armed) {
+    *raw_count = 0;
+    *overflow = false;
+    return false;
+  }
+  symafl_single_pass_control *control = data->single_pass_control;
+  const uint32_t count = __atomic_load_n(&control->event_count,
+                                         __ATOMIC_ACQUIRE);
+  *raw_count = count;
+  *overflow = __atomic_load_n(&control->overflow, __ATOMIC_ACQUIRE) ||
+              count > control->event_capacity;
+  const uint32_t available = std::min(count, control->event_capacity);
+  events->reserve(available);
+  for (uint32_t i = 0; i < available; ++i) {
+    const symafl_single_pass_event &event = control->events[i];
+    events->push_back({event.cid, event.label, event.result,
+                       event.constraint,
+                       static_cast<uint16_t>(event.count ? event.count : 1)});
+  }
+  return true;
+}
+
+static void capture_opaque_if_new(
+    my_mutator_t *data, uint64_t opaque_before,
+    const std::vector<pcbt::Event> &events, const dfsan_label_info *table,
+    size_t table_labels, const u8 *input, size_t input_len,
+    const char *trace_mode, uint32_t skip_depth, uint32_t raw_event_count,
+    bool trace_overflow) {
+  const uint64_t opaque_after = data->tree.num_opaque;
+  if (opaque_after == opaque_before) return;
+  ForensicSnapshotMeta meta;
+  meta.trace_mode = trace_mode;
+  meta.skip_depth = skip_depth;
+  meta.raw_event_count = raw_event_count;
+  meta.trace_overflow = trace_overflow;
+  meta.opaque_before = opaque_before;
+  meta.opaque_after = opaque_after;
+  capture_forensic_snapshot(data, "opaque", events, table, table_labels, input,
+                            input_len, meta);
+}
+
 static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
                                size_t buf_size, const char *fname,
                                pcbt::NodeRef *out_tail_node = nullptr,
@@ -1123,6 +1363,7 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
     disarm_capture(data);
     return false;
   }
+  const uint64_t opaque_before = data->tree.num_opaque;
   uint32_t created = data->tree.InsertTrace(events, __dfsan_label_info,
                                             MAX_LABEL, buf,
                                             (uint32_t)buf_size,
@@ -1133,6 +1374,9 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   fprintf(stderr, "[pcbt-trace] %s mode=full events=%zu expanded=%llu "
           "created=%u\n", fname, events.size(),
           (unsigned long long)expanded, created);
+  capture_opaque_if_new(data, opaque_before, events, __dfsan_label_info,
+                        MAX_LABEL, buf, buf_size, "pipe-full", 0,
+                        (uint32_t)events.size(), false);
   disarm_capture(data);
   return true;
 }
@@ -1152,6 +1396,7 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
     disarm_capture(data);
     return false;
   }
+  const uint64_t opaque_before = data->tree.num_opaque;
   uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
       events, __dfsan_label_info, MAX_LABEL, out_tail_node, out_tail_dir);
   uint64_t expanded = 0;
@@ -1161,6 +1406,10 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
           "created=%u\n",
           fname, data->tree.depth(data->last_node), events.size(),
           (unsigned long long)expanded, created);
+  capture_opaque_if_new(data, opaque_before, events, __dfsan_label_info,
+                        MAX_LABEL, buf, buf_size, "pipe-suffix",
+                        data->tree.depth(data->last_node),
+                        (uint32_t)events.size(), false);
   disarm_capture(data);
   return true;
 }
@@ -1208,6 +1457,7 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
   profile_stop(data, decode_start, &data->profile_decode_ns,
                &data->profile_decode_calls);
   uint64_t insert_start = profile_start(data);
+  const uint64_t opaque_before = data->tree.num_opaque;
   uint32_t created = root_capture
       ? data->tree.InsertTrace(events, data->single_pass_label_info,
                                MAX_LABEL, buf, (uint32_t)buf_size,
@@ -1226,6 +1476,11 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
           fname, root_capture ? "root-shm" : "suffix",
           root_capture ? 0 : data->tree.depth(data->last_node), events.size(),
           (unsigned long long)expanded, created);
+  capture_opaque_if_new(data, opaque_before, events,
+                        data->single_pass_label_info, MAX_LABEL, buf,
+                        buf_size, root_capture ? "root-shm" : "shm-suffix",
+                        root_capture ? 0 : data->tree.depth(data->last_node),
+                        count, false);
   disarm_capture(data);
   return true;
 }
@@ -1315,18 +1570,21 @@ static bool read_cur_input(my_mutator_t *data, std::vector<u8> *buf) {
 // tree missed.
 static void record_admitted_pair(my_mutator_t *data, pcbt::NodeRef tail_node,
                                  uint8_t tail_dir) {
-  if (!data->pair_log || tail_node == pcbt::kUnexplored) return;
+  if ((!data->pair_log && !data->forensics_dir) ||
+      tail_node == pcbt::kUnexplored) return;
   std::vector<u8> buf;
   if (!read_cur_input(data, &buf)) return;
-  fprintf(data->pair_log, "admit node=%u cid=%u dir=%u len=%zu hex=",
-          tail_node, data->tree.cid_of(tail_node), tail_dir, buf.size());
-  size_t shown = buf.size() < 4096 ? buf.size() : 4096;
-  for (size_t i = 0; i < shown; ++i) {
-    fprintf(data->pair_log, "%02x", buf[i]);
+  if (data->pair_log) {
+    fprintf(data->pair_log, "admit node=%u cid=%u dir=%u len=%zu hex=",
+            tail_node, data->tree.cid_of(tail_node), tail_dir, buf.size());
+    size_t shown = buf.size() < 4096 ? buf.size() : 4096;
+    for (size_t i = 0; i < shown; ++i) {
+      fprintf(data->pair_log, "%02x", buf[i]);
+    }
+    if (shown < buf.size()) fprintf(data->pair_log, " TRUNC");
+    fprintf(data->pair_log, "\n");
+    fflush(data->pair_log);
   }
-  if (shown < buf.size()) fprintf(data->pair_log, " TRUNC");
-  fprintf(data->pair_log, "\n");
-  fflush(data->pair_log);
 }
 
 // Veto side of the identical-PCBT-path pair forensics: a veto-probe that
@@ -1516,6 +1774,34 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
       data->probe_gained_terminal += 1;
       WARNF("terminal-veto-but-gain detected; stopping quality run\n");
       data->afl->stop_soon = 1;
+      if (data->forensics_dir) {
+        std::vector<pcbt::Event> events;
+        uint32_t raw_event_count = 0;
+        bool trace_overflow = false;
+        decode_probe_capture(data, &events, &raw_event_count,
+                             &trace_overflow);
+        const uint32_t mode = data->single_pass_armed
+            ? __atomic_load_n(&data->single_pass_control->mode,
+                              __ATOMIC_ACQUIRE)
+            : SYMAFL_TRACE_OFF;
+        const char *trace_mode = mode == SYMAFL_TRACE_SUFFIX_SHM
+            ? "shm-suffix"
+            : mode == SYMAFL_TRACE_SUFFIX_PIPE ? "pipe-suffix" : "none";
+        ForensicSnapshotMeta meta;
+        meta.trace_mode = trace_mode;
+        meta.skip_depth = data->last_veto_depth;
+        meta.raw_event_count = raw_event_count;
+        meta.trace_overflow = trace_overflow;
+        meta.veto_node = data->last_veto_node;
+        meta.veto_dir = data->last_veto_dir;
+        meta.veto_kind = data->last_probe_veto_kind;
+        meta.veto_depth = data->last_veto_depth;
+        meta.new_bits = new_bits;
+        meta.pair_log = data->pair_log_path;
+        capture_forensic_snapshot(data, "terminal-veto-but-gain", events,
+                                  __dfsan_label_info, MAX_LABEL, buf, buf_size,
+                                  meta);
+      }
     } else {
       data->probe_gained_rlimit += 1;
     }
@@ -1787,10 +2073,15 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     memcpy(data->last_probe_input, buf, data->last_probe_input_len);
     if (data->sat_window) data->sat_probe_total += 1;
     if (data->single_pass_armed) disarm_capture(data);
-    if (data->probe_diag && data->last_veto_depth > 0) {
+    const bool forensic_terminal_capture =
+        data->forensics_dir && data->last_probe_veto_kind == 0 &&
+        data->last_veto_depth > 0;
+    if ((data->probe_diag || forensic_terminal_capture) &&
+        data->last_veto_depth > 0) {
       arm_suffix_capture(data, data->last_veto_node, data->last_veto_dir);
-      data->probe_capture_pending = data->probe_learn &&
-                                    data->last_probe_veto_kind == 1;
+      data->probe_capture_pending =
+          (data->probe_learn && data->last_probe_veto_kind == 1) ||
+          forensic_terminal_capture;
       data->probe_capture_node = data->last_veto_node;
       data->probe_capture_dir = data->last_veto_dir;
       // Probe capture is not an admitted candidate: do not let the normal
