@@ -433,42 +433,9 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       return true;
     }
     if (current.pred.opaque) {
-      // Opaque nodes from return-value comparisons (compile-time
-      // instrumentation of ret != CONST where DFSan constant-folded the call
-      // result to shadow 0) mark decisions that exist but cannot be
-      // evaluated for candidates. Near the root they must not collapse
-      // screening (an admit would let every candidate through): follow the
-      // stored direction there - routing is then identical to the decision
-      // being absent. Deeper opaque nodes (e.g. index_hash.c:189 at depth
-      // ~180, where the vli-decoder return value decides decode success)
-      // mark genuine unmodeled divergence: admit conservatively so the
-      // coverage-gaining population past them is not lost.
-      constexpr uint32_t kOpaqueFollowDepth = 64;
-      if (current.depth < kOpaqueFollowDepth) {
-        NodeRef next = current.child[0] != kUnexplored
-                           ? current.child[0]
-                           : current.child[1];
-        if (next == kTerminal) {
-          *out_node = kUnexplored;
-          *out_dir = 0;
-          if (out_veto_depth) *out_veto_depth = current.depth;
-          if (out_veto_node) *out_veto_node = cur;
-          if (out_veto_dir) *out_veto_dir = 0;
-          if (out_veto_kind) *out_veto_kind = 0;
-          check_veto_terminal += 1;
-          finish_profile(4, walked);
-          return false;
-        }
-        if (next == kUnexplored) {
-          *out_node = cur;
-          *out_dir = 0;
-          check_admit_frontier += 1;
-          finish_profile(3, walked);
-          return true;
-        }
-        cur = next;
-        continue;
-      }
+      // An opaque predicate has no sound candidate-dependent direction.
+      // Never infer one from child topology: doing so turns an unsupported
+      // expression such as idx_merge into a fabricated terminal proof.
       *out_node = kUnexplored;
       *out_dir = 0;
       check_admit_opaque += 1;
