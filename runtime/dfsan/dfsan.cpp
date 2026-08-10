@@ -231,7 +231,8 @@ static inline dfsan_label add_taint_info(dfsan_label_info *info) {
 // for internal use only, skip optimization and ubsan checks
 // caller must ensure op is valid, handle commutative conventions
 static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
-                                  uint16_t size, uint64_t op1, uint64_t op2) {
+                                  uint16_t size, uint64_t op1, uint64_t op2,
+                                  uint64_t op1_hi = 0, uint64_t op2_hi = 0) {
   // dedup
   uint32_t h1 = l1 ? __dfsan_label_info[l1].hash : 0;
   uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
@@ -244,10 +245,13 @@ static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   h1 = xxhash(h1, h2, h3);
   uint32_t h4 = (uint32_t)(op1 ^ (op1 >> 32));
   uint32_t h5 = (uint32_t)(op2 ^ (op2 >> 32));
-  uint32_t hash = xxhash(h1, h4, h5);
+  uint32_t h6 = (uint32_t)(op1_hi ^ (op1_hi >> 32));
+  uint32_t h7 = (uint32_t)(op2_hi ^ (op2_hi >> 32));
+  uint32_t hash = xxhash(xxhash(h1, h4, h5), h6, h7);
 
   struct dfsan_label_info label_info = {
-    .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2}, .op = op, .size = size,
+    .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2},
+    .op1_hi = op1_hi, .op2_hi = op2_hi, .op = op, .size = size,
     .hash = hash};
 
   __taint::option res = __union_table.lookup(label_info);
@@ -301,6 +305,16 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   if (l1 == kInitializingLabel || l2 == kInitializingLabel)
     return kInitializingLabel;
 
+  // bswap expands every byte of the concrete operand into an Extract label.
+  // A wide concrete value can legitimately carry a narrower shadow (only the
+  // bytes tainted by the input are represented).  Extracting beyond that
+  // shadow has no symbolic dependency and must stay clean; retaining a
+  // malformed out-of-range label later makes the PCBT converter invent a
+  // dependency or reject an otherwise solvable predicate.
+  if (op == __dfsan::Extract && l1 >= CONST_OFFSET && l2 == 0 &&
+      op2 >= get_label_info(l1)->size)
+    return 0;
+
   // special handling for bounds
   if (get_label_info(l1)->op == __dfsan::Alloca ||
       (op != __dfsan::Load && get_label_info(l2)->op == __dfsan::Alloca)) {
@@ -322,20 +336,56 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   // - ICmp: records both operands for comparison
   // - Higher-order ops (>= fmemcmp): use op1/op2 for various purposes
   if (is_fmemcmp(op)) {
-    // fmemcmp stores operand addresses initially. Materialize at most eight
+    // fmemcmp stores operand addresses initially. Materialize at most sixteen
     // bytes only after the sanitizer runtime verifies the target range is
     // readable; a failed probe leaves the address unmarked for conservative
-    // parent-side handling.
-    uint16_t len = size > 8 ? 8 : size;
+    // parent-side handling. The first eight bytes use op1/op2 and the next
+    // eight use op1_hi/op2_hi, so a wide comparison is never silently reduced
+    // to a prefix.
+    uint16_t len = size > 16 ? 16 : size;
+    uint64_t op1_hi = 0, op2_hi = 0;
     op &= ~kFmemcmpCaptureMask;
     if (len != 0 && op1 != 0 && IsAccessibleMemoryRange((uptr)op1, len)) {
-      internal_memcpy(&op1, (void *)op1, len);
+      uint64_t address = op1;
+      internal_memcpy(&op1, (void *)address, len > 8 ? 8 : len);
+      if (len > 8)
+        internal_memcpy(&op1_hi, (void *)(address + 8), len - 8);
       op |= kFmemcmpOperand1Captured;
     }
     if (len != 0 && op2 != 0 && IsAccessibleMemoryRange((uptr)op2, len)) {
-      internal_memcpy(&op2, (void *)op2, len);
+      uint64_t address = op2;
+      internal_memcpy(&op2, (void *)address, len > 8 ? 8 : len);
+      if (len > 8)
+        internal_memcpy(&op2_hi, (void *)(address + 8), len - 8);
       op |= kFmemcmpOperand2Captured;
     }
+    // The high halves are consumed by the label constructor below. Keep them
+    // in locals rather than overwriting the address-derived low halves.
+    uint32_t h1 = l1 ? __dfsan_label_info[l1].hash : 0;
+    uint32_t h2 = l2 ? __dfsan_label_info[l2].hash : 0;
+    uint32_t h3 = (op << 16) | size;
+    h1 = xxhash(h1, h2, h3);
+    uint32_t h4 = (uint32_t)(op1 ^ (op1 >> 32));
+    uint32_t h5 = (uint32_t)(op2 ^ (op2 >> 32));
+    uint32_t h6 = (uint32_t)(op1_hi ^ (op1_hi >> 32));
+    uint32_t h7 = (uint32_t)(op2_hi ^ (op2_hi >> 32));
+    uint32_t hash = xxhash(xxhash(h1, h4, h5), h6, h7);
+
+    struct dfsan_label_info label_info = {
+      .l1 = l1, .l2 = l2, .op1 = {op1}, .op2 = {op2},
+      .op1_hi = op1_hi, .op2_hi = op2_hi, .op = op, .size = size,
+      .hash = hash};
+
+    __taint::option res = __union_table.lookup(label_info);
+    if (res != __taint::none()) {
+      dfsan_label label = *res;
+      AOUT("%u found\n", label);
+      return label;
+    }
+
+    dfsan_label label = add_taint_info(&label_info);
+    __union_table.insert(&__dfsan_label_info[label], label);
+    return label;
   } else if ((op & 0xff) < __dfsan::fmemcmp &&
              op != __dfsan::Alloca &&
              op != __dfsan::PtrToInt &&
@@ -831,7 +881,14 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
   // slowpath
   AOUT("union load slowpath at %p\n", __builtin_return_address(0));
   dfsan_label label = label0;
-  for (uptr i = get_label_info(label0)->size / 8; i < n;) {
+  // Keep a concrete prefix out of the label DAG until the first symbolic
+  // byte arrives. The old slow path created Concat(0, 0) nodes for that
+  // prefix, retaining only the last byte in op2 and losing the dependency
+  // shape used by later pointer predicates.
+  uint64_t concrete_prefix = 0;
+  uint16_t concrete_prefix_bits = 0;
+  uptr start = label0 == 0 ? 0 : get_label_info(label0)->size / 8;
+  for (uptr i = start; i < n;) {
     dfsan_label next_label = ls[i];
     if (next_label == kInitializingLabel) return kInitializingLabel;
     uint16_t next_size = get_label_info(next_label)->size;
@@ -839,12 +896,32 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
     if (!is_constant_label(next_label)) {
       if (next_size <= (n - i) * 8) {
         i += next_size / 8;
-        label = do_taint_union(label, next_label, Concat, i * 8, 0, 0);
+        if (label == 0) {
+          if (concrete_prefix_bits == 0) {
+            label = next_label;
+          } else if (concrete_prefix_bits <= 64) {
+            label = do_taint_union(0, next_label, Concat,
+                                   concrete_prefix_bits + next_size,
+                                   concrete_prefix, 0);
+          } else {
+            return 0;
+          }
+        } else {
+          label = do_taint_union(label, next_label, Concat, i * 8, 0, 0);
+        }
       } else {
         Report("WARNING: partial loading expected=%lu has=%d\n", n-i, next_size);
         uptr size = n - i;
-        dfsan_label trunc = do_taint_union(next_label, CONST_LABEL, Trunc, size * 8, 0, 0);
-        dfsan_label result = do_taint_union(label, trunc, Concat, n * 8, 0, 0);
+        dfsan_label trunc = do_taint_union(next_label, CONST_LABEL,
+                                           Trunc, size * 8, 0, 0);
+        dfsan_label result;
+        if (label == 0 && concrete_prefix_bits != 0) {
+          if (concrete_prefix_bits > 64) return 0;
+          result = do_taint_union(0, trunc, Concat, n * 8,
+                                  concrete_prefix, 0);
+        } else {
+          result = do_taint_union(label, trunc, Concat, n * 8, 0, 0);
+        }
         if (size_in_bits < n * 8)
           result = do_taint_union(result, CONST_LABEL, Trunc, size_in_bits, 0, 0);
         return result;
@@ -853,7 +930,15 @@ dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_b
       Report("WARNING: taint mixed with concrete %lu\n", i);
       char *c = (char *)app_for(&ls[i]);
       ++i;
-      label = do_taint_union(label, 0, Concat, i * 8, 0, *c);
+      if (label == 0) {
+        if (concrete_prefix_bits >= 64) return 0;
+        concrete_prefix |= (uint64_t)(unsigned char)*c
+                           << concrete_prefix_bits;
+        concrete_prefix_bits += 8;
+      } else {
+        label = do_taint_union(label, 0, Concat, i * 8, 0,
+                               (unsigned char)*c);
+      }
     }
   }
   AOUT("\n");

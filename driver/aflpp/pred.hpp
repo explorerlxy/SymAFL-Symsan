@@ -34,6 +34,14 @@ enum class PKind : uint8_t {
   Equal, Distinct, Ult, Ule, Ugt, Uge, Slt, Sle, Sgt, Sge,
   ZExt, SExt, Extract, Concat, Memcmp,
   Ctlz, Cttz,
+  // IEEE-754 values are stored as their 32/64-bit bit patterns.  These nodes
+  // are evaluated concretely at CheckInput time; they are never replaced by
+  // the trace-time result.
+  FpAdd, FpSub, FpMul, FpDiv, FpRem,
+  FpNeg, FpAbs, FpSqrt, FpRound, FpMin, FpMax, FpCopySign,
+  FpIsNan, FpIsInf, FpIsFinite, FpSignBit, FpLrint,
+  FpExp, FpExp2, FpLog, FpLog2, FpLog10, FpLog1p, FpPow,
+  FpTrunc, FpExt, FpToUI, FpToSI, FpToFP, FpSIToFP,
   // Input-length boundary nodes (flen_* labels). `len` is the eval-time
   // candidate length; a missing byte evaluates as EOF (masked -1 at width).
   Len,      // leaf: value ignored; eval = mask_bits(len, bits)
@@ -134,10 +142,24 @@ class RunConverter {
   std::vector<uint32_t> inserted_labels_;
   PredError error_ = PredError::None;
   uint16_t error_op_ = 0;
+  // Conversion context used when a helper (for example Concat lowering or
+  // FP comparison expansion) rejects an invalid child width.  Keeping the
+  // originating op makes opaque-node telemetry actionable without changing
+  // the conservative admission result.
+  uint16_t op_context_ = 0;
+  uint32_t root_label_ = 0;
 
   uint32_t convert(uint32_t label);
   uint32_t convert_op(const dfsan_label_info *info, uint32_t op,
                       uint32_t op_lo);
+  // Project a byte/bit slice from a wide load/concat without materializing an
+  // unsupported wide PNode. This is exact for the little-endian label grammar
+  // and is used when a later Extract/Trunc observes only a scalar slice.
+  uint32_t convert_slice(dfsan_label label, uint64_t cval,
+                         uint16_t label_bits, uint64_t offset,
+                         uint16_t width);
+  uint32_t convert_wide_truth(const dfsan_label_info *info,
+                              uint32_t label);
   uint32_t add(PKind kind, uint16_t bits, uint32_t a, uint32_t b,
                uint64_t value = 0);
   uint32_t add_const(uint64_t value, uint16_t bits);
@@ -162,6 +184,8 @@ class RunConverter {
                               const dfsan_label_info &chr_info);
   uint32_t convert_strstr_cmp(const dfsan_label_info *info, uint32_t op,
                               const dfsan_label_info &strstr_info);
+  uint32_t convert_fmemcmp_cmp(const dfsan_label_info *info, uint32_t op,
+                               const dfsan_label_info &memcmp_info);
   uint32_t convert_fcmp(const dfsan_label_info *info, uint32_t op);
 
   // Length-boundary lowering (flen_* ops). Builds a Count-family node with

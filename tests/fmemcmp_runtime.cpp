@@ -46,9 +46,9 @@ int main() {
     CHECK(info->size == 4, "fmemcmp size should be 4 bytes");
 
     // Both operands are readable -> both capture bits set
-    CHECK(fmemcmp_operand_captured(info->op, false),
+    CHECK(__dfsan::fmemcmp_operand_captured(info->op, false),
           "operand1 captured flag set");
-    CHECK(fmemcmp_operand_captured(info->op, true),
+    CHECK(__dfsan::fmemcmp_operand_captured(info->op, true),
           "operand2 captured flag set");
 
     // After commutative normalization the constant should be on op1 as
@@ -71,9 +71,9 @@ int main() {
     CHECK((info->op & 0xff) == __dfsan::fmemcmp,
           "base op should be fmemcmp (const,sym)");
     CHECK(info->size == 4, "fmemcmp size should be 4 bytes (const,sym)");
-    CHECK(fmemcmp_operand_captured(info->op, false),
+    CHECK(__dfsan::fmemcmp_operand_captured(info->op, false),
           "operand1 captured (const,sym)");
-    CHECK(fmemcmp_operand_captured(info->op, true),
+    CHECK(__dfsan::fmemcmp_operand_captured(info->op, true),
           "operand2 captured (const,sym)");
     // After commutative normalization the constant moves to op1:
     // 0xAA 0xBB 0xCC 0xDD => 0xDDCCBBAA
@@ -106,12 +106,12 @@ int main() {
 
     // Unreadable side: capture flag clear, op value unchanged (still address)
     // Which side is l1/l2 depends on commutative normalization, so test both.
-    bool op1_unreadable = (info->l1 == 0 && !fmemcmp_operand_captured(info->op, false));
-    bool op2_unreadable = (info->l2 == 0 && !fmemcmp_operand_captured(info->op, true));
+    bool op1_unreadable = (info->l1 == 0 && !__dfsan::fmemcmp_operand_captured(info->op, false));
+    bool op2_unreadable = (info->l2 == 0 && !__dfsan::fmemcmp_operand_captured(info->op, true));
     bool one_unreadable = (op1_unreadable && info->l2 != 0 &&
-                           fmemcmp_operand_captured(info->op, true)) ||
+                           __dfsan::fmemcmp_operand_captured(info->op, true)) ||
                           (op2_unreadable && info->l1 != 0 &&
-                           fmemcmp_operand_captured(info->op, false));
+                           __dfsan::fmemcmp_operand_captured(info->op, false));
     CHECK(one_unreadable,
           "exactly one operand should be unreadable with address preserved");
 
@@ -131,14 +131,24 @@ int main() {
           "base op should be fmemcmp (null operand)");
     // Null address: IsAccessibleMemoryRange probe fails, capture bit stays
     // clear and the value remains zero.
-    bool null_uncaptured = (info->l1 == 0 && !fmemcmp_operand_captured(info->op, false) &&
+    bool null_uncaptured = (info->l1 == 0 && !__dfsan::fmemcmp_operand_captured(info->op, false) &&
                             info->op1.i == 0ULL) ||
-                           (info->l2 == 0 && !fmemcmp_operand_captured(info->op, true) &&
+                           (info->l2 == 0 && !__dfsan::fmemcmp_operand_captured(info->op, true) &&
                             info->op2.i == 0ULL);
     CHECK(null_uncaptured,
           "null constant operand should be uncaptured with zero value");
 
     printf("PASS: direct dfsan_union with null operand survived\n");
+  }
+
+  // A bswap-style Extract outside the represented shadow width is concrete,
+  // not a symbolic byte. The runtime must drop that label rather than emit an
+  // out-of-range Extract node for the PCBT converter.
+  {
+    dfsan_label result = dfsan_union(
+        input_label, 0, __dfsan::Extract, 8, 0, sizeof(input) * 8);
+    CHECK(result == 0, "out-of-range Extract should be clean");
+    printf("PASS: out-of-range Extract remains clean\n");
   }
 
   if (failures) {
@@ -149,6 +159,7 @@ int main() {
   // CHECK: PASS: memcmp(static_constant, symbolic)
   // CHECK: PASS: direct dfsan_union with unreadable operand survived
   // CHECK: PASS: direct dfsan_union with null operand survived
+  // CHECK: PASS: out-of-range Extract remains clean
   printf("ALL PASS\n");
   return 0;
 }

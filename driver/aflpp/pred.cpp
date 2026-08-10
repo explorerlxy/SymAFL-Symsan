@@ -1,7 +1,11 @@
 #include "pred.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -100,7 +104,7 @@ uint32_t RunConverter::add(PKind kind, uint16_t bits, uint32_t a, uint32_t b,
       arena_->nodes.size() - predicate_start_ >= kMaxPredicateNodes ||
       arena_->nodes.size() >= kInvalidNode) {
     if (bits == 0 || bits > 64) {
-      fail(PredError::InvalidWidth);
+      fail(PredError::InvalidWidth, op_context_);
     } else if (arena_->nodes.size() - predicate_start_ >= kMaxPredicateNodes) {
       fail(PredError::ArenaLimit);
     } else {
@@ -133,7 +137,17 @@ uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
   if (op_lo == PtrToInt) return 1;
   if (op == __dfsan::Extract || op_lo == Trunc ||
       op_lo == Neg || op_lo == Not || op_lo == ZExt || op_lo == SExt ||
-      op_lo == __dfsan::ctlz || op_lo == __dfsan::cttz)
+      op_lo == __dfsan::ctlz || op_lo == __dfsan::cttz ||
+      op_lo == __dfsan::fp_neg || op_lo == __dfsan::fp_fabs ||
+      op_lo == __dfsan::fp_sqrt || op_lo == __dfsan::fp_round ||
+      op_lo == __dfsan::fp_is_nan || op_lo == __dfsan::fp_is_inf ||
+      op_lo == __dfsan::fp_is_finite || op_lo == __dfsan::fp_signbit ||
+      op_lo == __dfsan::fp_lrint || op_lo == __dfsan::fp_exp ||
+      op_lo == __dfsan::fp_exp2 || op_lo == __dfsan::fp_log ||
+      op_lo == __dfsan::fp_log2 || op_lo == __dfsan::fp_log10 ||
+      op_lo == __dfsan::fp_log1p || op_lo == FPTrunc || op_lo == FPExt ||
+      op_lo == FPToUI || op_lo == FPToSI || op_lo == UIToFP ||
+      op_lo == SIToFP)
     return 1;
   if (op == __dfsan::Concat || is_fmemcmp(op) || op_lo == ICmp ||
       op_lo == FCmp || op_lo == Add || op_lo == Sub || op_lo == Mul ||
@@ -141,7 +155,10 @@ uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
       op_lo == __dfsan::umin || op_lo == __dfsan::umax ||
       op_lo == __dfsan::smin || op_lo == __dfsan::smax ||
       op_lo == Shl || op_lo == LShr || op_lo == AShr || op_lo == And ||
-      op_lo == Or || op_lo == Xor)
+      op_lo == Or || op_lo == Xor || op_lo == FAdd || op_lo == FSub ||
+      op_lo == FMul || op_lo == FDiv || op_lo == FRem ||
+      op_lo == __dfsan::fp_min || op_lo == __dfsan::fp_max ||
+      op_lo == __dfsan::fp_copysign || op_lo == __dfsan::fp_pow)
     return 2;
   if (op == __dfsan::fsize || op == __dfsan::flen_eof ||
       op == __dfsan::flen_count || op == __dfsan::flen_count_neg1 ||
@@ -198,6 +215,21 @@ uint32_t RunConverter::convert(uint32_t label) {
             so == __dfsan::fstrrchr || so == __dfsan::fstrstr)
           count = 0;
       }
+      // A wide load/concat can be immediately projected by Extract or Trunc.
+      // Do not walk the unsupported wide node first; convert_op() lowers only
+      // the observed scalar slice through convert_slice().
+      if ((op == __dfsan::Extract || op_lo == Trunc) &&
+          (info->l1 != 0 || info->l2 != 0)) {
+        dfsan_label child = info->l1 != 0 ? info->l1 : info->l2;
+        if (child < table_labels_ && table_[child].size > 64)
+          count = 0;
+      }
+      if (op_lo == ICmp && info->l2 == 0 && info->l1 != 0 &&
+          info->l1 < table_labels_ && is_fmemcmp(table_[info->l1].op) &&
+          table_[info->l1].size > 8)
+        count = 0;
+      if (op_lo == Concat && info->size > 64)
+        count = 0;
       if (count == 2) {
         if (info->l2 != 0) stack.push_back({info->l2, false});
         if (info->l1 != 0) stack.push_back({info->l1, false});
@@ -225,9 +257,55 @@ uint32_t RunConverter::convert(uint32_t label) {
                   table_[info->l1].op1.i);
       }
     } else {
-      idx = convert_op(info, op, op_lo);
+      op_context_ = static_cast<uint16_t>(op);
+      idx = (op_lo == Concat && info->size > 64)
+                ? convert_wide_truth(info, frame.label)
+                : convert_op(info, op, op_lo);
     }
-    if (idx == kInvalidNode) break;
+    if (idx == kInvalidNode) {
+      static thread_local uint32_t forensic_reports = 0;
+      if (getenv("SYMAFL_PRED_FORENSICS") && forensic_reports < 64) {
+        ++forensic_reports;
+        fprintf(stderr,
+                "[pcbt-pred-forensic] error=%s error_op=%u root=%u "
+                "root_op=%u root_size=%u root_l1=%u root_l2=%u "
+                "label=%u op=%u size=%u l1=%u l2=%u op1=%llu op2=%llu\n",
+                pred_error_name(error_), error_op_, root_label_,
+                table_[root_label_].op, table_[root_label_].size,
+                table_[root_label_].l1, table_[root_label_].l2,
+                frame.label, info->op,
+                info->size,
+                info->l1, info->l2,
+                (unsigned long long)info->op1.i,
+                (unsigned long long)info->op2.i);
+        for (dfsan_label child : {info->l1, info->l2}) {
+          if (child != 0 && child < table_labels_)
+            fprintf(stderr,
+                    "[pcbt-pred-forensic] child=%u op=%u size=%u l1=%u l2=%u "
+                    "op1=%llu op2=%llu\n",
+                    child, table_[child].op, table_[child].size,
+                    table_[child].l1, table_[child].l2,
+                    (unsigned long long)table_[child].op1.i,
+                    (unsigned long long)table_[child].op2.i);
+        }
+        uint32_t cursor = frame.label;
+        for (unsigned depth = 0; depth < 8 && cursor != 0 &&
+                                      cursor < table_labels_; ++depth) {
+          const dfsan_label_info &trace = table_[cursor];
+          uint32_t l1_op = trace.l1 != 0 && trace.l1 < table_labels_
+                               ? table_[trace.l1].op : 0;
+          uint32_t l2_op = trace.l2 != 0 && trace.l2 < table_labels_
+                               ? table_[trace.l2].op : 0;
+          fprintf(stderr,
+                  "[pcbt-pred-forensic] path depth=%u label=%u op=%u size=%u "
+                  "l1=%u(lop=%u) l2=%u(lop=%u)\n",
+                  depth, cursor, trace.op, trace.size, trace.l1, l1_op,
+                  trace.l2, l2_op);
+          cursor = trace.l1 ? trace.l1 : trace.l2;
+        }
+      }
+      break;
+    }
     label_map_.emplace(frame.label, idx);
     inserted_labels_.push_back(frame.label);
     pending.erase(frame.label);
@@ -245,15 +323,184 @@ uint32_t RunConverter::convert(uint32_t label) {
   return root;
 }
 
+uint32_t RunConverter::convert_slice(dfsan_label label, uint64_t cval,
+                                     uint16_t label_bits, uint64_t offset,
+                                     uint16_t width) {
+  if (width == 0 || width > 64 || offset > label_bits ||
+      width > static_cast<uint64_t>(label_bits) - offset) {
+    if (getenv("SYMAFL_PRED_FORENSICS"))
+      fprintf(stderr,
+              "[pcbt-pred-slice] label=%u op=%u label_bits=%u offset=%llu "
+              "width=%u cval=%llu\n",
+              label, label < table_labels_ ? table_[label].op : 0,
+              label_bits, (unsigned long long)offset, width,
+              (unsigned long long)cval);
+    fail(PredError::InvalidWidth, op_context_);
+    return kInvalidNode;
+  }
+
+  if (label == 0) {
+    // Concrete pieces in the runtime label grammar are at most one machine
+    // word. A wider concrete-only slice would require bytes that were never
+    // carried in the label table and must remain conservative.
+    if (offset >= 64 || width > 64 - offset) {
+      fail(PredError::InvalidWidth, op_context_);
+      return kInvalidNode;
+    }
+    uint64_t value = cval >> offset;
+    if (width < 64) value &= (uint64_t{1} << width) - 1;
+    return add_const(value, width);
+  }
+  if (label >= table_labels_) {
+    fail(PredError::InvalidLabel, op_context_);
+    return kInvalidNode;
+  }
+
+  const dfsan_label_info &info = table_[label];
+  uint32_t op = info.op;
+  uint32_t op_lo = op & 0xff;
+  if (op == 0) {
+    if (offset != 0 || width != 8 || label_bits != 8) {
+      fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    return add(PKind::Read, 8, kNoChild, kNoChild, info.op1.i);
+  }
+
+  if (op_lo == Load) {
+    if (info.l1 == 0 || info.l1 >= table_labels_ || info.l2 == 0 ||
+        info.l2 > 16 || table_[info.l1].op != 0 || (offset % 8) != 0 ||
+        (width % 8) != 0 || offset + width > info.l2 * 8 || width > 64) {
+      fail(PredError::BadLoad, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    return add(PKind::Read, width, kNoChild, kNoChild,
+               table_[info.l1].op1.i + offset / 8);
+  }
+
+  if (op_lo == Concat) {
+    if (info.l1 == 0 && info.l2 == 0) {
+      fail(PredError::BadConcat, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    uint16_t low_bits = 0;
+    uint16_t high_bits = 0;
+    if (info.l1 != 0) {
+      if (info.l1 >= table_labels_) {
+        fail(PredError::InvalidLabel, static_cast<uint16_t>(op));
+        return kInvalidNode;
+      }
+      low_bits = table_[info.l1].size;
+    }
+    if (info.l2 != 0) {
+      if (info.l2 >= table_labels_) {
+        fail(PredError::InvalidLabel, static_cast<uint16_t>(op));
+        return kInvalidNode;
+      }
+      high_bits = table_[info.l2].size;
+    }
+    if (info.l1 == 0) low_bits = info.size - high_bits;
+    if (info.l2 == 0) high_bits = info.size - low_bits;
+    if (low_bits == 0 || high_bits == 0 ||
+        static_cast<uint32_t>(low_bits) + high_bits != info.size) {
+      fail(PredError::BadConcat, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+
+    if (offset + width <= low_bits) {
+      return convert_slice(info.l1, info.op1.i, low_bits, offset, width);
+    }
+    if (offset >= low_bits) {
+      return convert_slice(info.l2, info.op2.i, high_bits,
+                           offset - low_bits, width);
+    }
+
+    uint16_t low_width = static_cast<uint16_t>(low_bits - offset);
+    uint16_t high_width = static_cast<uint16_t>(width - low_width);
+    uint32_t low = convert_slice(info.l1, info.op1.i, low_bits,
+                                 offset, low_width);
+    uint32_t high = convert_slice(info.l2, info.op2.i, high_bits,
+                                  0, high_width);
+    if (low == kInvalidNode || high == kInvalidNode)
+      return kInvalidNode;
+    return add(PKind::Concat, width, low, high);
+  }
+
+  if (op == __dfsan::Extract || op_lo == Trunc || op_lo == BitCast) {
+    dfsan_label child = info.l1 ? info.l1 : info.l2;
+    uint64_t child_cval = info.l1 ? info.op1.i : info.op2.i;
+    if (child == 0 || child >= table_labels_) {
+      fail(PredError::InvalidLabel, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    uint64_t child_offset = op == __dfsan::Extract ? info.op2.i : 0;
+    if (child_offset > UINT64_MAX - offset) {
+      fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    if (table_[child].size <= 64) {
+      // The wide projection intentionally skipped this scalar child in the
+      // iterative conversion stack. Convert it as a normal subtree so its
+      // arithmetic labels are materialized and memoized before the byte
+      // Extract is attached.
+      uint32_t child_node = convert(child);
+      if (child_node == kInvalidNode) return kInvalidNode;
+      if (op == __dfsan::BitCast) return child_node;
+      uint64_t slice_offset = child_offset + offset;
+      if (slice_offset > table_[child].size ||
+          width > static_cast<uint64_t>(table_[child].size) - slice_offset) {
+        if (getenv("SYMAFL_PRED_FORENSICS"))
+          fprintf(stderr,
+                  "[pcbt-pred-slice] scalar-extract label=%u op=%u child=%u "
+                  "child_bits=%u child_offset=%llu offset=%llu width=%u\n",
+                  label, op, child, table_[child].size,
+                  (unsigned long long)child_offset,
+                  (unsigned long long)offset, width);
+        fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+        return kInvalidNode;
+      }
+      return add(PKind::Extract, width, child_node, kNoChild,
+                 slice_offset);
+    }
+    return convert_slice(child, child_cval, table_[child].size,
+                         child_offset + offset, width);
+  }
+
+  fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
+  return kInvalidNode;
+}
+
+uint32_t RunConverter::convert_wide_truth(const dfsan_label_info *info,
+                                          uint32_t label) {
+  if (info == nullptr || info->size <= 64 || info->size == 0) {
+    fail(PredError::InvalidWidth, info ? info->op : 0);
+    return kInvalidNode;
+  }
+
+  // A bare wide label is emitted for a truthiness condition (for example a
+  // pointer-sized select condition after the runtime's shadow composition).
+  // Its exact branch predicate is value != 0. Project every observed byte and
+  // OR their nonzero tests; never truncate the wide value to one word.
+  uint32_t result = add_const(0, 8);
+  for (uint64_t offset = 0; offset < info->size; offset += 8) {
+    uint16_t width = static_cast<uint16_t>(
+        std::min<uint64_t>(8, info->size - offset));
+    uint32_t byte = convert_slice(label, 0, info->size, offset, width);
+    if (byte == kInvalidNode) return kInvalidNode;
+    uint32_t nonzero = add(PKind::Distinct, 8, byte, add_const(0, width));
+    result = add(PKind::Or, 8, result, nonzero);
+    if (result == kInvalidNode) return kInvalidNode;
+  }
+  return result;
+}
+
 uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
                                   uint32_t op_lo) {
-  // fmemcmp's size is a byte count, unlike ordinary label widths.  The DFSan
-  // runtime copies up to eight concrete bytes into op1/op2, so this scalar
-  // PCBT grammar can model exactly the byte range it records.  Its canonical
-  // -1/0/+1 result preserves every comparison against zero (the only admitted
-  // use; target preflight rejects other fmemcmp-derived predicates).
+  // fmemcmp's size is a byte count, unlike ordinary label widths. Its
+  // canonical -1/0/+1 result is lowered at the consuming comparison so a
+  // wide operand is never truncated to the first machine word.
   if (is_fmemcmp(static_cast<uint16_t>(op))) {
-    if (info->size == 0 || info->size > 8) {
+    if (info->size == 0 || info->size > 16) {
       fail(PredError::InvalidWidth);
       return kInvalidNode;
     }
@@ -293,6 +540,121 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
   PKind kind;
   bool unary = false, binary = false;
 
+  auto fp_width = [&](uint16_t width) {
+    return width == 32 || width == 64;
+  };
+  auto fp_child = [&](dfsan_label label, uint64_t concrete,
+                      uint16_t fallback_width) {
+    uint16_t child_width = fallback_width;
+    if (label != 0 && label < table_labels_)
+      child_width = table_[label].size;
+    if (!fp_width(child_width)) {
+      fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    return conv_child(label, concrete, child_width);
+  };
+  auto fp_operand = [&](dfsan_label label, uint64_t concrete,
+                        uint16_t operand_width) {
+    // A scalar FP instruction can inherit a wider shadow from a load of an
+    // aggregate or a bitcasted byte span.  The runtime's little-endian label
+    // grammar places the scalar operand in the low-order bits; project that
+    // exact slice instead of rejecting the whole predicate or truncating a
+    // prebuilt PNode.  For ordinary labels this is identical to fp_child().
+    if (label != 0 && label < table_labels_ &&
+        table_[label].size > operand_width) {
+      if (!fp_width(operand_width)) {
+        fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+        return kInvalidNode;
+      }
+      return convert_slice(label, concrete, table_[label].size, 0,
+                           operand_width);
+    }
+    return fp_child(label, concrete, operand_width);
+  };
+  auto scalar_child = [&](dfsan_label label, uint64_t concrete,
+                          uint16_t fallback_width) {
+    uint16_t child_width = fallback_width;
+    if (label != 0 && label < table_labels_)
+      child_width = table_[label].size;
+    if (child_width == 0 || child_width > 64) {
+      fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    return conv_child(label, concrete, child_width);
+  };
+
+  // FP arithmetic and custom FP runtime nodes retain IEEE bit patterns in
+  // their children.  Build an evaluable node instead of freezing op1/op2 or
+  // rejecting the branch as opaque.
+  switch (op_lo) {
+    case FAdd: kind = PKind::FpAdd; binary = true; break;
+    case FSub: kind = PKind::FpSub; binary = true; break;
+    case FMul: kind = PKind::FpMul; binary = true; break;
+    case FDiv: kind = PKind::FpDiv; binary = true; break;
+    case FRem: kind = PKind::FpRem; binary = true; break;
+    case __dfsan::fp_neg: kind = PKind::FpNeg; unary = true; break;
+    case __dfsan::fp_fabs: kind = PKind::FpAbs; unary = true; break;
+    case __dfsan::fp_sqrt: kind = PKind::FpSqrt; unary = true; break;
+    case __dfsan::fp_round: kind = PKind::FpRound; unary = true; break;
+    case __dfsan::fp_min: kind = PKind::FpMin; binary = true; break;
+    case __dfsan::fp_max: kind = PKind::FpMax; binary = true; break;
+    case __dfsan::fp_copysign: kind = PKind::FpCopySign; binary = true; break;
+    case __dfsan::fp_is_nan: kind = PKind::FpIsNan; unary = true; break;
+    case __dfsan::fp_is_inf: kind = PKind::FpIsInf; unary = true; break;
+    case __dfsan::fp_is_finite: kind = PKind::FpIsFinite; unary = true; break;
+    case __dfsan::fp_signbit: kind = PKind::FpSignBit; unary = true; break;
+    case __dfsan::fp_lrint: kind = PKind::FpLrint; unary = true; break;
+    case __dfsan::fp_exp: kind = PKind::FpExp; unary = true; break;
+    case __dfsan::fp_exp2: kind = PKind::FpExp2; unary = true; break;
+    case __dfsan::fp_log: kind = PKind::FpLog; unary = true; break;
+    case __dfsan::fp_log2: kind = PKind::FpLog2; unary = true; break;
+    case __dfsan::fp_log10: kind = PKind::FpLog10; unary = true; break;
+    case __dfsan::fp_log1p: kind = PKind::FpLog1p; unary = true; break;
+    case __dfsan::fp_pow: kind = PKind::FpPow; binary = true; break;
+    case FPTrunc: kind = PKind::FpTrunc; unary = true; break;
+    case FPExt: kind = PKind::FpExt; unary = true; break;
+    case FPToUI: kind = PKind::FpToUI; unary = true; break;
+    case FPToSI: kind = PKind::FpToSI; unary = true; break;
+    case UIToFP: kind = PKind::FpToFP; unary = true; break;
+    case SIToFP: kind = PKind::FpSIToFP; unary = true; break;
+    default: break;
+  }
+  const bool is_fp_node = unary || binary &&
+      (kind == PKind::FpAdd || kind == PKind::FpSub ||
+       kind == PKind::FpMul || kind == PKind::FpDiv || kind == PKind::FpRem ||
+       kind == PKind::FpMin || kind == PKind::FpMax ||
+       kind == PKind::FpCopySign || kind == PKind::FpPow);
+  if (is_fp_node && kind != PKind::FpLrint && !fp_width(size)) {
+    fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+    return kInvalidNode;
+  }
+  if (is_fp_node) {
+    if (kind == PKind::FpLrint) {
+      dfsan_label child = info->l1 ? info->l1 : info->l2;
+      uint64_t cval = info->l1 ? info->op1.i : info->op2.i;
+      uint32_t a = fp_child(child, cval, 32);
+      return a == kInvalidNode ? kInvalidNode :
+          add(PKind::FpLrint, 64, a, kNoChild);
+    }
+    if (unary) {
+      dfsan_label child = info->l1 ? info->l1 : info->l2;
+      uint64_t cval = info->l1 ? info->op1.i : info->op2.i;
+      const bool input_is_fp =
+          kind == PKind::FpTrunc || kind == PKind::FpExt ||
+          kind == PKind::FpToUI || kind == PKind::FpToSI;
+      uint32_t a = input_is_fp ? fp_child(child, cval, size)
+                               : scalar_child(child, cval, size);
+      return a == kInvalidNode ? kInvalidNode :
+          add(kind, size, a, kNoChild,
+              kind == PKind::FpRound ? info->op1.i : 0);
+    }
+    uint32_t a = fp_operand(info->l1, info->op1.i, size);
+    uint32_t b = fp_operand(info->l2, info->op2.i, size);
+    return a == kInvalidNode || b == kInvalidNode ? kInvalidNode :
+        add(kind, size, a, b, (op >> 8) & 0xff);
+  }
+
   switch (op_lo) {
     case Add: kind = PKind::Add; binary = true; break;
     case Sub: kind = PKind::Sub; binary = true; break;
@@ -325,7 +687,11 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     dfsan_label child = info->l1 ? info->l1 : info->l2;
     uint64_t cval = info->l1 ? info->op1.i : info->op2.i;
     uint64_t off = (op == __dfsan::Extract) ? info->op2.i : 0;
-    uint32_t a = conv_child(child, cval, 64);
+    uint16_t child_bits = child != 0 && child < table_labels_
+                              ? table_[child].size : info->size;
+    if (child_bits > 64)
+      return convert_slice(child, cval, child_bits, off, size);
+    uint32_t a = conv_child(child, cval, child_bits);
     return a == kInvalidNode ? kInvalidNode
                              : add(PKind::Extract, size, a, kNoChild, off);
   }
@@ -389,6 +755,10 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
         (right_memcmp && (info->l1 != 0 || info->op1.i != 0))) {
       fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
       return kInvalidNode;
+    }
+    if (left_memcmp && info->l2 == 0 &&
+        table_[info->l1].size > 8) {
+      return convert_fmemcmp_cmp(info, op, table_[info->l1]);
     }
     // String-op vs constant comparison: expand into byte reads so the scalar
     // interpreter can evaluate it (strlen > n, strchr/strstr != NULL).
@@ -911,6 +1281,78 @@ uint32_t RunConverter::convert_strstr_cmp(const dfsan_label_info *info,
   return acc;
 }
 
+uint32_t RunConverter::convert_fmemcmp_cmp(
+    const dfsan_label_info *info, uint32_t op,
+    const dfsan_label_info &memcmp_info) {
+  const uint32_t n = memcmp_info.size;
+  if (n == 0 || n > 16) {
+    fail(PredError::InvalidWidth, static_cast<uint16_t>(memcmp_info.op));
+    return kInvalidNode;
+  }
+
+  auto constant_bytes = [&](bool operand2, std::vector<StringByte> &out) {
+    if (!fmemcmp_operand_captured(memcmp_info.op, operand2)) {
+      fail(PredError::UncapturedMemcmpOperand, memcmp_info.op);
+      return false;
+    }
+    uint64_t low = operand2 ? memcmp_info.op2.i : memcmp_info.op1.i;
+    uint64_t high = operand2 ? memcmp_info.op2_hi : memcmp_info.op1_hi;
+    for (uint32_t i = 0; i < n; ++i) {
+      uint64_t word = i < 8 ? low : high;
+      uint32_t byte = static_cast<uint32_t>((word >> (8 * (i % 8))) & 0xff);
+      out.push_back({add_const(byte, 8), 0});
+    }
+    return true;
+  };
+
+  std::vector<StringByte> lhs, rhs;
+  if (memcmp_info.l1 == 0) {
+    if (!constant_bytes(false, lhs)) return kInvalidNode;
+  } else if (!string_bytes(memcmp_info.l1, n, lhs)) {
+    fail(PredError::UnsupportedOp, memcmp_info.op);
+    return kInvalidNode;
+  }
+  if (memcmp_info.l2 == 0) {
+    if (!constant_bytes(true, rhs)) return kInvalidNode;
+  } else if (!string_bytes(memcmp_info.l2, n, rhs)) {
+    fail(PredError::UnsupportedOp, memcmp_info.op);
+    return kInvalidNode;
+  }
+  if (lhs.size() != n || rhs.size() != n) {
+    fail(PredError::UnsupportedOp, memcmp_info.op);
+    return kInvalidNode;
+  }
+
+  // The C memcmp result is the sign of the first differing unsigned byte.
+  // Build the three mutually exclusive outcomes without creating a wide
+  // integer node: less-than, equal, and greater-than.
+  uint32_t equal_prefix = add_const(1, 8);
+  uint32_t less = add_const(0, 8);
+  uint32_t greater = add_const(0, 8);
+  for (uint32_t i = 0; i < n; ++i) {
+    uint32_t eq = add(PKind::Equal, 8, lhs[i].node, rhs[i].node);
+    uint32_t lt = add(PKind::Ult, 8, lhs[i].node, rhs[i].node);
+    uint32_t gt = add(PKind::Ugt, 8, lhs[i].node, rhs[i].node);
+    less = add(PKind::Or, 8, less,
+               add(PKind::And, 8, equal_prefix, lt));
+    greater = add(PKind::Or, 8, greater,
+                  add(PKind::And, 8, equal_prefix, gt));
+    equal_prefix = add(PKind::And, 8, equal_prefix, eq);
+  }
+
+  switch (op >> 8) {
+    case bveq: return equal_prefix;
+    case bvneq: return add(PKind::Or, 8, less, greater);
+    case bvult: case bvslt: return less;
+    case bvule: case bvsle: return add(PKind::Or, 8, less, equal_prefix);
+    case bvugt: case bvsgt: return greater;
+    case bvuge: case bvsge: return add(PKind::Or, 8, greater, equal_prefix);
+    default:
+      fail(PredError::UnsupportedCompare, static_cast<uint16_t>(op));
+      return kInvalidNode;
+  }
+}
+
 // FP comparison lowered to integer comparison over IEEE-754 bit patterns
 // (total-order transform), matching LLVM FCmp semantics including NaN and ±0.
 uint32_t RunConverter::fp_is_nan(uint32_t a, uint16_t w) {
@@ -1000,6 +1442,7 @@ Predicate RunConverter::conv(uint32_t label) {
   Predicate pred;
   error_ = PredError::None;
   error_op_ = 0;
+  root_label_ = label;
   if (label == 0) {
     pred.opaque = true;
     pred.error = PredError::InvalidRoot;
@@ -1172,6 +1615,186 @@ inline int64_t sext_bits(uint64_t v, uint16_t bits) {
   if (bits >= 64) return (int64_t)v;
   uint64_t m = 1ull << (bits - 1);
   return (int64_t)((v ^ m) - m);
+}
+
+template <typename T>
+static T fp_from_bits(uint64_t value) {
+  T result;
+  using U = typename std::conditional<sizeof(T) == 4, uint32_t, uint64_t>::type;
+  U raw = static_cast<U>(value);
+  std::memcpy(&result, &raw, sizeof(result));
+  return result;
+}
+
+template <typename T>
+static uint64_t fp_to_bits(T value) {
+  using U = typename std::conditional<sizeof(T) == 4, uint32_t, uint64_t>::type;
+  U raw = 0;
+  std::memcpy(&raw, &value, sizeof(raw));
+  return static_cast<uint64_t>(raw);
+}
+
+template <typename T>
+static T fp_round_mode(T value, uint64_t mode) {
+  switch (mode) {
+    case 0: return std::round(value);  // nearest, ties away
+    case 1: return std::nearbyint(value); // nearest, ties to even
+    case 2: return std::ceil(value);
+    case 3: return std::floor(value);
+    case 4: return std::trunc(value);
+    default: return std::nearbyint(value);
+  }
+}
+
+static bool eval_fp_cast(PKind kind, uint16_t out_bits, uint16_t input_bits,
+                         uint64_t a, uint64_t *out) {
+  if (out_bits != 32 && out_bits != 64) return false;
+  if (kind == PKind::FpTrunc) {
+    if (input_bits != 64 || out_bits != 32) return false;
+    return *out = fp_to_bits(static_cast<float>(fp_from_bits<double>(a))), true;
+  }
+  if (kind == PKind::FpExt) {
+    if (input_bits != 32 || out_bits != 64) return false;
+    return *out = fp_to_bits(static_cast<double>(fp_from_bits<float>(a))), true;
+  }
+  if (kind == PKind::FpToUI || kind == PKind::FpToSI) {
+    if (input_bits != 32 && input_bits != 64) return false;
+    long double value = input_bits == 32
+        ? static_cast<long double>(fp_from_bits<float>(a))
+        : static_cast<long double>(fp_from_bits<double>(a));
+    if (!std::isfinite(value)) return false;
+    if (kind == PKind::FpToUI) {
+      long double limit = std::ldexp(1.0L, out_bits);
+      if (value < 0 || value >= limit) return false;
+      *out = mask_bits(static_cast<uint64_t>(value), out_bits);
+    } else {
+      long double limit = std::ldexp(1.0L, out_bits - 1);
+      if (value < -limit || value >= limit) return false;
+      *out = mask_bits(static_cast<uint64_t>(static_cast<int64_t>(value)),
+                       out_bits);
+    }
+    return true;
+  }
+  if (kind == PKind::FpToFP || kind == PKind::FpSIToFP) {
+    long double value = kind == PKind::FpToFP
+        ? static_cast<long double>(mask_bits(a, input_bits))
+        : static_cast<long double>(sext_bits(a, input_bits));
+    if (out_bits == 32)
+      *out = fp_to_bits(static_cast<float>(value));
+    else
+      *out = fp_to_bits(static_cast<double>(value));
+    return true;
+  }
+  return false;
+}
+
+static bool eval_fp_unary(PKind kind, uint16_t bits, uint64_t a,
+                          uint64_t mode, uint64_t *out) {
+  if (bits != 32 && bits != 64) return false;
+  if (kind == PKind::FpLrint) {
+    long double value = bits == 32
+        ? static_cast<long double>(fp_from_bits<float>(a))
+        : static_cast<long double>(fp_from_bits<double>(a));
+    // The runtime wrapper is lrint/lrintf with the default RNE mode.  Use
+    // nearbyint rather than the trace-time integer result so the input
+    // dependency remains live during CheckInput.
+    long double rounded = std::nearbyint(value);
+    if (rounded > static_cast<long double>(std::numeric_limits<int64_t>::max()) ||
+        rounded < static_cast<long double>(std::numeric_limits<int64_t>::min()))
+      return false;
+    *out = static_cast<uint64_t>(static_cast<int64_t>(rounded));
+    return true;
+  }
+  if (kind == PKind::FpIsNan || kind == PKind::FpIsInf ||
+      kind == PKind::FpIsFinite || kind == PKind::FpSignBit) {
+    bool result;
+    if (bits == 32) {
+      float value = fp_from_bits<float>(a);
+      result = kind == PKind::FpIsNan ? std::isnan(value) :
+          kind == PKind::FpIsInf ? std::isinf(value) :
+          kind == PKind::FpIsFinite ? std::isfinite(value) :
+          std::signbit(value);
+    } else {
+      double value = fp_from_bits<double>(a);
+      result = kind == PKind::FpIsNan ? std::isnan(value) :
+          kind == PKind::FpIsInf ? std::isinf(value) :
+          kind == PKind::FpIsFinite ? std::isfinite(value) :
+          std::signbit(value);
+    }
+    *out = result ? 1 : 0;
+    return true;
+  }
+  if (bits == 32) {
+    float value = fp_from_bits<float>(a), result;
+    switch (kind) {
+      case PKind::FpNeg: result = -value; break;
+      case PKind::FpAbs: result = std::fabs(value); break;
+      case PKind::FpSqrt: result = std::sqrt(value); break;
+      case PKind::FpRound: result = fp_round_mode(value, mode); break;
+      case PKind::FpExp: result = std::exp(value); break;
+      case PKind::FpExp2: result = std::exp2(value); break;
+      case PKind::FpLog: result = std::log(value); break;
+      case PKind::FpLog2: result = std::log2(value); break;
+      case PKind::FpLog10: result = std::log10(value); break;
+      case PKind::FpLog1p: result = std::log1p(value); break;
+      default: return false;
+    }
+    *out = fp_to_bits(result);
+  } else {
+    double value = fp_from_bits<double>(a), result;
+    switch (kind) {
+      case PKind::FpNeg: result = -value; break;
+      case PKind::FpAbs: result = std::fabs(value); break;
+      case PKind::FpSqrt: result = std::sqrt(value); break;
+      case PKind::FpRound: result = fp_round_mode(value, mode); break;
+      case PKind::FpExp: result = std::exp(value); break;
+      case PKind::FpExp2: result = std::exp2(value); break;
+      case PKind::FpLog: result = std::log(value); break;
+      case PKind::FpLog2: result = std::log2(value); break;
+      case PKind::FpLog10: result = std::log10(value); break;
+      case PKind::FpLog1p: result = std::log1p(value); break;
+      default: return false;
+    }
+    *out = fp_to_bits(result);
+  }
+  return true;
+}
+
+static bool eval_fp_binary(PKind kind, uint16_t bits, uint64_t a, uint64_t b,
+                           uint64_t *out) {
+  if (bits != 32 && bits != 64) return false;
+  if (bits == 32) {
+    float av = fp_from_bits<float>(a), bv = fp_from_bits<float>(b), result;
+    switch (kind) {
+      case PKind::FpAdd: result = av + bv; break;
+      case PKind::FpSub: result = av - bv; break;
+      case PKind::FpMul: result = av * bv; break;
+      case PKind::FpDiv: result = av / bv; break;
+      case PKind::FpRem: result = std::fmod(av, bv); break;
+      case PKind::FpMin: result = std::fmin(av, bv); break;
+      case PKind::FpMax: result = std::fmax(av, bv); break;
+      case PKind::FpCopySign: result = std::copysign(av, bv); break;
+      case PKind::FpPow: result = std::pow(av, bv); break;
+      default: return false;
+    }
+    *out = fp_to_bits(result);
+  } else {
+    double av = fp_from_bits<double>(a), bv = fp_from_bits<double>(b), result;
+    switch (kind) {
+      case PKind::FpAdd: result = av + bv; break;
+      case PKind::FpSub: result = av - bv; break;
+      case PKind::FpMul: result = av * bv; break;
+      case PKind::FpDiv: result = av / bv; break;
+      case PKind::FpRem: result = std::fmod(av, bv); break;
+      case PKind::FpMin: result = std::fmin(av, bv); break;
+      case PKind::FpMax: result = std::fmax(av, bv); break;
+      case PKind::FpCopySign: result = std::copysign(av, bv); break;
+      case PKind::FpPow: result = std::pow(av, bv); break;
+      default: return false;
+    }
+    *out = fp_to_bits(result);
+  }
+  return true;
 }
 }  // namespace
 
@@ -1363,6 +1986,45 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
         }
         break;
       }
+      case PKind::FpAdd:
+      case PKind::FpSub:
+      case PKind::FpMul:
+      case PKind::FpDiv:
+      case PKind::FpRem:
+      case PKind::FpMin:
+      case PKind::FpMax:
+      case PKind::FpCopySign:
+      case PKind::FpPow:
+        if (!eval_fp_binary(nd.kind, bits, a, b, &v)) return false;
+        break;
+      case PKind::FpNeg:
+      case PKind::FpAbs:
+      case PKind::FpSqrt:
+      case PKind::FpRound:
+      case PKind::FpIsNan:
+      case PKind::FpIsInf:
+      case PKind::FpIsFinite:
+      case PKind::FpSignBit:
+      case PKind::FpLrint:
+      case PKind::FpExp:
+      case PKind::FpExp2:
+      case PKind::FpLog:
+      case PKind::FpLog2:
+      case PKind::FpLog10:
+      case PKind::FpLog1p:
+        if (!eval_fp_unary(nd.kind, nd.kind == PKind::FpLrint
+                                           ? nodes[nd.a].bits : bits,
+                           a, nd.value, &v)) return false;
+        break;
+      case PKind::FpTrunc:
+      case PKind::FpExt:
+      case PKind::FpToUI:
+      case PKind::FpToSI:
+      case PKind::FpToFP:
+      case PKind::FpSIToFP:
+        if (!eval_fp_cast(nd.kind, bits, nodes[nd.a].bits, a, &v))
+          return false;
+        break;
       case PKind::ZExt: v = mask_bits(a, bits); break;
       case PKind::SExt:
         v = mask_bits((uint64_t)sext_bits(a, nodes[nd.a].bits), bits);

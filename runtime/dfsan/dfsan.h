@@ -46,6 +46,11 @@ struct dfsan_label_info {
   dfsan_label l2;
   data op1;
   data op2;
+  // fmemcmp may compare more than one machine word. op1/op2 retain the first
+  // eight bytes; *_hi retain bytes 8..15 when the complete operand is known
+  // to be readable.
+  uint64_t op1_hi;
+  uint64_t op2_hi;
   uint16_t op;
   uint16_t size; // FIXME: this limit the size of the operand to 65535 bits or bytes (in case of memcmp)
   uint32_t hash;
@@ -324,8 +329,9 @@ enum operators {
 
 // fmemcmp keeps its base opcode in the low byte. The high bits record whether
 // the corresponding op value was materialized from a readable target address
-// into at most eight concrete bytes. A consumer must never treat an unmarked
-// constant operand as bytes: it is still an address in the target process.
+// into concrete bytes in op1/op2 (and, for bytes 8..15, op1_hi/op2_hi). A
+// consumer must never treat an unmarked constant operand as bytes: it is still
+// an address in the target process.
 constexpr uint16_t kFmemcmpOperand1Captured = 1u << 14;
 constexpr uint16_t kFmemcmpOperand2Captured = 1u << 15;
 constexpr uint16_t kFmemcmpCaptureMask =

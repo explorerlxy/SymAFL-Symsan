@@ -433,13 +433,13 @@ __taint_trace_memcmp(dfsan_label label) {
   uint16_t has_content = 1;
   // If fmemcmp materialized a constant operand, its op value no longer holds
   // an address. Solver-side trailers can carry the saved bytes only when the
-  // complete comparison fits in that bounded representation.
+  // complete comparison fits in the two-word representation.
   if (is_fmemcmp(info->op)) {
     bool concrete_op2 = info->l1 == CONST_LABEL &&
                         fmemcmp_operand_captured(info->op, false);
     bool concrete_op1 = info->l2 == CONST_LABEL &&
                         fmemcmp_operand_captured(info->op, true);
-    has_content = info->size != 0 && info->size <= 8 &&
+    has_content = info->size != 0 && info->size <= 16 &&
                   (concrete_op1 || concrete_op2);
   } else if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) ||
              info->size == 0) {
@@ -467,9 +467,14 @@ __taint_trace_memcmp(dfsan_label label) {
   memcmp_msg *mmsg = (memcmp_msg*)__builtin_alloca(msg_size);
   mmsg->label = label;
   if (is_fmemcmp(info->op)) {
-    uint64_t concrete_bytes = info->l1 == CONST_LABEL ? info->op1.i
-                                                       : info->op2.i;
-    internal_memcpy(mmsg->content, &concrete_bytes, info->size);
+    bool use_op1 = info->l1 == CONST_LABEL;
+    uint64_t concrete_bytes = use_op1 ? info->op1.i : info->op2.i;
+    uint64_t concrete_bytes_hi = use_op1 ? info->op1_hi : info->op2_hi;
+    internal_memcpy(mmsg->content, &concrete_bytes,
+                    info->size > 8 ? 8 : info->size);
+    if (info->size > 8)
+      internal_memcpy(mmsg->content + 8, &concrete_bytes_hi,
+                      info->size - 8);
   } else {
     // Copy concrete content: use op1 if l1 is concrete, else op2.
     void *concrete_ptr = (info->l1 == CONST_LABEL)
