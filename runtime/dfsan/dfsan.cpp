@@ -710,6 +710,43 @@ dfsan_label __taint_gep_offset(dfsan_label label, char* result, char* base) {
   return do_taint_union(0, label, __dfsan::Add, info->size, (uint64_t)offset, 0);
 }
 
+// Build the symbolic pointer value produced by a GEP with an input-dependent
+// index. The GEP trace constrains the index itself; this companion shadow is
+// needed when the resulting pointer participates in a comparison such as
+// `op < op + length`. Keep the concrete base address in the missing child so
+// the predicate evaluator sees the same absolute pointer value as the target.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE
+dfsan_label __taint_gep_index(dfsan_label ptr_label, dfsan_label index_label,
+                              uint64_t ptr, int64_t index,
+                              uint64_t elem_size, int64_t current_offset) {
+  if (index_label == 0)
+    return ptr_label;
+  if (index_label == kInitializingLabel ||
+      ptr_label == kInitializingLabel)
+    return kInitializingLabel;
+
+  uint64_t scaled = (uint64_t)index * elem_size;
+  dfsan_label offset_label = index_label;
+  if (elem_size != 1) {
+    offset_label = do_taint_union(index_label, 0, __dfsan::Mul, 64,
+                                   (uint64_t)index, elem_size);
+  }
+  if (current_offset != 0) {
+    offset_label = do_taint_union(offset_label, 0, __dfsan::Add, 64,
+                                  scaled, (uint64_t)current_offset);
+    scaled += (uint64_t)current_offset;
+  }
+
+  // Alloca shadows carry bounds metadata and cannot be operands of ordinary
+  // arithmetic. Preserve the input-dependent address expression here; the
+  // existing bounds path still observes the original ptr_label.
+  if (ptr_label != 0 &&
+      get_label_info(ptr_label)->op == __dfsan::Alloca)
+    ptr_label = 0;
+  return do_taint_union(ptr_label, offset_label, __dfsan::Add, 64, ptr,
+                        scaled);
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE
 dfsan_label __taint_union_load(const dfsan_label *ls, uptr n, uint64_t size_in_bits, uint64_t align) {
   if ((uptr)ls < 4096) {

@@ -130,6 +130,7 @@ uint32_t RunConverter::conv_child(uint32_t label, uint64_t cval,
 uint8_t RunConverter::child_count(const dfsan_label_info *info, uint32_t op,
                                   uint32_t op_lo) const {
   if (op == 0 || op_lo == Load) return 0;
+  if (op_lo == PtrToInt) return 1;
   if (op == __dfsan::Extract || op_lo == Trunc ||
       op_lo == Neg || op_lo == Not || op_lo == ZExt || op_lo == SExt ||
       op_lo == __dfsan::ctlz || op_lo == __dfsan::cttz)
@@ -279,6 +280,16 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     fail(PredError::InvalidWidth);
     return kInvalidNode;
   }
+
+  // Pointer-to-integer conversion preserves the 64-bit pointer value. The
+  // runtime child already models the absolute pointer expression, so an
+  // identity conversion is both exact and sufficient for scalar PCBT.
+  if (op_lo == PtrToInt) {
+    uint32_t child = conv_child(info->l1 ? info->l1 : info->l2,
+                                info->l1 ? info->op1.i : info->op2.i,
+                                size);
+    return child == kInvalidNode ? kInvalidNode : child;
+  }
   PKind kind;
   bool unary = false, binary = false;
 
@@ -323,21 +334,36 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
       fail(PredError::BadConcat);
       return kInvalidNode;
     }
-    uint16_t cbits1 = size, cbits2 = size;
-    if (info->l1 == 0 && info->l2 != 0 && info->l2 < table_labels_) {
-      if (table_[info->l2].size > size) {
+    uint16_t l1_bits = 0, l2_bits = 0;
+    if (info->l1 != 0) {
+      if (info->l1 >= table_labels_) {
+        fail(PredError::InvalidLabel);
+        return kInvalidNode;
+      }
+      l1_bits = table_[info->l1].size;
+      if (l1_bits > size) {
         fail(PredError::BadConcat);
         return kInvalidNode;
       }
-      cbits1 = (uint16_t)(size - table_[info->l2].size);
     }
-    if (info->l2 == 0 && info->l1 != 0 && info->l1 < table_labels_) {
-      if (table_[info->l1].size > size) {
+    if (info->l2 != 0) {
+      if (info->l2 >= table_labels_) {
+        fail(PredError::InvalidLabel);
+        return kInvalidNode;
+      }
+      l2_bits = table_[info->l2].size;
+      if (l2_bits > size) {
         fail(PredError::BadConcat);
         return kInvalidNode;
       }
-      cbits2 = (uint16_t)(size - table_[info->l1].size);
     }
+    if (info->l1 != 0 && info->l2 != 0 &&
+        (uint32_t)l1_bits + l2_bits != size) {
+      fail(PredError::BadConcat);
+      return kInvalidNode;
+    }
+    uint16_t cbits1 = info->l1 ? l1_bits : (uint16_t)(size - l2_bits);
+    uint16_t cbits2 = info->l2 ? l2_bits : (uint16_t)(size - l1_bits);
     uint32_t a = conv_child(info->l1, info->op1.i, cbits1);
     uint32_t b = conv_child(info->l2, info->op2.i, cbits2);
     return a == kInvalidNode || b == kInvalidNode
@@ -1213,9 +1239,12 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
         v = nd.value >= 64 ? 0 : mask_bits(a >> nd.value, bits);
         break;
       case PKind::Concat: {
-        uint16_t lo_bits = nodes[nd.b].bits;
-        if (lo_bits >= 64) return false;
-        v = mask_bits((a << lo_bits) | b, bits);
+        // Runtime __taint_union_load records l1 as the low-order part and
+        // l2 as the newly appended high-order part. Keep that little-endian
+        // byte assembly here: (high << low_bits) | low.
+        uint16_t low_bits = nodes[nd.a].bits;
+        if (low_bits >= 64) return false;
+        v = mask_bits((b << low_bits) | a, bits);
         break;
       }
       case PKind::Memcmp: {

@@ -450,6 +450,7 @@ class Taint {
   FunctionType *TaintUnionLoadFnTy;
   FunctionType *TaintUnionStoreFnTy;
   FunctionType *TaintGEPOffsetFnTy;
+  FunctionType *TaintGEPIndexFnTy;
   FunctionType *TaintUnimplementedFnTy;
   FunctionType *TaintWrapperExternWeakNullFnTy;
   FunctionType *TaintSetLabelFnTy;
@@ -482,6 +483,7 @@ class Taint {
   FunctionCallee TaintUnionLoadFn;
   FunctionCallee TaintUnionStoreFn;
   FunctionCallee TaintGEPOffsetFn;
+  FunctionCallee TaintGEPIndexFn;
   FunctionCallee TaintUnimplementedFn;
   FunctionCallee TaintWrapperExternWeakNullFn;
   FunctionCallee TaintSetLabelFn;
@@ -1040,6 +1042,10 @@ bool Taint::initializeModule(Module &M) {
   TaintGEPOffsetFnTy = FunctionType::get(
       PrimitiveShadowTy,
       { PrimitiveShadowTy, VoidPtrTy, VoidPtrTy }, /*isVarArg=*/ false);
+  TaintGEPIndexFnTy = FunctionType::get(
+      PrimitiveShadowTy,
+      { PrimitiveShadowTy, PrimitiveShadowTy, Int64Ty, Int64Ty, Int64Ty,
+        Int64Ty }, /*isVarArg=*/false);
   TaintUnimplementedFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), PointerType::getUnqual(*Ctx), /*isVarArg=*/false);
   Type *TaintWrapperExternWeakNullArgs[2] = { PointerType::getUnqual(*Ctx),
@@ -1272,6 +1278,8 @@ void Taint::initializeRuntimeFunctions(Module &M) {
     AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
     TaintGEPOffsetFn =
         Mod->getOrInsertFunction("__taint_gep_offset", TaintGEPOffsetFnTy, AL);
+    TaintGEPIndexFn =
+        Mod->getOrInsertFunction("__taint_gep_index", TaintGEPIndexFnTy, AL);
   }
   {
     TaintUnimplementedFn =
@@ -1327,6 +1335,8 @@ void Taint::initializeRuntimeFunctions(Module &M) {
       TaintUnionStoreFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintGEPOffsetFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintGEPIndexFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintUnimplementedFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -1919,7 +1929,15 @@ Value *TaintFunction::getShadowForTLSArgument(Argument *A) {
       continue;
     }
 
-    unsigned Size = DL.getTypeAllocSize(TT.getShadowTy(&FArg));
+    // LLVM lowers large by-value aggregates to pointer arguments carrying a
+    // byval attribute.  The concrete ABI copies the aggregate before entering
+    // the callee, but that copy does not copy SymSan shadow memory.  Match the
+    // caller's TLS layout using the byval element type rather than the
+    // pointer's scalar shadow.
+    Type *ShadowOrigTy = FArg.getParamByValType();
+    if (!ShadowOrigTy)
+      ShadowOrigTy = FArg.getType();
+    unsigned Size = DL.getTypeAllocSize(TT.getShadowTy(ShadowOrigTy));
     if (A != &FArg) {
       ArgOffset += alignTo(Size, ShadowTLSAlignment);
       if (ArgOffset > ArgTLSSize)
@@ -1932,9 +1950,21 @@ Value *TaintFunction::getShadowForTLSArgument(Argument *A) {
 
     Instruction *ArgTLSPos = &*F->getEntryBlock().begin();
     IRBuilder<> IRB(ArgTLSPos);
-    Value *ArgShadowPtr = getArgTLS(FArg.getType(), ArgOffset, IRB);
-    return IRB.CreateAlignedLoad(TT.getShadowTy(&FArg), ArgShadowPtr,
-                                 ShadowTLSAlignment);
+    Value *ArgShadowPtr = getArgTLS(ShadowOrigTy, ArgOffset, IRB);
+    Value *Shadow = IRB.CreateAlignedLoad(TT.getShadowTy(ShadowOrigTy),
+                                          ArgShadowPtr, ShadowTLSAlignment);
+
+    // Recreate shadow memory for the ABI-created byval copy.  Subsequent
+    // field loads use the ordinary shadow-memory path, so this preserves
+    // labels for aggregate fields such as sequence.matchLength.
+    if (FArg.getParamByValType()) {
+      uint64_t ValueSize = DL.getTypeStoreSize(ShadowOrigTy);
+      Align ValueAlign = FArg.getParamAlign().value_or(
+          DL.getABITypeAlign(ShadowOrigTy));
+      storeShadow(&FArg, ShadowOrigTy, ValueSize, ValueAlign, Shadow,
+                  ArgTLSPos);
+    }
+    return Shadow;
   }
 
   return TT.getZeroShadow(A);
@@ -3827,6 +3857,7 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   Module *M = F->getParent();
   auto &DL = M->getDataLayout();
   int64_t CurrentOffset = 0;
+  bool HasSymbolicIndex = false;
 
   IRBuilder<> IRB(I);
   Value *Base = I->getPointerOperand();
@@ -3897,6 +3928,18 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
             IRB.CreateCall(TT.TaintTraceGEPFn,
                            {Shadow, Ptr, IndexShadow, Index, NE, ES, Offset, CID});
           }
+
+          // The result pointer must retain the index dependency.  A function
+          // argument's pointer shadow is a runtime TLS load, so testing it
+          // with isZeroShadow() cannot establish that it is zero at compile
+          // time.  Build the pointer expression in the runtime instead.
+          Shadow = IRB.CreateCall(
+              TT.TaintGEPIndexFn,
+              {Shadow, IndexShadow, Ptr, Index, ES, Offset});
+          HasSymbolicIndex = true;
+          // The helper has consumed the constant offset before this index;
+          // offsets after it are applied by the final GEP-offset call below.
+          CurrentOffset = 0;
         } else {
           break;
         }
@@ -3908,7 +3951,8 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   // 1. For constant offset GEPs on string op pointers, create fstr_off label
   // to track the offset (e.g., sep + 1 where sep is from strchr)
   // 2. For symbolic ptr (e.g., from UCSan), we need to trace the offset
-  if (!TT.isZeroShadow(Shadow)) {
+  if (!TT.isZeroShadow(Shadow) &&
+      (!HasSymbolicIndex || CurrentOffset != 0)) {
     IRBuilder<> IRB(I->getNextNode());
     Shadow = IRB.CreateCall(TT.TaintGEPOffsetFn,
         {Shadow, IRB.CreateBitOrPointerCast(I, TT.VoidPtrTy),
@@ -5063,18 +5107,31 @@ void TaintVisitor::visitCallBase(CallBase &CB) {
   // Stores argument shadows.
   unsigned ArgOffset = 0;
   for (unsigned I = 0, N = FT->getNumParams(); I != N; ++I) {
-    unsigned Size =
-        DL.getTypeAllocSize(TF.TT.getShadowTy(FT->getParamType(I)));
+    // A byval pointer represents the aggregate bytes copied by the ABI, not
+    // the pointer value itself.  Transfer the aggregate shadow field-by-field
+    // so the callee can restore it onto its private byval copy.
+    Type *ShadowOrigTy = CB.getParamByValType(I);
+    if (!ShadowOrigTy)
+      ShadowOrigTy = FT->getParamType(I);
+    unsigned Size = DL.getTypeAllocSize(TF.TT.getShadowTy(ShadowOrigTy));
     // Stop storing if arguments' size overflows. Inside a function, arguments
     // after overflow have zero shadow values.
     if (ArgOffset + Size > ArgTLSSize)
       break;
     Value *Arg = CB.getArgOperand(I);
-    auto *GV = dyn_cast<GlobalVariable>(Arg->stripPointerCasts());
-    Value *Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
-                       : TF.getShadow(Arg);
+    Value *Shadow;
+    if (CB.getParamByValType(I)) {
+      uint64_t ValueSize = DL.getTypeStoreSize(ShadowOrigTy);
+      Align ValueAlign = CB.getParamAlign(I).value_or(
+          DL.getABITypeAlign(ShadowOrigTy));
+      Shadow = TF.loadShadow(ShadowOrigTy, Arg, ValueSize, ValueAlign, &CB);
+    } else {
+      auto *GV = dyn_cast<GlobalVariable>(Arg->stripPointerCasts());
+      Shadow = GV ? TF.getShadowForGlobal(GV, IRB)
+                  : TF.getShadow(Arg);
+    }
     IRB.CreateAlignedStore(Shadow,
-                           TF.getArgTLS(FT->getParamType(I), ArgOffset, IRB),
+                           TF.getArgTLS(ShadowOrigTy, ArgOffset, IRB),
                            ShadowTLSAlignment);
     ArgOffset += alignTo(Size, ShadowTLSAlignment);
   }
