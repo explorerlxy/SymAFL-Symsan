@@ -54,6 +54,40 @@ static bool label_depends_on(const dfsan_label_info *table, size_t labels,
   return false;
 }
 
+// True when the converted arena subtree has no input-dependent leaves. An
+// ICmp operand derived only from constants (e.g. fstrlen with a programmatic
+// NUL, folded pointer arithmetic) does not depend on the candidate, so the
+// runtime's captured concrete operand is the only faithful value.
+static bool subtree_input_free(const PredArena &arena, uint32_t root) {
+  if (root == kNoChild || root == kInvalidNode || root >= arena.nodes.size())
+    return false;
+  std::vector<uint32_t> stack = {root};
+  std::unordered_set<uint32_t> seen;
+  while (!stack.empty()) {
+    uint32_t idx = stack.back();
+    stack.pop_back();
+    if (idx == kNoChild || idx >= arena.nodes.size() ||
+        !seen.insert(idx).second)
+      continue;
+    const PNode &nd = arena.nodes[idx];
+    switch (nd.kind) {
+      case PKind::Read:
+      case PKind::EofRead:
+      case PKind::Len:
+      case PKind::Count:
+      case PKind::CountNeg1:
+      case PKind::CountElems:
+      case PKind::Opaque:
+        return false;
+      default:
+        break;
+    }
+    if (nd.a != kNoChild) stack.push_back(nd.a);
+    if (nd.b != kNoChild) stack.push_back(nd.b);
+  }
+  return true;
+}
+
 struct ConvertFrame {
   uint32_t label;
   bool expanded;
@@ -845,8 +879,19 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     }
     uint32_t a = conv_child(info->l1, info->op1.i, size);
     uint32_t b = conv_child(info->l2, info->op2.i, size);
-    return a == kInvalidNode || b == kInvalidNode
-               ? kInvalidNode : add(kind, size, a, b);
+    if (a == kInvalidNode || b == kInvalidNode)
+      return kInvalidNode;
+    // An ICmp label always carries the concrete operand bit patterns in
+    // op1/op2 (the runtime keeps them for the solver).  When the derived
+    // operand DAGs are input-independent, the label arithmetic can
+    // reconstruct a different constant than the runtime actually compared
+    // (address-derived operands: the branch depends on heap layout, not
+    // input bytes).  Rebuild such operands from the captured concrete values
+    // so the stored predicate matches the observed direction instead of
+    // poisoning the node unstable on replay.
+    if (subtree_input_free(*arena_, a)) a = add_const(info->op1.i, size);
+    if (subtree_input_free(*arena_, b)) b = add_const(info->op2.i, size);
+    return add(kind, size, a, b);
   }
   if (op_lo == FCmp) {
     // Lower an FP comparison to an integer comparison over the IEEE-754 bit

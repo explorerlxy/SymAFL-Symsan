@@ -1104,6 +1104,10 @@ static bool replay_check_trace(my_mutator_t *data,
     else if (report.reached_frontier) data->replay_frontier_match += 1;
     return true;
   }
+  // Replay-validation mismatches are trace conflicts too: count them in the
+  // tree's conflict census so the `conflicts` metric does not hide replay
+  // drift that marks nodes unstable (admit_unstable) behind a zero.
+  data->tree.num_conflicts += 1;
 
   // Log the mismatch. The trace is discarded so it never grows the tree with
   // an unverified path; the divergence is a collection/derivation defect to
