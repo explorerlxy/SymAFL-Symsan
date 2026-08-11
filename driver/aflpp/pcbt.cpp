@@ -293,6 +293,11 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
 
   RunConverter conv(table, table_labels, &pred_arena_);
   uint32_t created = 0;
+
+  // Diagnostics: detect label pollution (non-zero label but no input dependency)
+  static bool label_pollution_diagnostics = getenv("SYMAFL_LABEL_POLLUTION_DEBUG") != nullptr;
+  static uint32_t pollution_logged = 0;
+
   for (; i < events.size(); ++i) {
     const Event &ev = events[i];
     std::vector<Predicate> preds;
@@ -396,6 +401,14 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   uint32_t created = 0;
   uint8_t dir = direction;
   NodeRef cur = parent;
+
+  // Diagnostics: count events with empty reads (label pollution candidates)
+  static bool label_pollution_diagnostics = getenv("SYMAFL_LABEL_POLLUTION_DEBUG") != nullptr;
+  static uint32_t pollution_logged = 0;
+  static uint32_t total_events_seen = 0;
+  static uint32_t empty_reads_seen = 0;
+  static bool diagnostics_banner_printed = false;
+
   for (const Event &event : events) {
     std::vector<Predicate> preds;
     if (event.count > 1) {
@@ -404,6 +417,29 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       preds.push_back(conv.conv(event.label));
     }
     for (const Predicate &pred : preds) {
+      total_events_seen++;
+
+      if (!diagnostics_banner_printed) {
+        if (label_pollution_diagnostics) {
+          fprintf(stderr, "[label-pollution] diagnostics ENABLED\n");
+        }
+        diagnostics_banner_printed = true;
+      }
+
+      if (!pred.opaque && pred.reads.empty()) {
+        empty_reads_seen++;
+        if (label_pollution_diagnostics && pollution_logged < 50) {
+          fprintf(stderr, "[label-pollution] #%u cid=%u label=%u result=%u\n",
+                  pollution_logged, event.cid, event.label, event.result);
+          fprintf(stderr, "  label_info: op=0x%x l1=%u l2=%u size=%u op1=%llu op2=%llu\n",
+                  table[event.label].op, table[event.label].l1, table[event.label].l2,
+                  table[event.label].size,
+                  (unsigned long long)table[event.label].op1.i,
+                  (unsigned long long)table[event.label].op2.i);
+          pollution_logged++;
+        }
+      }
+
       Node new_node;
       new_node.cid = event.cid;
       new_node.depth = node(cur).depth + 1;
@@ -432,6 +468,18 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   node(cur).child[dir] = kTerminal;
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
+
+  // Report label pollution statistics
+  if (label_pollution_diagnostics && total_events_seen > 0) {
+    static uint32_t last_report_total = 0;
+    if (total_events_seen - last_report_total >= 10000) {
+      fprintf(stderr, "[label-pollution] stats: total=%u empty_reads=%u (%.1f%%)\n",
+              total_events_seen, empty_reads_seen,
+              100.0 * empty_reads_seen / total_events_seen);
+      last_report_total = total_events_seen;
+    }
+  }
+
   if (out_tail_node) *out_tail_node = cur;
   if (out_tail_dir) *out_tail_dir = dir;
   return created;
