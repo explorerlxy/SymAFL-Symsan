@@ -98,6 +98,7 @@ class Tree {
   uint32_t InsertSuffix(NodeRef parent, uint8_t direction,
                         const std::vector<Event> &events,
                         const dfsan_label_info *table, size_t table_labels,
+                        const uint8_t *input, uint32_t len,
                         NodeRef *out_tail_node = nullptr,
                         uint8_t *out_tail_dir = nullptr);
 

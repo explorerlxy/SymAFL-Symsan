@@ -181,6 +181,64 @@ static inline uint32_t child_skip_cnt(const Node &parent, uint8_t parent_dir,
   return parent.skipCnt + (constraint ? 1 : 2);
 }
 
+// True when the DAG freezes a large absolute constant that is neither a
+// small bit-mask nor a small negative. Incomplete taint of pointer
+// arithmetic (FSE sequence lengths into iLitEnd/oMatchEnd bounds checks)
+// freezes stack/heap bases from the training run; those bases are not
+// candidate-invariant when earlier omitted decisions change layout.
+static bool pred_has_abs_addr_const(const PredArena &arena,
+                                    const Predicate &pred) {
+  if (pred.opaque || pred.root >= arena.nodes.size()) return false;
+  std::vector<uint32_t> stack = {pred.root};
+  std::vector<uint8_t> seen(arena.nodes.size(), 0);
+  while (!stack.empty()) {
+    uint32_t idx = stack.back();
+    stack.pop_back();
+    if (idx >= arena.nodes.size() || seen[idx]) continue;
+    seen[idx] = 1;
+    const PNode &nd = arena.nodes[idx];
+    if (nd.kind == PKind::Const && nd.bits >= 48) {
+      const uint64_t v = nd.value;
+      // 48/64-bit constants above the 32-bit space are almost always
+      // frozen stack/heap bases. Keep 32-bit magic numbers (zstd frame
+      // magic 0xfd2fb528), small bit-masks, and small negatives
+      // (EOF/-1, WILDCOPY_OVERLENGTH as -32) modellable.
+      if (v > 0xFFFFFFFFULL && v < (~uint64_t{0} - 0xFFFFULL)) return true;
+    }
+    if (nd.a != UINT32_MAX) stack.push_back(nd.a);
+    if (nd.b != UINT32_MAX) stack.push_back(nd.b);
+  }
+  return false;
+}
+
+// Fail-closed insertion guard for incomplete predicate models:
+// 1) Self-check: must reproduce the training run's observed direction.
+// 2) Absolute-address + input mix: a partially tainted pointer comparison
+//    freezes training-run bases while sampling input bits; it agrees on
+//    the training candidate but disagrees on later ones (zstd cid
+//    595640479 residual dir_mismatch). Pure constants (no reads) are
+//    allowed after ICmp pinning; they evaluate the same for every
+//    candidate.
+// Mark opaque so CheckInput admits conservatively.
+static Predicate selfcheck_predicate(const PredArena &arena, Predicate pred,
+                                     const uint8_t *input, uint32_t len,
+                                     uint8_t expected_result) {
+  if (pred.opaque) return pred;
+  if (!pred.reads.empty() && pred_has_abs_addr_const(arena, pred)) {
+    pred.opaque = true;
+    pred.error = PredError::UnsupportedOp;
+    return pred;
+  }
+  if (input == nullptr) return pred;
+  uint64_t v = 0;
+  if (!eval_predicate(arena, pred, input, len, &v) ||
+      ((v != 0) ? 1 : 0) != (expected_result ? 1 : 0)) {
+    pred.opaque = true;
+    pred.error = PredError::UnsupportedOp;
+  }
+  return pred;
+}
+
 uint32_t Tree::InsertTrace(const std::vector<Event> &events,
                            const dfsan_label_info *table,
                            size_t table_labels,
@@ -309,7 +367,9 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       preds.push_back(conv.conv(ev.label));
     }
     k = 0;
-    for (const Predicate &pred : preds) {
+    for (const Predicate &raw_pred : preds) {
+      Predicate pred =
+          selfcheck_predicate(pred_arena_, raw_pred, input, len, ev.result);
       Node new_node;
       new_node.cid = ev.cid;
       new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
@@ -353,7 +413,8 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
 uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
                             const std::vector<Event> &events,
                             const dfsan_label_info *table,
-                            size_t table_labels, NodeRef *out_tail_node,
+                            size_t table_labels, const uint8_t *input,
+                            uint32_t len, NodeRef *out_tail_node,
                             uint8_t *out_tail_dir) {
   if (parent < kRoot || parent >= nodes_.size() || direction > 1 ||
       node(parent).child[direction] != kUnexplored) {
@@ -416,7 +477,9 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     } else {
       preds.push_back(conv.conv(event.label));
     }
-    for (const Predicate &pred : preds) {
+    for (const Predicate &raw_pred : preds) {
+      Predicate pred = selfcheck_predicate(pred_arena_, raw_pred, input, len,
+                                           event.result);
       total_events_seen++;
 
       if (!diagnostics_banner_printed) {

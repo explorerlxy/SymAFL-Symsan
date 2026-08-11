@@ -1518,8 +1518,9 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
     return false;
   }
   const uint64_t opaque_before = data->tree.num_opaque;
-  uint32_t created = data->tree.InsertSuffix(data->last_node, data->last_dir,
-      events, __dfsan_label_info, MAX_LABEL, out_tail_node, out_tail_dir);
+  uint32_t created = data->tree.InsertSuffix(
+      data->last_node, data->last_dir, events, __dfsan_label_info, MAX_LABEL,
+      buf, (uint32_t)buf_size, out_tail_node, out_tail_dir);
   uint64_t expanded = 0;
   for (const pcbt::Event &ev : events) expanded += ev.count;
   fprintf(stderr,
@@ -1583,9 +1584,10 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
       ? data->tree.InsertTrace(events, data->single_pass_label_info,
                                MAX_LABEL, buf, (uint32_t)buf_size,
                                out_tail_node, out_tail_dir)
-      : data->tree.InsertSuffix(data->last_node, data->last_dir,
-          events, data->single_pass_label_info, MAX_LABEL,
-          out_tail_node, out_tail_dir);
+      : data->tree.InsertSuffix(data->last_node, data->last_dir, events,
+                                data->single_pass_label_info, MAX_LABEL, buf,
+                                (uint32_t)buf_size, out_tail_node,
+                                out_tail_dir);
   profile_stop(data, insert_start, &data->profile_insert_ns,
                &data->profile_insert_calls);
   data->single_pass_captures += 1;
@@ -2022,7 +2024,8 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
         if (!trace_overflow && !events.empty()) {
           uint32_t created = data->tree.InsertSuffix(
               data->probe_capture_node, data->probe_capture_dir, events,
-              __dfsan_label_info, MAX_LABEL, nullptr, nullptr);
+              __dfsan_label_info, MAX_LABEL, buf, (uint32_t)buf_size, nullptr,
+              nullptr);
           if (created > 0) {
             // A nonempty learned suffix proves the edge has real follow-up
             // paths; refresh the budget so later candidates can reach them.

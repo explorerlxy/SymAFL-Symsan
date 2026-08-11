@@ -884,14 +884,22 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     uint32_t b = conv_child(info->l2, info->op2.i, size);
     if (a == kInvalidNode || b == kInvalidNode)
       return kInvalidNode;
-    // REMOVED: subtree_input_free() pinning (38309bf).
-    // Pinning masked the symptom (direction mismatch) but did not fix the
-    // root cause. If pointer/heap-derived values produce mismatches, the real
-    // issue is either (a) an earlier omitted decision event, or (b) a genuine
-    // heap-layout expressiveness limit. Either way, the predicate must fail
-    // closed (UnsupportedOp -> opaque) or the omission must be fixed, not
-    // pinned to trace-time constants. Sqlite dir_mismatch will reappear;
-    // forensic snapshot required to diagnose the true root cause.
+    // Input-free operand DAGs (heap pointers, programmatic-NUL fstrlen, pure
+    // constant arithmetic) can reconstruct different constants than the
+    // runtime compared. The ICmp label always carries the observed concrete
+    // operand bits in op1/op2: pin each input-free side to those captured
+    // values so the stored predicate matches the observed branch direction.
+    // Input-dependent sides keep their converted expressions. Incomplete
+    // models that still disagree on the training input are caught by the
+    // InsertTrace/InsertSuffix self-check and fail closed to opaque.
+    if (subtree_input_free(*arena_, a)) {
+      a = add_const(info->op1.i, size);
+      if (a == kInvalidNode) return kInvalidNode;
+    }
+    if (subtree_input_free(*arena_, b)) {
+      b = add_const(info->op2.i, size);
+      if (b == kInvalidNode) return kInvalidNode;
+    }
     return add(kind, size, a, b);
   }
   if (op_lo == FCmp) {
@@ -1665,40 +1673,12 @@ Predicate RunConverter::conv(uint32_t label) {
   pred.reads.erase(std::unique(pred.reads.begin(), pred.reads.end()),
                    pred.reads.end());
 
-  // Fail-closed check for input-free predicates:
-  // If a predicate has no Read leaves and no Len/Count family leaves,
-  // it is pure constant logic (or polluted label). Marking it opaque ensures
-  // it is conservatively admitted (admit_opaque) rather than being evaluated
-  // as a constant decision node that creates false terminal vetoes and replay conflicts.
-  if (pred.reads.empty()) {
-    bool has_len = false;
-    std::vector<uint32_t> check_st = {pred.root};
-    std::unordered_set<uint32_t> check_seen;
-    while (!check_st.empty()) {
-      uint32_t idx = check_st.back();
-      check_st.pop_back();
-      if (!check_seen.insert(idx).second) continue;
-      const PNode &nd = arena_->nodes[idx];
-      switch (nd.kind) {
-        case PKind::Len:
-        case PKind::EofRead:
-        case PKind::Count:
-        case PKind::CountNeg1:
-        case PKind::CountElems:
-          has_len = true;
-          break;
-        default:
-          break;
-      }
-      if (has_len) break;
-      if (nd.a != kNoChild) check_st.push_back(nd.a);
-      if (nd.b != kNoChild) check_st.push_back(nd.b);
-    }
-    if (!has_len) {
-      pred.opaque = true;
-      pred.error = PredError::UnsupportedOp;
-    }
-  }
+  // Input-free predicates that survived conversion (including ICmp pinning
+  // above) are pure constants relative to the candidate. They are sound only
+  // when their evaluation matches the observed branch direction; that check
+  // lives in Tree::selfcheck_predicate during insertion. Do not blanket-mark
+  // them opaque here: a correctly pinned heap/pointer comparison must remain
+  // a constant decision node.
 
   return pred;
 }
