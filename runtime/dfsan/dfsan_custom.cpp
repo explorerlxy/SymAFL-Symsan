@@ -1105,14 +1105,41 @@ void *__dfsw_memset(void *s, int c, size_t n,
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_tolower(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = tolower(c);
-  *ret_label = dfsan_union(0, c_label, __dfsan::Or, 8, 0x20, 0);
+  // Exact mapping: tolower(c) = c + 0x20 when c is an uppercase letter,
+  // otherwise c unchanged.  The old `c | 0x20` approximation corrupted
+  // non-letter inputs (e.g. '0' | 0x20 = 'p'), which libxml2 feeds into
+  // encoding-name matching (toupper/tolower over the input's encoding
+  // declaration), producing wrong byte labels and replay mismatches.
+  if (c_label == 0 || c_label == kInitializingLabel) {
+    *ret_label = 0;
+  } else {
+    dfsan_label upper = dfsan_union(
+        dfsan_union(c_label, 0, __dfsan::ICmp | (bvuge << 8), 8, c, 'A'),
+        dfsan_union(c_label, 0, __dfsan::ICmp | (bvule << 8), 8, c, 'Z'),
+        __dfsan::And, 1, 0, 0);
+    dfsan_label delta =
+        dfsan_union(upper, 0, __dfsan::Mul, 8, 0, 0x20);
+    *ret_label = dfsan_union(c_label, delta, __dfsan::Add, 8, ret, 0);
+  }
   return ret;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_toupper(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = toupper(c);
-  *ret_label = dfsan_union(0, c_label, __dfsan::And, 8, 0x5f, 0);
+  // Exact mapping: toupper(c) = c - 0x20 when c is a lowercase letter,
+  // otherwise c unchanged.
+  if (c_label == 0 || c_label == kInitializingLabel) {
+    *ret_label = 0;
+  } else {
+    dfsan_label lower = dfsan_union(
+        dfsan_union(c_label, 0, __dfsan::ICmp | (bvuge << 8), 8, c, 'a'),
+        dfsan_union(c_label, 0, __dfsan::ICmp | (bvule << 8), 8, c, 'z'),
+        __dfsan::And, 1, 0, 0);
+    dfsan_label delta =
+        dfsan_union(lower, 0, __dfsan::Mul, 8, 0, 0x20);
+    *ret_label = dfsan_union(c_label, delta, __dfsan::Sub, 8, ret, 0);
+  }
   return ret;
 }
 
@@ -4818,13 +4845,103 @@ static void iconv_emit_ucs4_checks(const char *p, size_t remaining,
   }
 }
 
+// glibc UTF-8 decoder: does the byte at offset i start a complete valid
+// sequence?  ASCII is valid; a lead byte needs its continuation bytes in
+// [0x80,0xBF] with the overlong/surrogate boundary rules (0xE0: second
+// byte >= 0xA0, 0xED: <= 0x9F, 0xF0: >= 0x90, 0xF4: <= 0x8F); a truncated
+// sequence (fewer bytes than needed) is invalid (EINVAL).
+static bool iconv_utf8_seq_valid(const uint8_t *p, size_t i, size_t remaining) {
+  if (i >= remaining) return false;
+  uint8_t b = p[i];
+  if (b < 0x80) return true;
+  size_t need;
+  if (b >= 0xC2 && b <= 0xDF) need = 2;
+  else if (b >= 0xE0 && b <= 0xEF) need = 3;
+  else if (b >= 0xF0 && b <= 0xF4) need = 4;
+  else return false;
+  if (i + need > remaining) return false;
+  for (size_t k = 1; k < need; ++k) {
+    uint8_t c = p[i + k];
+    if (c < 0x80 || c > 0xBF) return false;
+  }
+  if (need == 3) {
+    if (b == 0xE0 && p[i + 1] < 0xA0) return false;
+    if (b == 0xED && p[i + 1] > 0x9F) return false;
+  } else if (need == 4) {
+    if (b == 0xF0 && p[i + 1] < 0x90) return false;
+    if (b == 0xF4 && p[i + 1] > 0x8F) return false;
+  }
+  return true;
+}
+
+// Build the invariant label for "position i starts a valid UTF-8 sequence":
+//   ascii(i) | (lead2(i) & cont(i+1)) |
+//   (lead3(i) & cont(i+1) & cont(i+2) & bnd3(i)) |
+//   (lead4(i) & cont(i+1) & cont(i+2) & cont(i+3) & bnd4(i))
+// where cont(j) = b_j in [0x80,0xBF] and bnd3/bnd4 are the overlong/
+// surrogate boundary rules.  The structure is fixed per position; bytes at
+// j >= remaining are absent (constant-false leaves, 0xFF when replayed with
+// a longer input), and candidates with the same read-count branch share the
+// same window edge, so the stored predicate stays consistent.
+static dfsan_label iconv_utf8_seq_valid_label(const uint8_t *p, size_t i,
+                                              size_t remaining) {
+  auto byte_label = [&](size_t j) -> dfsan_label {
+    return j < remaining ? dfsan_read_label(p + j, 1) : 0;
+  };
+  auto byte_val = [&](size_t j) -> uint8_t {
+    return j < remaining ? p[j] : 0;
+  };
+  auto icmp = [](dfsan_label l, uint64_t lhs, uint64_t rhs, uint8_t pred) {
+    return dfsan_union(l, 0, __dfsan::ICmp | (pred << 8), 8, lhs, rhs);
+  };
+  auto land = [](dfsan_label a, dfsan_label b) {
+    return dfsan_union(a, b, __dfsan::And, 1, 0, 0);
+  };
+  auto lor = [](dfsan_label a, dfsan_label b) {
+    return dfsan_union(a, b, __dfsan::Or, 1, 0, 0);
+  };
+  auto lnot = [](dfsan_label a) {
+    return dfsan_union(a, 0, __dfsan::Not, 1, 0, 0);
+  };
+
+  dfsan_label b0 = byte_label(i);
+  if (b0 == 0 || b0 == kInitializingLabel) return 0;
+  uint8_t v0 = byte_val(i);
+  dfsan_label b1 = byte_label(i + 1);
+  dfsan_label b2 = byte_label(i + 2);
+  dfsan_label b3 = byte_label(i + 3);
+  uint8_t v1 = byte_val(i + 1);
+  uint8_t v2 = byte_val(i + 2);
+  uint8_t v3 = byte_val(i + 3);
+
+  dfsan_label ascii = icmp(b0, v0, 0x80, bvult);
+  dfsan_label lead2 = land(icmp(b0, v0, 0xC2, bvuge), icmp(b0, v0, 0xDF, bvule));
+  dfsan_label lead3 = land(icmp(b0, v0, 0xE0, bvuge), icmp(b0, v0, 0xEF, bvule));
+  dfsan_label lead4 = land(icmp(b0, v0, 0xF0, bvuge), icmp(b0, v0, 0xF4, bvule));
+  auto cont = [&](dfsan_label bl, uint8_t v) {
+    return land(icmp(bl, v, 0x80, bvuge), icmp(bl, v, 0xBF, bvule));
+  };
+  dfsan_label c1 = cont(b1, v1);
+  dfsan_label c2 = cont(b2, v2);
+  dfsan_label c3 = cont(b3, v3);
+  dfsan_label bnd3 = lnot(lor(
+      land(icmp(b0, v0, 0xE0, bveq), icmp(b1, v1, 0xA0, bvult)),
+      land(icmp(b0, v0, 0xED, bveq), icmp(b1, v1, 0x9F, bvugt))));
+  dfsan_label bnd4 = lnot(lor(
+      land(icmp(b0, v0, 0xF0, bveq), icmp(b1, v1, 0x90, bvult)),
+      land(icmp(b0, v0, 0xF4, bveq), icmp(b1, v1, 0x8F, bvugt))));
+  dfsan_label seq2 = land(lead2, c1);
+  dfsan_label seq3 = land(land(lead3, c1), land(c2, bnd3));
+  dfsan_label seq4 = land(land(land(lead4, c1), c2), land(c3, bnd4));
+  return lor(ascii, lor(seq2, lor(seq3, seq4)));
+}
+
 // Emit per-byte UTF-8 legality checks as ordinary ICmp events (glibc UTF-8
-// decoder): byte classes ASCII (<0x80), 2-byte lead [0xC2,0xDF], 3-byte lead
-// [0xE0,0xEF], 4-byte lead [0xF0,0xF4], and continuation [0x80,0xBF]. A
-// fully general sequence validator (lead-to-continuation matching) is a
-// variable-length decision and is tracked separately; this covers the
-// encoding-head/header legality constraints (first 32 bytes) with a fixed
-// event sequence per byte, so candidate streams stay position-stable.
+// decoder): the nine byte-class checks (ASCII <0x80, 2-byte lead [0xC2,0xDF],
+// 3-byte lead [0xE0,0xEF], 4-byte lead [0xF0,0xF4], continuation [0x80,0xBF])
+// plus one cross-byte sequence-validity event per position.  The fixed event
+// sequence per byte keeps candidate streams position-stable; the window
+// (first 32 bytes = encoding-head constraint) bounds the event volume.
 static void iconv_emit_utf8_checks(const char *p, size_t remaining) {
   const size_t limit = remaining < 32 ? remaining : 32;
   for (size_t i = 0; i < limit; ++i) {
@@ -4849,6 +4966,14 @@ static void iconv_emit_utf8_checks(const char *p, size_t remaining) {
       bool res = ck.pred == bvult ? (b < ck.rhs) : (b >= ck.rhs);
       if (ck.pred == bvule) res = (b <= ck.rhs);
       __taint_send_cond(lab, res, 0, 0, ck.cid, (void *)(p + i));
+    }
+    dfsan_label seq = iconv_utf8_seq_valid_label(
+        reinterpret_cast<const uint8_t *>(p), i, remaining);
+    if (seq != 0 && seq != kInitializingLabel) {
+      __taint_send_cond(seq, iconv_utf8_seq_valid(
+                                 reinterpret_cast<const uint8_t *>(p), i,
+                                 remaining),
+                        0, 0, kIconvUtf8SeqValidCid, (void *)(p + i));
     }
   }
 }
@@ -4898,6 +5023,21 @@ size_t __dfsw_iconv(iconv_t cd, char **inbuf, size_t *inbytesleft,
     }
   }
   size_t ret = iconv(cd, inbuf, inbytesleft, outbuf, outbytesleft);
+  // The call mutates *inbytesleft (remaining unconverted input) inside
+  // uninstrumented libc, so the DFSan shadow of the caller's local (e.g.
+  // xmlIconvWrapper's icv_inlen, copied before the call) stays stale: it
+  // still carries the pre-call length label while the runtime value is the
+  // actual remainder.  libxml2 then branches `icv_inlen != 0` (EILSEQ check,
+  // encoding.c:1923) with a label that evaluates to "input length != 0" for
+  // every non-empty input, mismatching the observed direction whenever the
+  // input was fully consumed.  The encoding-legality decision is already
+  // modeled by the per-unit events above, so the aggregate branch is a
+  // derived decision: zero the shadow of *inbytesleft so it stays unlabeled
+  // instead of storing a wrong predicate.  (The same stale-shadow pattern
+  // then makes the caller's `*inlen -= icv_inlen` keep the original label,
+  // and the subsequent xmlBufShrink length becomes x-x = 0, both consistent.)
+  if (inbytesleft != nullptr)
+    dfsan_set_label(0, inbytesleft, sizeof(size_t));
   // The return value stays unmodeled; the per-unit legality events above
   // carry the encoding-success/failure fork.
   *ret_label = 0;

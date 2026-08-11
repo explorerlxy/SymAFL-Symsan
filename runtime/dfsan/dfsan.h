@@ -505,6 +505,12 @@ static constexpr uint32_t kFgetsConstraintCid = 4;    // fgets/fgets_unlocked
 static constexpr uint32_t kIconvUcs4RangeCid = 5;     // cp < 0x80000000
 static constexpr uint32_t kIconvSurrogateLoCid = 6;   // cp >= 0xD800
 static constexpr uint32_t kIconvSurrogateHiCid = 7;   // cp <= 0xDFFF
+// UTF-8 per-position sequence-validity event (glibc decoder): the byte at
+// this position starts a complete valid sequence (ASCII, or a lead followed
+// by the right number of in-range continuation bytes with overlong/surrogate
+// boundaries respected, or a truncated sequence that fails). Emitted once
+// per byte after the nine class checks; stream position distinguishes bytes.
+static constexpr uint32_t kIconvUtf8SeqValidCid = 17;
 
 enum undefined_check_ids {
   ub_integer_overflow = 1,
