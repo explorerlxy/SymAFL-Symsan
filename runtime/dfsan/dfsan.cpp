@@ -1912,8 +1912,12 @@ static void InitializeTaintFile() {
   } else {
     if (!realpath(filename, tainted.filename)) {
       if (flags().taint_max_len == 0) {
-        Report("WARNING: failed to get to real path for taint file\n");
-        return;
+        Report("FATAL: taint_file specified but file does not exist and taint_max_len not set\n");
+        Report("  taint_file: %s\n", filename);
+        Report("  For SymAFL v2 forkserver mode, taint_max_len is MANDATORY when the\n");
+        Report("  input file does not exist at init time (AFL++ creates .cur_input after\n");
+        Report("  forkserver starts). Set TAINT_OPTIONS=taint_max_len=65536 or larger.\n");
+        Die();
       }
       // SymAFL v2 (forkserver mode): afl-fuzz creates the input file
       // (.cur_input) after the forkserver has started, so the file does not
@@ -1934,8 +1938,12 @@ static void InitializeTaintFile() {
       }
       char rdir[PATH_MAX];
       if (!realpath(dir, rdir)) {
-        Report("WARNING: failed to get to real path for taint file\n");
-        return;
+        Report("FATAL: cannot resolve parent directory for taint_file\n");
+        Report("  taint_file: %s\n", filename);
+        Report("  parent dir: %s\n", dir);
+        Report("  Ensure the AFL++ output directory exists before starting the target.\n");
+        Report("  This is a configuration error, not a SymSan bug.\n");
+        Die();
       }
       internal_snprintf(tainted.filename, sizeof(tainted.filename),
                         "%s/%s", rdir, base);
@@ -1966,9 +1974,25 @@ static void InitializeTaintFile() {
     off_t prealloc = tainted.size;
     if ((off_t)flags().taint_max_len > prealloc)
       prealloc = (off_t)flags().taint_max_len;
+    if (prealloc <= 0) {
+      Report("FATAL: taint enabled but preallocation size is %ld\n", (long)prealloc);
+      Report("  tainted.size: %ld, taint_max_len: %ld\n",
+             (long)tainted.size, (long)flags().taint_max_len);
+      Report("  This indicates taint registration failed silently.\n");
+      Die();
+    }
     for (off_t i = 0; i < prealloc; i++) {
       dfsan_label label = dfsan_create_label(0, i, 1);
       dfsan_check_label(label);
+    }
+    // Verify that preallocation actually worked (at least one label created).
+    if (prealloc > 0) {
+      dfsan_label verify = dfsan_create_label(0, 0, 1);
+      if (verify == 0) {
+        Report("FATAL: label preallocation verification failed\n");
+        Report("  Created %ld labels but cannot retrieve label for offset 0\n", (long)prealloc);
+        Die();
+      }
     }
   }
 }
