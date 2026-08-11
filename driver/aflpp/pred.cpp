@@ -1664,6 +1664,42 @@ Predicate RunConverter::conv(uint32_t label) {
   std::sort(pred.reads.begin(), pred.reads.end());
   pred.reads.erase(std::unique(pred.reads.begin(), pred.reads.end()),
                    pred.reads.end());
+
+  // Fail-closed check for input-free predicates:
+  // If a predicate has no Read leaves and no Len/Count family leaves,
+  // it is pure constant logic (or polluted label). Marking it opaque ensures
+  // it is conservatively admitted (admit_opaque) rather than being evaluated
+  // as a constant decision node that creates false terminal vetoes and replay conflicts.
+  if (pred.reads.empty()) {
+    bool has_len = false;
+    std::vector<uint32_t> check_st = {pred.root};
+    std::unordered_set<uint32_t> check_seen;
+    while (!check_st.empty()) {
+      uint32_t idx = check_st.back();
+      check_st.pop_back();
+      if (!check_seen.insert(idx).second) continue;
+      const PNode &nd = arena_->nodes[idx];
+      switch (nd.kind) {
+        case PKind::Len:
+        case PKind::EofRead:
+        case PKind::Count:
+        case PKind::CountNeg1:
+        case PKind::CountElems:
+          has_len = true;
+          break;
+        default:
+          break;
+      }
+      if (has_len) break;
+      if (nd.a != kNoChild) check_st.push_back(nd.a);
+      if (nd.b != kNoChild) check_st.push_back(nd.b);
+    }
+    if (!has_len) {
+      pred.opaque = true;
+      pred.error = PredError::UnsupportedOp;
+    }
+  }
+
   return pred;
 }
 
