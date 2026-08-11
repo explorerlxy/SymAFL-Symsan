@@ -300,11 +300,13 @@ static inline void taint_report_read_constraint(dfsan_label count_label,
 }
 
 // The scalar PCBT converter lowers fstrcmp/fstrcasecmp exactly only when the
-// wrappers can capture every compared byte (bounded to 32 bytes per side) or
-// the string shadow already covers the whole window. A longer or unreadable
-// comparison must not create an opaque label: the wrapper returns a clean
-// label so the branch is conservatively unmodeled (no constraint is invented)
-// instead of stopping the run at the opaque hard gate.
+// wrappers can capture every compared byte (bounded to 32 bytes per side) OR
+// the string shadow already covers the whole window. A longer or uncapturable
+// comparison emits the event with incomplete capture fields (zeroed); the
+// converter marks it as opaque and admits the candidate conservatively.
+// The wrapper MUST NOT suppress the event (ret_label=0) - that would make
+// opaque=0 a lie and hide decision events from the SEDBT tree, causing
+// terminal-veto-but-gain when later candidates carry the missing decision.
 static inline bool fstrcmp_capturable(size_t n, const void *s1, const void *s2) {
   return n > 0 && n <= 32 && s1 != nullptr && s2 != nullptr &&
          IsAccessibleMemoryRange((uptr)s1, n) &&
@@ -650,13 +652,12 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
   bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
 
   uint16_t op = (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp : __dfsan::fmemcmp;
-  if (op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) {
-    *ret_label = 0;
-    return ret;
-  }
-  dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
+  // Emit the event even when capture is incomplete (bcmp - same as memcmp).
+  uint64_t op1_capture = (op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s1;
+  uint64_t op2_capture = (op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s2;
+  dfsan_label cmp = dfsan_union(l1, l2, op, n, op1_capture, op2_capture);
   if (cmp) __taint_trace_memcmp(cmp);
-    *ret_label = cmp;
+  *ret_label = cmp;
   return ret;
 }
 
@@ -687,13 +688,12 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   bool l2_is_string_op = (l2 >= CONST_OFFSET && is_string_op(dfsan_get_label_info(l2)->op));
 
   uint16_t op = (l1_is_string_op || l2_is_string_op) ? __dfsan::fstrcmp : __dfsan::fmemcmp;
-  if (op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) {
-    *ret_label = 0;
-    return ret;
-  }
-  dfsan_label cmp = dfsan_union(l1, l2, op, n, (uint64_t)s1, (uint64_t)s2);
+  // Emit the event even when capture is incomplete (see memcmp above).
+  uint64_t op1_capture = (op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s1;
+  uint64_t op2_capture = (op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s2;
+  dfsan_label cmp = dfsan_union(l1, l2, op, n, op1_capture, op2_capture);
   if (cmp) __taint_trace_memcmp(cmp);
-    *ret_label = cmp;
+  *ret_label = cmp;
   return ret;
 }
 
@@ -730,14 +730,12 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
     // exactly solvable by the PCBT interpreter; larger ones stay on the Z3
     // string-theory op (opaque to the scalar interpreter, admitted).
     uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcmp;
-    if (cmp_op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) {
-      *ret_label = 0;
-    } else {
-      dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
-                                     (uint64_t)s1, (uint64_t)s2);
-      if (cmp) __taint_trace_memcmp(cmp);
-      *ret_label = cmp;
-    }
+    // Emit event even when uncapturable - converter will mark opaque.
+    uint64_t op1_capture = (cmp_op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s1;
+    uint64_t op2_capture = (cmp_op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s2;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n, op1_capture, op2_capture);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
   }
   return ret;
 }
@@ -894,14 +892,12 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
     // exactly solvable by the PCBT interpreter; larger ones stay on the Z3
     // string-theory op (opaque to the scalar interpreter, admitted).
     uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcasecmp;
-    if (cmp_op == __dfsan::fstrcasecmp && !fstrcmp_capturable(n, s1, s2)) {
-      *ret_label = 0;
-    } else {
-      dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
-                                     (uint64_t)s1, (uint64_t)s2);
-      if (cmp) __taint_trace_memcmp(cmp);
-      *ret_label = cmp;
-    }
+    // Emit event even when uncapturable - converter will mark opaque (strcasecmp).
+    uint64_t op1_capture = (cmp_op == __dfsan::fstrcasecmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s1;
+    uint64_t op2_capture = (cmp_op == __dfsan::fstrcasecmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s2;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n, op1_capture, op2_capture);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
   }
   return ret;
 }
@@ -942,14 +938,12 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strncmp(const char *s1, const char *s2,
 
     // Small comparisons fit the scalar fmemcmp byte-capture grammar.
     uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcmp;
-    if (cmp_op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) {
-      *ret_label = 0;
-    } else {
-      dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
-                                     (uint64_t)s1, (uint64_t)s2);
-      if (cmp) __taint_trace_memcmp(cmp);
-      *ret_label = cmp;
-    }
+    // Emit event even when uncapturable - converter will mark opaque.
+    uint64_t op1_capture = (cmp_op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s1;
+    uint64_t op2_capture = (cmp_op == __dfsan::fstrcmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s2;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n, op1_capture, op2_capture);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
   }
   return ret;
 }
