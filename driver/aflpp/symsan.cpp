@@ -163,6 +163,7 @@ struct my_mutator_t {
   uint64_t replay_direction_mismatch = 0;
   uint64_t replay_after_terminal = 0;
   uint64_t replay_truncated = 0;
+  uint64_t replay_timeout_skipped = 0;
   uint64_t replay_frontier_match = 0;
   uint64_t replay_terminal_match = 0;
 
@@ -599,6 +600,11 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->tree.set_debug(true);
     fprintf(stderr, "[pcbt] predicate debug enabled (SYMAFL_PCBT_DEBUG=1)\n");
   }
+  if (getenv("SYMAFL_CONFLICT_DIAG")) {
+    data->tree.set_conflict_diag(true);
+    fprintf(stderr, "[pcbt] conflict-site diagnostics enabled "
+            "(SYMAFL_CONFLICT_DIAG=1)\n");
+  }
   if (const char *rl = getenv("SYMAFL_RCNT_LIMIT")) {
     char *end = nullptr;
     unsigned long parsed = strtoul(rl, &end, 10);
@@ -629,7 +635,12 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     fprintf(stderr, "[pcbt] veto probe enabled: execute every %lluth "
             "vetoed candidate to measure incorrect-veto rate\n",
             (unsigned long long)parsed);
-
+  }
+  // Probe-case persistence is needed for sampled veto probes (above) and for
+  // replay-all veto forensics (every vetoed candidate is executed and
+  // replayed; its input is saved so truncated/empty-stream cases can be
+  // replayed outside AFL and compared with the in-run capture).
+  if (data->veto_probe_every || data->replay_all) {
     const char *probe_dir = getenv("SYMAFL_PROBE_CASE_DIR");
     data->probe_case_dir = probe_dir && *probe_dir
         ? (char *)ck_strdup((u8 *)probe_dir)
@@ -829,14 +840,15 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   fprintf(stderr,
           "[pcbt-replay] checked=%llu cid_mismatch=%llu dir_mismatch=%llu "
           "after_terminal=%llu truncated=%llu frontier_match=%llu "
-          "terminal_match=%llu\n",
+          "terminal_match=%llu timeout_skipped=%llu\n",
           (unsigned long long)data->replay_checked,
           (unsigned long long)data->replay_cid_mismatch,
           (unsigned long long)data->replay_direction_mismatch,
           (unsigned long long)data->replay_after_terminal,
           (unsigned long long)data->replay_truncated,
           (unsigned long long)data->replay_frontier_match,
-          (unsigned long long)data->replay_terminal_match);
+          (unsigned long long)data->replay_terminal_match,
+          (unsigned long long)data->replay_timeout_skipped);
   fprintf(stderr,
           "[pcbt-opaque] invalid_root=%llu invalid_label=%llu initializing_label=%llu "
           "invalid_width=%llu depth_limit=%llu bad_load=%llu bad_concat=%llu "
@@ -1116,6 +1128,17 @@ static bool replay_check_trace(my_mutator_t *data,
                                const u8 *buf, size_t buf_size,
                                const char *fname, bool is_suffix) {
   if (!data->replay_check) return true;
+  // A timed-out target execution was SIGKILLed by AFL (last_run_timed_out +
+  // last_kill_signal==SIGKILL); its trace is incomplete by construction, not
+  // because the tree disagrees with it. Replaying it would fabricate
+  // truncated/conflict signals and mark nodes unstable for an execution that
+  // was interrupted, not divergent. Count it separately and skip: timeout
+  // handling is a performance/robustness concern, not a decision-omission
+  // signal.
+  if (data->afl->fsrv.last_run_timed_out) {
+    data->replay_timeout_skipped += 1;
+    return true;
+  }
   // post_run already replayed this run's full stream (SYMAFL_REPLAY_ALL);
   // queue_new_entry's insert must not count it a second time.
   if (data->replay_run_done) {
@@ -1139,7 +1162,11 @@ static bool replay_check_trace(my_mutator_t *data,
   }
   // Replay-validation mismatches are trace conflicts too: count them in the
   // tree's conflict census so the `conflicts` metric does not hide replay
-  // drift that marks nodes unstable (admit_unstable) behind a zero.
+  // drift that marks nodes unstable (admit_unstable) behind a zero. A
+  // TruncatedTrace is NOT benign: the candidate's stream ends in the middle
+  // of a tree path, so the candidate did not pass the tree's decision at
+  // that node - an entry/decision omission. Never widen the census to mask
+  // it.
   data->tree.num_conflicts += 1;
 
   // Log the mismatch. The trace is discarded so it never grows the tree with
@@ -1166,6 +1193,11 @@ static bool replay_check_trace(my_mutator_t *data,
     default: break;
   }
   if (report.mismatch_node != pcbt::kUnexplored) {
+    // A truncated trace (stream ends mid-path) is a structural disagreement
+    // like any other: the tree claims a decision here that the candidate's
+    // stream does not contain. Marking the node unstable is the exposure
+    // mechanism - the divergence must be diagnosed and the tree made
+    // correct, never hidden by widening the acceptance criteria.
     data->tree.mark_unstable(report.mismatch_node);
   }
   WARNF("[pcbt-replay] %s mismatch %s at event=%zu verified=%zu "
@@ -1174,6 +1206,35 @@ static bool replay_check_trace(my_mutator_t *data,
         report.expected_cid, report.observed_cid,
         report.evaluated_dir, report.observed_dir,
         is_suffix ? "suffix" : "full");
+  if (data->tree.conflict_diag() &&
+      report.error == pcbt::Tree::ReplayError::TruncatedTrace && buf &&
+      buf_size > 0) {
+    // Truncated-trace forensics: the candidate's stream ended mid-tree-path.
+    // Print the input head so the entry/decision gap can be diagnosed
+    // (empty/short inputs often skip the fread length constraint or an
+    // entry fork the tree assumes every candidate passes).
+    size_t shown = buf_size < 64 ? buf_size : 64;
+    fprintf(stderr,
+            "[pcbt-replay] truncated input len=%zu events=%zu "
+            "verified=%zu pipe_bytes=%zu kill_sig=%u timeout=%u hex=",
+            buf_size, events.size(), report.verified_events,
+            data->afl->fsrv.sym_trace_len,
+            data->afl->fsrv.last_kill_signal,
+            data->afl->fsrv.last_run_timed_out);
+    for (size_t k = 0; k < shown; ++k)
+      fprintf(stderr, "%02x", buf[k]);
+    fprintf(stderr, "%s\n", shown < buf_size ? " TRUNC" : "");
+    if (report.mismatch_node != pcbt::kUnexplored) {
+      fprintf(stderr,
+              "[pcbt-replay] truncated at tree node=%u cid=%u depth=%u "
+              "constraint=%d len_related=%d\n",
+              report.mismatch_node,
+              data->tree.cid_of(report.mismatch_node),
+              data->tree.depth(report.mismatch_node),
+              data->tree.is_constraint(report.mismatch_node) ? 1 : 0,
+              data->tree.is_len_related(report.mismatch_node) ? 1 : 0);
+    }
+  }
   if (data->tree.debug() && report.event_index < events.size()) {
     // The mismatching event's label structure in the current run's union
     // table, plus the input bytes the stored predicate reads (DebugPredicate
@@ -1685,6 +1746,16 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
     if (data->replay_all && probe_mode == SYMAFL_TRACE_FULL_STREAM) {
       std::vector<u8> buf;
       if (read_cur_input(data, &buf)) {
+        if (data->tree.conflict_diag()) {
+          size_t fshown = buf.size() < 16 ? buf.size() : 16;
+          fprintf(stderr,
+                  "[pcbt-replay] veto forensics cur_input_len=%zu "
+                  "pipe_bytes=%zu hex=",
+                  buf.size(), data->afl->fsrv.sym_trace_len);
+          for (size_t k = 0; k < fshown; ++k)
+            fprintf(stderr, "%02x", buf[k]);
+          fprintf(stderr, "\n");
+        }
         std::vector<pcbt::Event> events;
         if (decode_pipe_events(data, &events, "replay-all-veto")) {
           (void)replay_check_trace(data, events, buf.data(), buf.size(),
@@ -1775,6 +1846,24 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
         if (read_cur_input(data, &buf)) {
           std::vector<pcbt::Event> events;
           if (decode_pipe_events(data, &events, "replay-all")) {
+            if (data->tree.conflict_diag()) {
+              // skipCnt hypothesis: if the tree's suffix start position
+              // (skip_for) exceeds the candidate's actual event count, a
+              // steady-state suffix capture would be empty and the empty
+              // suffix would close a (possibly fake) terminal. Print the
+              // comparison for every admitted run while diagnosing.
+              uint32_t skip_for =
+                  data->last_node != pcbt::kUnexplored
+                      ? data->tree.skip_for(data->last_node, data->last_dir)
+                      : 0;
+              uint64_t ev_total = 0;
+              for (const pcbt::Event &ev : events) ev_total += ev.count;
+              fprintf(stderr,
+                      "[pcbt-replay] admit skipcnt node=%u dir=%u "
+                      "skip_for=%u events=%zu expanded=%llu\n",
+                      data->last_node, data->last_dir, skip_for,
+                      events.size(), (unsigned long long)ev_total);
+            }
             (void)replay_check_trace(data, events, buf.data(), buf.size(),
                                      "replay-all", false);
             data->replay_run_done = true;
@@ -2208,6 +2297,20 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     if (data->replay_all) {
       // Full-stream capture for the vetoed candidate's complete replay.
       arm_full_capture(data);
+      // Replay-all diagnostic: persist every vetoed probe input so the
+      // truncated/empty-stream cases can be replayed outside AFL and
+      // compared with the in-run capture.
+      if (data->probe_case_dir) {
+        char *veto_path = alloc_printf("%s/veto-%llu.bin",
+                                       data->probe_case_dir,
+                                       (unsigned long long)data->vetoed);
+        FILE *vf = fopen(veto_path, "wb");
+        if (vf) {
+          fwrite(buf, 1, buf_size, vf);
+          fclose(vf);
+        }
+        ck_free(veto_path);
+      }
       // Probe capture is not an admitted candidate: do not let the normal
       // post_run retry bookkeeping treat it as last_node/last_dir.
       data->last_node = pcbt::kUnexplored;

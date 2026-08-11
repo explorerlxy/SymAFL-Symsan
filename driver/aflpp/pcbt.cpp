@@ -213,6 +213,11 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     const Node &cn = node(cur);
     if (cn.unstable) {
       num_conflicts += 1;
+      if (diag_conflicts_)
+        fprintf(stderr,
+                "[pcbt-conflict] walk hit already-unstable node=%u cid=%u "
+                "depth=%u ev_cid=%u\n",
+                cur, cn.cid, cn.depth, ev.cid);
       return 0;
     }
     uint64_t v = 0;
@@ -228,6 +233,12 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
         (!cn.constraint && evaluated && edir != (ev.result ? 1 : 0))) {
       node(cur).unstable = true;
       num_conflicts += 1;
+      if (diag_conflicts_)
+        fprintf(stderr,
+                "[pcbt-conflict] InsertTrace marks node=%u cid=%u depth=%u "
+                "unstable (ev_cid=%u ev_res=%u eval_dir=%u)\n",
+                cur, cn.cid, cn.depth, ev.cid, ev.result,
+                evaluated ? (v ? 1 : 0) : 255);
       return 0;
     }
     trace_depth += 1;
@@ -260,6 +271,11 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     if (parent >= kRoot && parent < nodes_.size())
       node(parent).unstable = true;
     num_conflicts += 1;
+    if (diag_conflicts_)
+      fprintf(stderr,
+              "[pcbt-conflict] InsertTrace prefix-drift marks parent=%u "
+              "cid=%u depth=%u unstable (remaining events start at i=%zu)\n",
+              parent, node(parent).cid, node(parent).depth, i);
     return 0;
   }
 

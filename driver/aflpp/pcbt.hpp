@@ -172,6 +172,9 @@ class Tree {
   bool is_constraint(NodeRef ref) const {
     return ref >= kRoot && ref < nodes_.size() ? node(ref).constraint : false;
   }
+  bool is_len_related(NodeRef ref) const {
+    return ref >= kRoot && ref < nodes_.size() ? node(ref).len_related : false;
+  }
   bool is_unstable(NodeRef ref) const {
     return ref >= kRoot && ref < nodes_.size() ? node(ref).unstable : false;
   }
@@ -207,6 +210,10 @@ class Tree {
   // closure, never by retry budgets).
   void set_rlimit_unlimited(bool enabled) { rlimit_unlimited_ = enabled; }
   bool rlimit_unlimited() const { return rlimit_unlimited_; }
+  // Conflict-site diagnostics (SYMAFL_CONFLICT_DIAG): log every InsertTrace
+  // unstable mark / prefix-drift / already-unstable hit with node cid+depth.
+  void set_conflict_diag(bool enabled) { diag_conflicts_ = enabled; }
+  bool conflict_diag() const { return diag_conflicts_; }
   void DebugPredicate(NodeRef ref, const uint8_t *input, uint32_t len) const;
 
   // stats
@@ -247,6 +254,7 @@ class Tree {
   bool debug_ = false;
   bool profile_ = false;
   bool rlimit_unlimited_ = false;
+  bool diag_conflicts_ = false;
   // Persistent eval context for CheckInput: the values_/stamps_ vectors are
   // keyed by arena index, so they must only grow (the arena is append-only
   // between checks); a fresh context per check zero-fills up to the arena

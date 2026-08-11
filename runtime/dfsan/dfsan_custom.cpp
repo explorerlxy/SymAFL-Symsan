@@ -3556,6 +3556,21 @@ __dfsw_fread(void *ptr, size_t size, size_t nmemb, FILE *stream,
   size_t ret = fread(ptr, size, nmemb, stream);
   AOUT("fread(%lu,%lu) = %ld, off = %ld\n", size, nmemb, ret, offset);
   if (ret) {
+    if (tfsize == 0 && fd == 0) {
+      // Replay-all forensics: a candidate whose stdin read produced no
+      // tainted bytes has zero symbolic events. Log the taint-file state the
+      // first few times this happens so the root cause (fd registration,
+      // force_stdin, size) can be pinned down.
+      static int diag_fread_tfsize0 = 0;
+      if (diag_fread_tfsize0 < 5) {
+        diag_fread_tfsize0++;
+        Printf("[RT-DIAG] fread fd=%d tainted.fd=%d force_stdin=%d "
+               "size=%lld max_len=%llu ret=%zu\n",
+               fd, tainted.fd, flags().force_stdin ? 1 : 0,
+               (long long)tainted.size,
+               (unsigned long long)flags().taint_max_len, ret);
+      }
+    }
     if (tfsize) {
       for (size_t i = 0; i < ret * size; i++) {
         dfsan_set_label(get_label_for(fd, offset + i), (char *)ptr + i, 1);
