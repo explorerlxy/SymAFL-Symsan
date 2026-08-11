@@ -426,8 +426,27 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
         diagnostics_banner_printed = true;
       }
 
-      if (!pred.opaque && pred.reads.empty()) {
+      if (!pred.opaque && pred.reads.empty() && !pred_has_len_kind(pred_arena_, pred)) {
         empty_reads_seen++;
+        static FILE *poll_file = nullptr;
+        static bool poll_file_checked = false;
+        if (!poll_file_checked) {
+          const char *log_path = getenv("SYMAFL_POLLUTION_LOG");
+          if (!log_path) log_path = "/tmp/symafl_pollution.log";
+          poll_file = fopen(log_path, "a");
+          poll_file_checked = true;
+        }
+        if (poll_file && pollution_logged < 500) {
+          fprintf(poll_file, "[label-pollution] #%u cid=%u label=%u result=%u\n",
+                  pollution_logged, event.cid, event.label, event.result);
+          fprintf(poll_file, "  label_info: op=0x%x l1=%u l2=%u size=%u op1=%llu op2=%llu\n",
+                  table[event.label].op, table[event.label].l1, table[event.label].l2,
+                  table[event.label].size,
+                  (unsigned long long)table[event.label].op1.i,
+                  (unsigned long long)table[event.label].op2.i);
+          fflush(poll_file);
+          pollution_logged++;
+        }
         if (label_pollution_diagnostics && pollution_logged < 50) {
           fprintf(stderr, "[label-pollution] #%u cid=%u label=%u result=%u\n",
                   pollution_logged, event.cid, event.label, event.result);
