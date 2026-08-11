@@ -2136,7 +2136,15 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
                 ? mask_bits(a, bits) : mask_bits(b, bits);
         break;
       case PKind::Neg: v = mask_bits(0 - a, bits); break;
-      case PKind::Not: v = mask_bits(~a, bits); break;
+      case PKind::Not:
+        // Logical negation: Not is only ever built over 0/1 predicate values
+        // (runtime `0b1 ^ x` at size 1, and the FCmp lowering's nan/ord/eq
+        // pieces at FP width).  Bitwise ~ at 32/64 bits turns Not(1) into a
+        // nonzero mask (e.g. 0xFE), so `v ? 1 : 0` would always read TRUE
+        // (libtiff tif_dir.c:405 XRESOLUTION NaN check: eval_dir=1 vs
+        // obs_dir=0).  Negate the truthiness, not the bits.
+        v = mask_bits(a == 0 ? 1 : 0, bits);
+        break;
       case PKind::And: v = mask_bits(a & b, bits); break;
       case PKind::Or: v = mask_bits(a | b, bits); break;
       case PKind::Xor: v = mask_bits(a ^ b, bits); break;
