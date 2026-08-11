@@ -832,6 +832,19 @@ TransformedFunction Taint::getCustomFunctionType(FunctionType *T) {
 
 bool Taint::isZeroShadow(Value *V) {
   Type *T = V->getType();
+  if (isa<VectorType>(T)) {
+    // A fixed-length vector of zero labels is a zero shadow. Scalable
+    // vectors are not instrumented per-lane and fall through to false.
+    if (isa<ConstantAggregateZero>(V)) return true;
+    if (const ConstantVector *CV = dyn_cast<ConstantVector>(V)) {
+      for (unsigned i = 0, n = CV->getNumOperands(); i < n; ++i) {
+        const ConstantInt *CI = dyn_cast<ConstantInt>(CV->getOperand(i));
+        if (!CI || !CI->isZero()) return false;
+      }
+      return true;
+    }
+    return false;
+  }
   if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
     if (const ConstantInt *CI = dyn_cast<ConstantInt>(V))
       return CI->isZero();
@@ -842,6 +855,12 @@ bool Taint::isZeroShadow(Value *V) {
 }
 
 Constant *Taint::getUninitializedShadow(Type *OrigTy) {
+  if (VectorType *VT = dyn_cast<VectorType>(OrigTy)) {
+    if (VT->isScalableTy()) return UninitializedPrimitiveShadow;
+    SmallVector<Constant *, 4> Elements(
+        VT->getElementCount().getFixedValue(), UninitializedPrimitiveShadow);
+    return ConstantVector::get(Elements);
+  }
   if (!isa<ArrayType>(OrigTy) && !isa<StructType>(OrigTy))
     return UninitializedPrimitiveShadow;
   Type *ShadowTy = getShadowTy(OrigTy);
@@ -859,6 +878,12 @@ Constant *Taint::getUninitializedShadow(Type *OrigTy) {
 }
 
 Constant *Taint::getZeroShadow(Type *OrigTy) {
+  if (VectorType *VT = dyn_cast<VectorType>(OrigTy)) {
+    if (VT->isScalableTy()) return ZeroPrimitiveShadow;
+    SmallVector<Constant *, 4> Elements(
+        VT->getElementCount().getFixedValue(), ZeroPrimitiveShadow);
+    return ConstantVector::get(Elements);
+  }
   if (!isa<ArrayType>(OrigTy) && !isa<StructType>(OrigTy))
     return ZeroPrimitiveShadow;
   Type *ShadowTy = getShadowTy(OrigTy);
@@ -874,8 +899,13 @@ Type *Taint::getShadowTy(Type *OrigTy) {
     return PrimitiveShadowTy;
   if (isa<IntegerType>(OrigTy))
     return PrimitiveShadowTy;
-  if (isa<VectorType>(OrigTy))
-    return PrimitiveShadowTy;
+  if (VectorType *VT = dyn_cast<VectorType>(OrigTy)) {
+    // Fixed-length vectors keep one shadow per lane (per-lane SIMD
+    // modeling). Scalable vectors stay collapsed to one scalar shadow.
+    if (VT->isScalableTy()) return PrimitiveShadowTy;
+    return FixedVectorType::get(PrimitiveShadowTy,
+                                VT->getElementCount().getFixedValue());
+  }
   if (ArrayType *AT = dyn_cast<ArrayType>(OrigTy))
     return ArrayType::get(getShadowTy(AT->getElementType()),
                           AT->getNumElements());
@@ -2223,42 +2253,64 @@ Value *TaintFunction::combineShadows(Value *V1, Value *V2,
   }
   Value *Op = ConstantInt::get(TT.Int16Ty, op);
   Value *Size = ConstantInt::get(TT.Int16Ty, size);
-  Value *Op1 = Pos->getOperand(0);
-  Ty = Op1->getType();
-  // a vector value carries a single collapsed shadow; compare via element 0.
-  if (Ty->isVectorTy()) {
-    Ty = cast<VectorType>(Ty)->getElementType();
-    Op1 = IRB.CreateExtractElement(Op1, ConstantInt::get(TT.Int32Ty, 0));
-  }
-  // bitcast to integer before extending
-  if (Ty->isHalfTy())
-    Op1 = IRB.CreateBitCast(Op1, TT.Int16Ty);
-  else if (Ty->isFloatTy())
-    Op1 = IRB.CreateBitCast(Op1, TT.Int32Ty);
-  else if (Ty->isDoubleTy())
-    Op1 = IRB.CreateBitCast(Op1, TT.Int64Ty);
-  else if (Ty->isPointerTy())
-    Op1 = IRB.CreatePtrToInt(Op1, TT.Int64Ty);
-  Op1 = IRB.CreateZExtOrTrunc(Op1, TT.Int64Ty);
-  Value *Op2 = ConstantInt::get(TT.Int64Ty, 0);
-  if (Pos->getNumOperands() > 1) {
-    Op2 = Pos->getOperand(1);
-    Ty = Op2->getType();
-    if (Ty->isVectorTy()) {
-      Ty = cast<VectorType>(Ty)->getElementType();
-      Op2 = IRB.CreateExtractElement(Op2, ConstantInt::get(TT.Int32Ty, 0));
+
+  // Prepare one concrete operand at a given lane: extract the lane (or use
+  // the scalar directly) and widen/bitcast it to i64 for the union call.
+  auto prepare_operand = [&](Value *Operand, unsigned lane) -> Value * {
+    Type *OTy = Operand->getType();
+    if (OTy->isVectorTy()) {
+      OTy = cast<VectorType>(OTy)->getElementType();
+      Operand = IRB.CreateExtractElement(
+          Operand, ConstantInt::get(TT.Int32Ty, lane));
     }
-    // bitcast to integer before extending
-    if (Ty->isHalfTy())
-      Op2 = IRB.CreateBitCast(Op2, TT.Int16Ty);
-    else if (Ty->isFloatTy())
-      Op2 = IRB.CreateBitCast(Op2, TT.Int32Ty);
-    else if (Ty->isDoubleTy())
-      Op2 = IRB.CreateBitCast(Op2, TT.Int64Ty);
-    else if (Ty->isPointerTy())
-      Op2 = IRB.CreatePtrToInt(Op2, TT.Int64Ty);
-    Op2 = IRB.CreateZExtOrTrunc(Op2, TT.Int64Ty);
+    if (OTy->isHalfTy())
+      Operand = IRB.CreateBitCast(Operand, TT.Int16Ty);
+    else if (OTy->isFloatTy())
+      Operand = IRB.CreateBitCast(Operand, TT.Int32Ty);
+    else if (OTy->isDoubleTy())
+      Operand = IRB.CreateBitCast(Operand, TT.Int64Ty);
+    else if (OTy->isPointerTy())
+      Operand = IRB.CreatePtrToInt(Operand, TT.Int64Ty);
+    return IRB.CreateZExtOrTrunc(Operand, TT.Int64Ty);
+  };
+
+  // Per-lane SIMD modeling: a fixed-length vector op with per-lane shadow
+  // vectors emits one __taint_union per lane and re-assembles the shadow
+  // vector, so each lane keeps its exact label (openjpeg's SSE2 MCT decode:
+  // _mm_load_si128/_mm_store_si128 + lane arithmetic no longer collapse to
+  // one folded label). A scalar shadow splats to every lane.
+  if (IsVector && V1->getType()->isVectorTy()) {
+    if (FixedVectorType *FVT = dyn_cast<FixedVectorType>(V1->getType())) {
+      unsigned N = FVT->getNumElements();
+      Value *Result = UndefValue::get(V1->getType());
+      for (unsigned lane = 0; lane < N; ++lane) {
+        Value *L1 = IRB.CreateExtractElement(
+            V1, ConstantInt::get(TT.Int32Ty, lane));
+        Value *L2 = V2->getType()->isVectorTy()
+                        ? IRB.CreateExtractElement(
+                              V2, ConstantInt::get(TT.Int32Ty, lane))
+                        : V2;
+        Value *Op1L = prepare_operand(Pos->getOperand(0), lane);
+        Value *Op2L = Pos->getNumOperands() > 1
+                          ? prepare_operand(Pos->getOperand(1), lane)
+                          : ConstantInt::get(TT.Int64Ty, 0);
+        CallInst *Call =
+            IRB.CreateCall(TT.TaintUnionFn, {L1, L2, Op, Size, Op1L, Op2L});
+        Call->addRetAttr(Attribute::ZExt);
+        Call->addParamAttr(0, Attribute::ZExt);
+        Call->addParamAttr(1, Attribute::ZExt);
+        Result = IRB.CreateInsertElement(
+            Result, Call, ConstantInt::get(TT.Int32Ty, lane));
+      }
+      return Result;
+    }
+    // Scalable vector shadow: fall through to the collapsed scalar path.
   }
+
+  Value *Op1 = prepare_operand(Pos->getOperand(0), 0);
+  Value *Op2 = ConstantInt::get(TT.Int64Ty, 0);
+  if (Pos->getNumOperands() > 1)
+    Op2 = prepare_operand(Pos->getOperand(1), 0);
   CallInst *Call = IRB.CreateCall(TT.TaintUnionFn, {V1, V2, Op, Size, Op1, Op2});
   Call->addRetAttr(Attribute::ZExt);
   Call->addParamAttr(0, Attribute::ZExt);
@@ -2278,6 +2330,10 @@ Value *TaintFunction::combineCastInstShadows(CastInst *CI,
     // of the operand.
     return TT.ZeroPrimitiveShadow;
   } else {
+    // Integer/FP casts (trunc/zext/sext/fptrunc/fpext/...) do not change the
+    // label dependency set of any lane, so a per-lane vector shadow passes
+    // through unchanged (these casts keep the element count).
+    if (Shadow1->getType()->isVectorTy()) return Shadow1;
     return combineShadows(Shadow1, Shadow2, op, CI);
   }
 }
@@ -3286,6 +3342,28 @@ Value *TaintFunction::loadShadowRecursive(
     Value *Addr, uint64_t Size, uint64_t Align, IRBuilder<> &IRB) {
   auto &DL = F->getParent()->getDataLayout();
 
+  if (VectorType *VT = dyn_cast<VectorType>(SubTy)) {
+    // Per-lane SIMD load: each fixed-length lane loads its own shadow from
+    // the lane's byte range (one union per lane) instead of collapsing the
+    // whole vector into a single label. Scalable vectors fall back to the
+    // collapsed scalar load below.
+    if (!VT->isScalableTy()) {
+      Type *ElemTy = VT->getElementType();
+      uint64_t ElemSize = DL.getTypeStoreSize(ElemTy);
+      for (unsigned Idx = 0, N = VT->getElementCount().getFixedValue();
+           Idx < N; ++Idx) {
+        Indices.push_back(Idx);
+        uint64_t Offset = ElemSize * Idx;
+        assert(Offset <= Size);
+        Value *SubAddr = IRB.CreateConstGEP2_32(VT, Addr, 0, Idx);
+        Shadow = loadShadowRecursive(Shadow, Indices, ElemTy, SubAddr,
+                                     Size - Offset, Align, IRB);
+        Indices.pop_back();
+      }
+      return Shadow;
+    }
+  }
+
   if (!isa<ArrayType>(SubTy) && !isa<StructType>(SubTy)) {
     uint64_t SubSize = DL.getTypeStoreSize(SubTy);
     assert(Size >= SubSize);
@@ -3293,6 +3371,13 @@ Value *TaintFunction::loadShadowRecursive(
     Align = std::min(Align, (uint64_t)(DL).getABITypeAlign(SubTy).value());
     // load a primitive shadow from address
     Value *PrimitiveShadow = loadPrimitiveShadow(Addr, SubSize, SubSizeInBits, Align, IRB);
+    // A per-lane vector shadow is indexed with InsertElement (Indices holds
+    // the lane); an aggregate shadow uses InsertValue.
+    if (Shadow->getType()->isVectorTy()) {
+      assert(Indices.size() == 1);
+      return IRB.CreateInsertElement(
+          Shadow, PrimitiveShadow, ConstantInt::get(TT.Int32Ty, Indices[0]));
+    }
     // then insert the primitive shadow into the sub-field
     return IRB.CreateInsertValue(Shadow, PrimitiveShadow, Indices);
   }
@@ -3366,8 +3451,9 @@ Value *TaintFunction::loadShadow(Type *T, Value *Addr, uint64_t Size,
   const uint64_t ShadowAlign = getShadowAlign(Alignment).value();
   auto &DL = F->getParent()->getDataLayout();
 
-  // now check if we're loading an aggragate object
-  if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
+  // now check if we're loading an aggragate object (fixed-length vectors
+  // are loaded per lane by loadShadowRecursive)
+  if (!isa<ArrayType>(T) && !isa<StructType>(T) && !isa<VectorType>(T)) {
     uint64_t SizeInBits = DL.getTypeSizeInBits(T);
     return loadPrimitiveShadow(Addr, Size, SizeInBits, ShadowAlign, IRB);
   }
@@ -3592,12 +3678,42 @@ void TaintFunction::storeShadowRecursive(
     Value *Addr, uint64_t Size, uint64_t Align, IRBuilder<> &IRB) {
   auto &DL = F->getParent()->getDataLayout();
 
+  if (VectorType *VT = dyn_cast<VectorType>(SubShadowTy)) {
+    // Per-lane SIMD store: store each fixed-length lane's shadow into the
+    // lane's byte range (TaintUnionStore per lane) instead of decomposing
+    // one collapsed label over the whole vector. Scalable vectors fall back
+    // to the collapsed scalar store below.
+    if (!VT->isScalableTy()) {
+      Type *ElemTy = VT->getElementType();
+      uint64_t ElemSize = DL.getTypeStoreSize(ElemTy);
+      for (unsigned Idx = 0, N = VT->getElementCount().getFixedValue();
+           Idx < N; ++Idx) {
+        Indices.push_back(Idx);
+        uint64_t Offset = ElemSize * Idx;
+        assert(Offset <= Size);
+        Value *SubAddr = IRB.CreateConstGEP2_32(VT, Addr, 0, Idx);
+        storeShadowRecursive(Shadow, Indices, ElemTy, SubAddr,
+                             Size - Offset, Align, IRB);
+        Indices.pop_back();
+      }
+      return;
+    }
+  }
+
   if (!isa<ArrayType>(SubShadowTy) && !isa<StructType>(SubShadowTy)) {
     uint64_t SubSize = DL.getTypeStoreSize(SubShadowTy);
     assert(Size >= SubSize);
     Align = std::min(Align, (uint64_t)(DL).getABITypeAlign(SubShadowTy).value());
-    // load a primitive shadow from the sub-field
-    Value *PrimitiveShadow = IRB.CreateExtractValue(Shadow, Indices);
+    // A per-lane vector shadow is indexed with ExtractElement (Indices holds
+    // the lane); an aggregate shadow uses ExtractValue.
+    Value *PrimitiveShadow;
+    if (Shadow->getType()->isVectorTy()) {
+      assert(Indices.size() == 1);
+      PrimitiveShadow = IRB.CreateExtractElement(
+          Shadow, ConstantInt::get(TT.Int32Ty, Indices[0]));
+    } else {
+      PrimitiveShadow = IRB.CreateExtractValue(Shadow, Indices);
+    }
     // then store the primitive shadow into the shadow address
     Value *ShadowAddr = TT.getShadowAddress(Addr, IRB);
     IRB.CreateCall(TT.TaintUnionStoreFn,
@@ -3670,8 +3786,9 @@ void TaintFunction::storeShadow(Value *Addr, Type *T, uint64_t Size,
     return;
   }
 
-  // now check if we're storing an aggragate shadow object
-  if (!isa<ArrayType>(T) && !isa<StructType>(T)) {
+  // now check if we're storing an aggragate shadow object (fixed-length
+  // vectors are stored per lane by storeShadowRecursive)
+  if (!isa<ArrayType>(T) && !isa<StructType>(T) && !isa<VectorType>(T)) {
     IRB.CreateCall(TT.TaintUnionStoreFn,
                    {Shadow, ShadowAddr, ConstantInt::get(TT.IntptrTy, Size),
                     ConstantInt::get(TT.IntptrTy, ShadowAlign.value())});
@@ -3967,21 +4084,44 @@ void TaintVisitor::visitGetElementPtrInst(GetElementPtrInst &GEPI) {
 }
 
 void TaintVisitor::visitExtractElementInst(ExtractElementInst &I) {
-  // extractelement feeds the branch: propagate the vector's collapsed label.
-  TF.setShadow(&I, TF.getShadow(I.getVectorOperand()));
+  // Per-lane SIMD modeling: extract the requested lane's shadow. A scalar
+  // (legacy collapsed) vector shadow still propagates unchanged.
+  Value *VecShadow = TF.getShadow(I.getVectorOperand());
+  if (VecShadow->getType()->isVectorTy()) {
+    IRBuilder<> IRB(&I);
+    TF.setShadow(&I,
+                 IRB.CreateExtractElement(VecShadow, I.getIndexOperand()));
+  } else {
+    TF.setShadow(&I, VecShadow);
+  }
 }
 
 void TaintVisitor::visitInsertElementInst(InsertElementInst &I) {
   Value *VecShadow = TF.getShadow(I.getOperand(0));
   Value *ElemShadow = TF.getShadow(I.getOperand(1));
-  TF.setShadow(&I, TF.combineShadows(VecShadow, ElemShadow,
-                                     Instruction::Or, &I));
+  if (VecShadow->getType()->isVectorTy()) {
+    // Insert this lane's shadow into the per-lane vector shadow.
+    IRBuilder<> IRB(&I);
+    TF.setShadow(&I, IRB.CreateInsertElement(VecShadow, ElemShadow,
+                                             I.getOperand(2)));
+  } else {
+    // Legacy collapsed shadow: OR the element label into the folded label.
+    TF.setShadow(&I, TF.combineShadows(VecShadow, ElemShadow,
+                                       Instruction::Or, &I));
+  }
 }
 
 void TaintVisitor::visitShuffleVectorInst(ShuffleVectorInst &I) {
   Value *A = TF.getShadow(I.getOperand(0));
   Value *B = TF.getShadow(I.getOperand(1));
-  TF.setShadow(&I, TF.combineShadows(A, B, Instruction::Or, &I));
+  if (A->getType()->isVectorTy()) {
+    // Per-lane shuffle: the shadow vectors shuffle with the same mask.
+    IRBuilder<> IRB(&I);
+    TF.setShadow(&I, IRB.CreateShuffleVector(A, B, I.getShuffleMask()));
+  } else {
+    // Legacy collapsed shadow: OR both folded labels.
+    TF.setShadow(&I, TF.combineShadows(A, B, Instruction::Or, &I));
+  }
 }
 
 void TaintVisitor::visitExtractValueInst(ExtractValueInst &I) {
@@ -4113,9 +4253,35 @@ void TaintVisitor::visitSelectInst(SelectInst &I) {
   Value *FalseShadow = TF.getShadow(I.getFalseValue());
 
   if (isa<VectorType>(Condition->getType())) {
-    //FIXME:
-    errs() << "WARNING: vector condition in Select" << I << "\n";
-    TF.setShadow(&I, TF.TT.ZeroPrimitiveShadow);
+    // Per-lane vector select: shadow[lane] = cond[lane] ? true[lane] :
+    // false[lane]. The shadow vectors are <N x i32>; splat a scalar shadow
+    // operand if one side is scalar.
+    IRBuilder<> IRB(&I);
+    if (!TrueShadow->getType()->isVectorTy()) {
+      // The other side is a vector; splat the scalar across its lanes.
+      unsigned N = 0;
+      if (FalseShadow->getType()->isVectorTy())
+        N = cast<FixedVectorType>(FalseShadow->getType())->getNumElements();
+      else
+        N = cast<FixedVectorType>(Condition->getType())->getNumElements();
+      Value *Splat = UndefValue::get(
+          FixedVectorType::get(TrueShadow->getType(), N));
+      for (unsigned lane = 0; lane < N; ++lane)
+        Splat = IRB.CreateInsertElement(Splat, TrueShadow,
+                                        ConstantInt::get(TF.TT.Int32Ty, lane));
+      TrueShadow = Splat;
+    }
+    if (!FalseShadow->getType()->isVectorTy()) {
+      unsigned N = cast<FixedVectorType>(TrueShadow->getType())
+                       ->getNumElements();
+      Value *Splat = UndefValue::get(
+          FixedVectorType::get(FalseShadow->getType(), N));
+      for (unsigned lane = 0; lane < N; ++lane)
+        Splat = IRB.CreateInsertElement(Splat, FalseShadow,
+                                        ConstantInt::get(TF.TT.Int32Ty, lane));
+      FalseShadow = Splat;
+    }
+    TF.setShadow(&I, IRB.CreateSelect(Condition, TrueShadow, FalseShadow));
   } else {
     Value *ShadowSel =
         TF.visitSelectInst(Condition, TrueShadow, FalseShadow, &I);
