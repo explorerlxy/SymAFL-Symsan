@@ -975,14 +975,12 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
 
     // Small comparisons fit the scalar fmemcmp byte-capture grammar.
     uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcasecmp;
-    if (cmp_op == __dfsan::fstrcasecmp && !fstrcmp_capturable(n, s1, s2)) {
-      *ret_label = 0;
-    } else {
-      dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
-                                     (uint64_t)s1, (uint64_t)s2);
-      if (cmp) __taint_trace_memcmp(cmp);
-      *ret_label = cmp;
-    }
+    // Emit event even when uncapturable - converter will mark opaque (strncasecmp).
+    uint64_t op1_capture = (cmp_op == __dfsan::fstrcasecmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s1;
+    uint64_t op2_capture = (cmp_op == __dfsan::fstrcasecmp && !fstrcmp_capturable(n, s1, s2)) ? 0 : (uint64_t)s2;
+    dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n, op1_capture, op2_capture);
+    if (cmp) __taint_trace_memcmp(cmp);
+    *ret_label = cmp;
   }
   return ret;
 }
