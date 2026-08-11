@@ -135,6 +135,46 @@ NodeRef Tree::append(Node &&new_node) {
 // freshly allocated per-call vector: this runs once per new tree node, and a
 // per-node `vector<uint8_t> visited(arena.nodes.size(), 0)` zero-fills the
 // whole arena per node (the profiled 74% memset in InsertSuffix).
+// Does the predicate read any input bytes? Input-free predicates depend only on
+// runtime state (pointers, timestamps, allocator state) and are inherently
+// unstable across executions due to ASLR, heap layout changes, etc. Such
+// predicates must be marked unstable to enforce fail-closed replay.
+static bool pred_is_input_free(const PredArena &arena, const Predicate &pred) {
+  if (pred.opaque || pred.root >= arena.nodes.size()) return false;
+  static thread_local std::vector<uint32_t> visited_if;
+  static thread_local uint32_t generation_if = 0;
+  if (visited_if.size() < arena.nodes.size()) {
+    visited_if.resize(arena.nodes.size(), 0);
+  }
+  if (++generation_if == 0) {
+    std::fill(visited_if.begin(), visited_if.end(), 0);
+    generation_if = 1;
+  }
+  std::vector<uint32_t> stack = {pred.root};
+  while (!stack.empty()) {
+    uint32_t idx = stack.back();
+    stack.pop_back();
+    if (idx >= arena.nodes.size() || visited_if[idx] == generation_if) continue;
+    visited_if[idx] = generation_if;
+    const PNode &p = arena.nodes[idx];
+    // Any input-reading node makes the predicate input-dependent
+    switch (p.kind) {
+      case PKind::Read:
+      case PKind::Len:
+      case PKind::EofRead:
+      case PKind::Count:
+      case PKind::CountNeg1:
+      case PKind::CountElems:
+        return false;  // Found input dependency
+      default:
+        break;
+    }
+    if (p.a != UINT32_MAX) stack.push_back(p.a);
+    if (p.b != UINT32_MAX) stack.push_back(p.b);
+  }
+  return true;  // No input nodes found -> input-free
+}
+
 static bool pred_has_len_kind(const PredArena &arena, const Predicate &pred) {
   if (pred.opaque || pred.root >= arena.nodes.size()) return false;
   static thread_local std::vector<uint32_t> visited;
@@ -314,6 +354,12 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.pred = pred;
       new_node.constraint = ev.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
+      // Input-free predicates depend only on runtime state (pointers, heap
+      // layout, timestamps) and are unstable across executions. Mark both flags
+      // so CheckInput can distinguish input-free from replay-mismatch unstable.
+      bool is_input_free = pred_is_input_free(pred_arena_, pred);
+      new_node.input_free = is_input_free;
+      new_node.unstable = is_input_free;
       if (pred.opaque) {
         num_opaque += 1;
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
@@ -411,6 +457,11 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.pred = pred;
       new_node.constraint = event.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
+      // Input-free predicates depend only on runtime state and are unstable
+      // across executions. Mark both flags for distinction in CheckInput.
+      bool is_input_free = pred_is_input_free(pred_arena_, pred);
+      new_node.input_free = is_input_free;
+      new_node.unstable = is_input_free;
       if (pred.opaque) {
         num_opaque += 1;
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
@@ -480,18 +531,24 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
     }
     if (current.unstable) {
       // Fail-closed: veto candidates routed through unstable nodes (those with
-      // replay mismatches). Previously admitted them, causing admit_unstable to
-      // count thousands of unverified admissions. An unstable node indicates a
-      // trace/tree defect (missing decision, non-determinism, incomplete
-      // predicate); admit would bypass the very verification SYMAFL_REPLAY_CHECK
-      // was intended to enforce.
+      // replay mismatches or input-free predicates). Previously admitted them,
+      // causing admit_unstable to count thousands of unverified admissions. An
+      // unstable node indicates a trace/tree defect (missing decision,
+      // non-determinism, incomplete predicate); admit would bypass the very
+      // verification SYMAFL_REPLAY_CHECK was intended to enforce.
       if (out_veto_node) *out_veto_node = cur;
       if (out_veto_dir) *out_veto_dir = 0;
       if (out_veto_depth) *out_veto_depth = current.depth;
       if (out_veto_kind) *out_veto_kind = 0; // not a real terminal
       *out_node = cur;
       *out_dir = 0;
-      check_veto_unstable += 1;
+      // Distinguish input-free (marked at creation) from replay-mismatch
+      // (marked during InsertTrace prefix walk).
+      if (current.input_free) {
+        check_veto_input_free += 1;
+      } else {
+        check_veto_unstable += 1;
+      }
       finish_profile(3, walked);
       return false;
     }

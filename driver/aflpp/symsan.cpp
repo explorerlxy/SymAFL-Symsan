@@ -404,6 +404,7 @@ static void print_concolic_phase_snapshot(const my_mutator_t *data) {
           "vetoed=%llu traced_entries=%llu probe_admitted=%llu "
           "probe_gained=%llu admit_frontier=%llu admit_len_veto=%llu "
           "veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu "
+          "veto_input_free=%llu "
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu "
           "traces=%llu nodes=%llu depth=%llu\n",
           (unsigned long long)data->screened,
@@ -417,6 +418,7 @@ static void print_concolic_phase_snapshot(const my_mutator_t *data) {
           (unsigned long long)t.check_veto_terminal,
           (unsigned long long)t.check_veto_rlimit,
           (unsigned long long)t.check_veto_unstable,
+          (unsigned long long)t.check_veto_input_free,
           (unsigned long long)data->probe_gained_terminal,
           (unsigned long long)data->probe_gained_rlimit,
           (unsigned long long)t.num_traces,
@@ -757,7 +759,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
           "single_pass=%llu single_pass_overflow=%llu "
           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
-          "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu probe_admitted=%llu probe_gained=%llu "
+          "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu veto_input_free=%llu probe_admitted=%llu probe_gained=%llu "
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
           "replay_ns=%llu replay_calls=%llu decode_ns=%llu decode_calls=%llu "
@@ -786,6 +788,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.check_veto_terminal,
           (unsigned long long)t.check_veto_rlimit,
           (unsigned long long)t.check_veto_unstable,
+          (unsigned long long)t.check_veto_input_free,
           (unsigned long long)data->veto_probe_admitted,
           (unsigned long long)data->veto_probe_gained,
           (unsigned long long)data->probe_gained_terminal,
@@ -2429,7 +2432,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "screened=%llu admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
            "single_pass=%llu single_pass_overflow=%llu "
            "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
-           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu probe_admitted=%llu probe_gained=%llu "
+           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu veto_input_free=%llu probe_admitted=%llu probe_gained=%llu "
            "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
            "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
            "replay_ns=%llu replay_calls=%llu exec_ns=%llu exec_calls=%llu",
@@ -2457,6 +2460,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)t.check_veto_terminal,
            (unsigned long long)t.check_veto_rlimit,
            (unsigned long long)t.check_veto_unstable,
+           (unsigned long long)t.check_veto_input_free,
            (unsigned long long)data->veto_probe_admitted,
            (unsigned long long)data->veto_probe_gained,
            (unsigned long long)data->probe_gained_terminal,
