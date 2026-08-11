@@ -479,11 +479,21 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       DebugPredicate(cur, input, len);
     }
     if (current.unstable) {
-      *out_node = kUnexplored;
+      // Fail-closed: veto candidates routed through unstable nodes (those with
+      // replay mismatches). Previously admitted them, causing admit_unstable to
+      // count thousands of unverified admissions. An unstable node indicates a
+      // trace/tree defect (missing decision, non-determinism, incomplete
+      // predicate); admit would bypass the very verification SYMAFL_REPLAY_CHECK
+      // was intended to enforce.
+      if (out_veto_node) *out_veto_node = cur;
+      if (out_veto_dir) *out_veto_dir = 0;
+      if (out_veto_depth) *out_veto_depth = current.depth;
+      if (out_veto_kind) *out_veto_kind = 0; // not a real terminal
+      *out_node = cur;
       *out_dir = 0;
-      check_admit_unstable += 1;
-      finish_profile(1, walked);
-      return true;
+      check_veto_unstable += 1;
+      finish_profile(3, walked);
+      return false;
     }
     if (current.pred.opaque) {
       // An opaque predicate has no sound candidate-dependent direction.

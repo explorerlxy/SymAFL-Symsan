@@ -542,7 +542,10 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
   // canonical -1/0/+1 result is lowered at the consuming comparison so a
   // wide operand is never truncated to the first machine word.
   if (is_fmemcmp(static_cast<uint16_t>(op))) {
-    if (info->size == 0 || info->size > 16) {
+    // Fail-closed: reject memcmp wider than the 64-bit evaluator supports.
+    // Previously accepted <=16 bytes but evaluation rejected >8, causing
+    // fail-open Opaque admission. Align conversion limit with eval limit.
+    if (info->size == 0 || info->size > 8) {
       fail(PredError::InvalidWidth);
       return kInvalidNode;
     }

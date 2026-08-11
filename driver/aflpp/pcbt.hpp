@@ -228,9 +228,10 @@ class Tree {
   uint64_t check_admit_eval_failure = 0;
   uint64_t check_admit_frontier = 0;
   uint64_t check_admit_len_veto = 0;  // terminal veto downgraded to admit
-  uint64_t check_admit_unstable = 0;
+  uint64_t check_admit_unstable = 0;  // DEPRECATED: unstable nodes now veto
   uint64_t check_veto_terminal = 0;
   uint64_t check_veto_rlimit = 0;
+  uint64_t check_veto_unstable = 0;  // replay-mismatch unstable node veto
   std::array<uint64_t, kPredErrorCount> opaque_by_error{};
   std::unordered_map<uint16_t, uint64_t> opaque_by_op;
   // Event-site census for opaque nodes. This is intentionally keyed by CID
