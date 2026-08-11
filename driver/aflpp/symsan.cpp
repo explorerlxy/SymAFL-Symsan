@@ -570,6 +570,18 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
             "and non-gaining) is full-pipe captured and replayed against "
             "the tree; mismatches mark nodes unstable and are counted\n");
   }
+  // rlimit-unlimited quality mode: bypass the rCnt/rlimit budget so every
+  // candidate that reaches an unexplored edge is admitted. Setting rlimit to
+  // 255 is NOT equivalent - a hot edge still exhausts 255 retries and starts
+  // rlimit-vetoing candidates, which would mask their streams. Replay-all
+  // implies this mode: the whole point of the census is that no candidate is
+  // screened out by a retry budget.
+  if (getenv("SYMAFL_RCNT_UNLIMITED") || data->replay_all) {
+    data->tree.set_rlimit_unlimited(true);
+    fprintf(stderr, "[pcbt] rlimit unlimited: every frontier admission is "
+            "granted (rCnt bypassed); saturation decided by terminal closure "
+            "alone\n");
+  }
   if (getenv("SYMAFL_NO_SCREEN")) {
     data->screening = false;
   }

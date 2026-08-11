@@ -517,7 +517,11 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       const uint8_t edge_rlimit = current.constraint && current.len_related
                                        ? len_rlimit
                                        : rlimit;
-      if (current.rCnt[dir] < edge_rlimit) {
+      // rlimit-unlimited quality mode bypasses the retry budget entirely:
+      // every candidate that reaches an unexplored edge is admitted, so an
+      // exhausted rCnt can never mask a candidate's stream from the replay
+      // census (and saturation is decided by terminal closure alone).
+      if (rlimit_unlimited_ || current.rCnt[dir] < edge_rlimit) {
         check_admit_frontier += 1;
         finish_profile(3, walked);
         return true;
@@ -563,6 +567,9 @@ bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const {
     NodeRef next = current.child[direction];
     if (next == kTerminal) continue;
     if (next == kUnexplored) {
+      // With an unlimited retry budget an unexplored edge never saturates:
+      // only terminal closure (or unstable/opaque) can saturate the tree.
+      if (rlimit_unlimited_) return false;
       const uint8_t edge_rlimit = current.constraint && current.len_related
                                        ? len_rlimit
                                        : rlimit;

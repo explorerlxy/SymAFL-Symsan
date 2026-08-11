@@ -85,15 +85,10 @@ class Tree {
 
   // Insert the suffix known to follow parent.child[direction]. The caller has
   // already established the PCBT prefix during screening, so this performs no
-  // root replay or prefix matching. An empty suffix never closes the edge: it
-  // proves only that THIS candidate produced no further symbolic decision,
-  // not that the edge terminates. Collection gaps (a length/count shadow
-  // absent for this candidate, an early-terminating invalid input, an
-  // invisible read) let same-prefix candidates continue with nonempty
-  // suffixes, so hard-closing would fabricate a terminal proof and veto them
-  // (terminal-veto-but-gain). The edge stays unexplored for the rCnt/rlimit
-  // budget instead of being closed, on ordinary and constraint parents alike.
-  // Nonempty suffixes close their tail as terminal.
+  // root replay or prefix matching. An empty suffix on an ordinary edge
+  // closes that edge terminal (the observed candidate's final decision);
+  // constraint value-forks stay unexplored (a complete suffix can never be
+  // empty there). Nonempty suffixes close their tail as terminal.
   // When the suffix inserts any node, *out_tail_node / *out_tail_dir
   // (optional) receive the LAST inserted edge — the edge that becomes
   // terminal (or that a later insertion continues from). This is the edge a
@@ -206,6 +201,12 @@ class Tree {
   bool debug() const { return debug_; }
   void set_profile(bool enabled) { profile_ = enabled; }
   bool profile() const { return profile_; }
+  // Quality-test mode: bypass the rCnt/rlimit budget entirely so EVERY
+  // candidate reaching an unexplored edge is admitted (rlimit vetoes cannot
+  // mask a candidate's stream; saturation is then decided only by terminal
+  // closure, never by retry budgets).
+  void set_rlimit_unlimited(bool enabled) { rlimit_unlimited_ = enabled; }
+  bool rlimit_unlimited() const { return rlimit_unlimited_; }
   void DebugPredicate(NodeRef ref, const uint8_t *input, uint32_t len) const;
 
   // stats
@@ -245,6 +246,7 @@ class Tree {
   bool IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const;
   bool debug_ = false;
   bool profile_ = false;
+  bool rlimit_unlimited_ = false;
   // Persistent eval context for CheckInput: the values_/stamps_ vectors are
   // keyed by arena index, so they must only grow (the arena is append-only
   // between checks); a fresh context per check zero-fills up to the arena
