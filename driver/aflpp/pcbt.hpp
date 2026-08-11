@@ -41,10 +41,6 @@ struct Node {
   // Prefix validation found incompatible symbolic event streams at this node.
   // Descendants are not safe terminal proofs while this flag is set.
   bool unstable = false;
-  // Input-free predicate (no Read/Len/EofRead nodes). Such predicates depend
-  // only on runtime state (pointers, heap layout, timestamps) and are inherently
-  // unstable across executions. Marked at node creation, not replay-check.
-  bool input_free = false;
   // The stored predicate's decision depends on a length/count family leaf
   // (Len/EofRead/Count/CountNeg1/CountElems). For constraint nodes this also
   // selects the optional length retry budget; terminal policy does not
@@ -236,7 +232,6 @@ class Tree {
   uint64_t check_veto_terminal = 0;
   uint64_t check_veto_rlimit = 0;
   uint64_t check_veto_unstable = 0;  // replay-mismatch unstable node veto
-  uint64_t check_veto_input_free = 0;  // input-free (pointer-compare) unstable veto
   std::array<uint64_t, kPredErrorCount> opaque_by_error{};
   std::unordered_map<uint16_t, uint64_t> opaque_by_op;
   // Event-site census for opaque nodes. This is intentionally keyed by CID
