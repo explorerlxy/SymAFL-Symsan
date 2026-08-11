@@ -497,6 +497,14 @@ static constexpr uint32_t kFreadConstraintCid = 1;    // fread/fread_unlocked
 static constexpr uint32_t kReadConstraintCid = 2;     // read/pread/pread64
 static constexpr uint32_t kGetlineConstraintCid = 3;  // getline/getdelim
 static constexpr uint32_t kFgetsConstraintCid = 4;    // fgets/fgets_unlocked
+// Reserved cids for black-box legality checks the wrappers expand into
+// ordinary per-unit symbolic decisions (glibc iconv UCS-4 semantics:
+// cp in [0,0x7FFFFFFF] and not in [0xD800,0xDFFF]). Low values never collide
+// with djbHash branch ids. Each unit emits three ordinary ICmp events (range,
+// surrogate-low, surrogate-high); the stream position distinguishes units.
+static constexpr uint32_t kIconvUcs4RangeCid = 5;     // cp < 0x80000000
+static constexpr uint32_t kIconvSurrogateLoCid = 6;   // cp >= 0xD800
+static constexpr uint32_t kIconvSurrogateHiCid = 7;   // cp <= 0xDFFF
 
 enum undefined_check_ids {
   ub_integer_overflow = 1,

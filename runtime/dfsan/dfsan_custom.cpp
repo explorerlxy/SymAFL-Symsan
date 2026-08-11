@@ -4721,33 +4721,30 @@ __dfsw_assume_cond(bool result, uint64_t id, dfsan_label result_label, dfsan_lab
 }
 
 // iconv family: control-flow-relevant black-box conversion. libc iconv is
-// uninstrumented, so without a wrapper the conversion outcome (ret/errno)
-// and the produced output bytes lose their shadow. Callers that branch on
-// the outcome (e.g. libxml2 xmlIconvWrapper's `errno == EILSEQ` check)
-// then emit no symbolic event and the PCBT misses the encoding-success/
-// failure fork — observed as a libxml2 terminal-veto-but-gain where the
-// vetoed input's UCS-4 conversion failed while the tree's path was built
-// from a succeeding sibling. This is a deliberately conservative boundary
-// model: we restore input-dependence of the output window, of errno on
-// failure, and of the return value; we do not reconstruct the exact
-// conversion relation inside libc.
+// uninstrumented, so the legality decision (does the input contain an
+// invalid encoding unit?) is invisible to the PCBT. We expand it into
+// per-unit ORDINARY symbolic decisions, the same way strcmp is lowered
+// byte-wise: for each complete input unit (UCS-4 = 4 bytes) the wrapper
+// emits three ICmp events (cp < 0x80000000, cp >= 0xD800, cp <= 0xDFFF)
+// whose predicates are exactly evaluable from the unit's bytes (glibc UCS-4
+// semantics measured: accept [0,0x7FFFFFFF], reject surrogates). Stream
+// position distinguishes units; the fread length constraint (value-fork
+// over read count) already separates candidates by input length, so a short
+// candidate never walks a long candidate's units.
+static __thread char g_iconv_tocode[64];
+static __thread char g_iconv_fromcode[64];
 SANITIZER_INTERFACE_ATTRIBUTE
 iconv_t __dfsw_iconv_open(const char *tocode, const char *fromcode,
                           dfsan_label tocode_label,
                           dfsan_label fromcode_label) {
   iconv_t cd = iconv_open(tocode, fromcode);
-  // Diagnostic: record the requested encodings so the wrapper can expand the
-  // legality check into per-unit symbolic decisions that match glibc iconv
-  // exactly (direction of conversion, unit width, legality rules).
-  static __thread char g_tocode[64];
-  static __thread char g_fromcode[64];
+  // Record the requested encodings for the per-unit legality expansion.
   if (tocode && fromcode && cd != (iconv_t)-1) {
-    internal_strncpy(g_tocode, tocode, sizeof(g_tocode) - 1);
-    g_tocode[sizeof(g_tocode) - 1] = '\0';
-    internal_strncpy(g_fromcode, fromcode, sizeof(g_fromcode) - 1);
-    g_fromcode[sizeof(g_fromcode) - 1] = '\0';
-    Printf("[RT-DIAG] iconv_open to=%s from=%s cd=%p\n", g_tocode,
-           g_fromcode, (void *)cd);
+    internal_strncpy(g_iconv_tocode, tocode, sizeof(g_iconv_tocode) - 1);
+    g_iconv_tocode[sizeof(g_iconv_tocode) - 1] = '\0';
+    internal_strncpy(g_iconv_fromcode, fromcode,
+                     sizeof(g_iconv_fromcode) - 1);
+    g_iconv_fromcode[sizeof(g_iconv_fromcode) - 1] = '\0';
   }
   return cd;
 }
@@ -4757,38 +4754,152 @@ int __dfsw_iconv_close(iconv_t cd, dfsan_label cd_label) {
   return iconv_close(cd);
 }
 
+// Emit per-unit UCS-4 legality checks as ordinary ICmp events. glibc's
+// UCS-4 conversion accepts cp in [0, 0x7FFFFFFF] and rejects surrogate
+// codepoints [0xD800, 0xDFFF] (measured with iconv_open("UTF-8","UCS-4LE")).
+static void iconv_emit_ucs4_checks(const char *p, size_t remaining,
+                                   bool big_endian) {
+  while (remaining >= 4) {
+    uint32_t cp;
+    if (big_endian) {
+      cp = ((uint32_t)(uint8_t)p[0] << 24) | ((uint32_t)(uint8_t)p[1] << 16) |
+           ((uint32_t)(uint8_t)p[2] << 8) | (uint32_t)(uint8_t)p[3];
+    } else {
+      cp = (uint32_t)(uint8_t)p[0] | ((uint32_t)(uint8_t)p[1] << 8) |
+           ((uint32_t)(uint8_t)p[2] << 16) | ((uint32_t)(uint8_t)p[3] << 24);
+    }
+    dfsan_label b0 = dfsan_read_label(p + 0, 1);
+    dfsan_label b1 = dfsan_read_label(p + 1, 1);
+    dfsan_label b2 = dfsan_read_label(p + 2, 1);
+    dfsan_label b3 = dfsan_read_label(p + 3, 1);
+    // Codepoint label via Concat (l1 = low bits, l2 = high bits;
+    // PKind::Concat evaluates (high << low_bits) | low).
+    dfsan_label cl, ch;
+    uint64_t lo16, hi16;
+    if (big_endian) {
+      cl = dfsan_union(b2, b3, __dfsan::Concat, 16, (uint8_t)p[2],
+                       (uint8_t)p[3]);
+      ch = dfsan_union(b0, b1, __dfsan::Concat, 16, (uint8_t)p[0],
+                       (uint8_t)p[1]);
+      lo16 = (uint8_t)p[2] | ((uint8_t)p[3] << 8);
+      hi16 = (uint8_t)p[0] | ((uint8_t)p[1] << 8);
+    } else {
+      cl = dfsan_union(b0, b1, __dfsan::Concat, 16, (uint8_t)p[0],
+                       (uint8_t)p[1]);
+      ch = dfsan_union(b2, b3, __dfsan::Concat, 16, (uint8_t)p[2],
+                       (uint8_t)p[3]);
+      lo16 = (uint8_t)p[0] | ((uint8_t)p[1] << 8);
+      hi16 = (uint8_t)p[2] | ((uint8_t)p[3] << 8);
+    }
+    dfsan_label cp_label = dfsan_union(cl, ch, __dfsan::Concat, 32, lo16,
+                                       hi16);
+    if (cp_label != 0 && cp_label != kInitializingLabel) {
+      dfsan_label rng = dfsan_union(cp_label, 0,
+                                    __dfsan::ICmp | (bvult << 8), 32, cp,
+                                    0x80000000ull);
+      if (rng)
+        __taint_send_cond(rng, cp < 0x80000000u, 0, 0, kIconvUcs4RangeCid,
+                          (void *)p);
+      dfsan_label slo = dfsan_union(cp_label, 0,
+                                    __dfsan::ICmp | (bvuge << 8), 32, cp,
+                                    0xD800u);
+      if (slo)
+        __taint_send_cond(slo, cp >= 0xD800u, 0, 0, kIconvSurrogateLoCid,
+                          (void *)p);
+      dfsan_label shi = dfsan_union(cp_label, 0,
+                                    __dfsan::ICmp | (bvule << 8), 32, cp,
+                                    0xDFFFu);
+      if (shi)
+        __taint_send_cond(shi, cp <= 0xDFFFu, 0, 0, kIconvSurrogateHiCid,
+                          (void *)p);
+    }
+    p += 4;
+    remaining -= 4;
+  }
+}
+
+// Emit per-byte UTF-8 legality checks as ordinary ICmp events (glibc UTF-8
+// decoder): byte classes ASCII (<0x80), 2-byte lead [0xC2,0xDF], 3-byte lead
+// [0xE0,0xEF], 4-byte lead [0xF0,0xF4], and continuation [0x80,0xBF]. A
+// fully general sequence validator (lead-to-continuation matching) is a
+// variable-length decision and is tracked separately; this covers the
+// encoding-head/header legality constraints (first 32 bytes) with a fixed
+// event sequence per byte, so candidate streams stay position-stable.
+static void iconv_emit_utf8_checks(const char *p, size_t remaining) {
+  const size_t limit = remaining < 32 ? remaining : 32;
+  for (size_t i = 0; i < limit; ++i) {
+    uint8_t b = (uint8_t)p[i];
+    dfsan_label bl = dfsan_read_label(p + i, 1);
+    if (bl == 0) continue;
+    struct { uint64_t rhs; uint8_t pred; uint32_t cid; } checks[] = {
+        {0x80, bvult, 8},   // b < 0x80       (ASCII)
+        {0xC2, bvuge, 9},   // b >= 0xC2
+        {0xDF, bvule, 10},  // b <= 0xDF
+        {0xE0, bvuge, 11},  // b >= 0xE0
+        {0xEF, bvule, 12},  // b <= 0xEF
+        {0xF0, bvuge, 13},  // b >= 0xF0
+        {0xF4, bvule, 14},  // b <= 0xF4
+        {0x80, bvuge, 15},  // b >= 0x80      (continuation/lead marker)
+        {0xBF, bvule, 16},  // b <= 0xBF
+    };
+    for (const auto &ck : checks) {
+      dfsan_label lab =
+          dfsan_union(bl, 0, __dfsan::ICmp | (ck.pred << 8), 8, b, ck.rhs);
+      if (lab == 0 || lab == kInitializingLabel) continue;
+      bool res = ck.pred == bvult ? (b < ck.rhs) : (b >= ck.rhs);
+      if (ck.pred == bvule) res = (b <= ck.rhs);
+      __taint_send_cond(lab, res, 0, 0, ck.cid, (void *)(p + i));
+    }
+  }
+}
+
+static bool iconv_fromcode_is_ucs4(const char *fromcode, bool *big_endian) {
+  if (!fromcode) return false;
+  if (internal_strcmp(fromcode, "UCS-4LE") == 0) {
+    *big_endian = false;
+    return true;
+  }
+  if (internal_strcmp(fromcode, "UCS-4BE") == 0) {
+    *big_endian = true;
+    return true;
+  }
+  // "UCS-4" / "UCS4" / "UCS-4-INTERNAL" follow the system byte order (LE on
+  // x86); glibc's UCS-4 converter is built from ucs4-internal.
+  if (internal_strcmp(fromcode, "UCS-4") == 0 ||
+      internal_strcmp(fromcode, "UCS4") == 0 ||
+      internal_strcmp(fromcode, "UCS-4-INTERNAL") == 0) {
+    *big_endian = false;
+    return true;
+  }
+  return false;
+}
+
+static bool iconv_fromcode_is_utf8(const char *fromcode) {
+  return fromcode &&
+         (internal_strcmp(fromcode, "UTF-8") == 0 ||
+          internal_strcmp(fromcode, "UTF8") == 0);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE
 size_t __dfsw_iconv(iconv_t cd, char **inbuf, size_t *inbytesleft,
                     char **outbuf, size_t *outbytesleft,
                     dfsan_label cd_label, dfsan_label inbuf_label,
                     dfsan_label inbytesleft_label, dfsan_label outbuf_label,
                     dfsan_label outbytesleft_label, dfsan_label *ret_label) {
-  const size_t orig_in = (inbytesleft != nullptr) ? *inbytesleft : 0;
-  const size_t orig_out = (outbytesleft != nullptr) ? *outbytesleft : 0;
-  // The first conversion unit's shadow is the dependency for this call's
-  // failure state. UCS-4-style encodings convert one character (<= 4 bytes)
-  // at a time and stop at the first invalid unit, so a small fixed window
-  // covers the EILSEQ decision while keeping the generated label DAG shallow
-  // (a full-window union of a 30-byte input produced opaque predicates).
-  dfsan_label input_label = 0;
-  if (inbuf != nullptr && *inbuf != nullptr && orig_in > 0) {
-    const size_t window = orig_in < 4 ? orig_in : 4;
-    input_label = dfsan_read_label(*inbuf, window);
+  // Expand the legality decision into per-unit ordinary symbolic events
+  // BEFORE the actual conversion (the input buffer is still unmodified).
+  if (inbuf != nullptr && *inbuf != nullptr && inbytesleft != nullptr &&
+      *inbytesleft > 0) {
+    bool be = false;
+    if (iconv_fromcode_is_ucs4(g_iconv_fromcode, &be)) {
+      iconv_emit_ucs4_checks(*inbuf, *inbytesleft, be);
+    } else if (iconv_fromcode_is_utf8(g_iconv_fromcode)) {
+      iconv_emit_utf8_checks(*inbuf, *inbytesleft);
+    }
   }
   size_t ret = iconv(cd, inbuf, inbytesleft, outbuf, outbytesleft);
-  // Diagnostic: log the actual conversion outcome so the legality expansion
-  // can be matched to glibc behavior.
-  if (ret == (size_t)-1) {
-    int e = errno;
-    Printf("[RT-DIAG] iconv ret=-1 errno=%d inbytesleft=%zu outbytesleft=%zu "
-           "inbuf_head=%02x\n",
-           e, inbytesleft ? *inbytesleft : 0,
-           outbytesleft ? *outbytesleft : 0,
-           (inbuf && *inbuf) ? (unsigned char)**inbuf : 0);
-  }
-  // The return value stays unmodeled; the caller's errno branch carries the
-  // failure fork (to be expanded per-unit by the wrapper once the exact
-  // glibc rules for the observed conversion are measured).
+  // The return value stays unmodeled; the per-unit legality events above
+  // carry the encoding-success/failure fork.
   *ret_label = 0;
   return ret;
 }
