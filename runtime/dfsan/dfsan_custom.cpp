@@ -4735,7 +4735,21 @@ SANITIZER_INTERFACE_ATTRIBUTE
 iconv_t __dfsw_iconv_open(const char *tocode, const char *fromcode,
                           dfsan_label tocode_label,
                           dfsan_label fromcode_label) {
-  return iconv_open(tocode, fromcode);
+  iconv_t cd = iconv_open(tocode, fromcode);
+  // Diagnostic: record the requested encodings so the wrapper can expand the
+  // legality check into per-unit symbolic decisions that match glibc iconv
+  // exactly (direction of conversion, unit width, legality rules).
+  static __thread char g_tocode[64];
+  static __thread char g_fromcode[64];
+  if (tocode && fromcode && cd != (iconv_t)-1) {
+    internal_strncpy(g_tocode, tocode, sizeof(g_tocode) - 1);
+    g_tocode[sizeof(g_tocode) - 1] = '\0';
+    internal_strncpy(g_fromcode, fromcode, sizeof(g_fromcode) - 1);
+    g_fromcode[sizeof(g_fromcode) - 1] = '\0';
+    Printf("[RT-DIAG] iconv_open to=%s from=%s cd=%p\n", g_tocode,
+           g_fromcode, (void *)cd);
+  }
+  return cd;
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
@@ -4762,12 +4776,19 @@ size_t __dfsw_iconv(iconv_t cd, char **inbuf, size_t *inbytesleft,
     input_label = dfsan_read_label(*inbuf, window);
   }
   size_t ret = iconv(cd, inbuf, inbytesleft, outbuf, outbytesleft);
-  // On failure the caller's `errno == EILSEQ`-style branches must stay
-  // symbolic: set errno's shadow to the input taint.
-  if (ret == (size_t)-1 && input_label)
-    dfsan_set_label(input_label, __errno_location(), sizeof(int));
-  // The return value stays unmodeled (a full-window dependency would be
-  // opaque); the caller's `errno == EILSEQ` branch carries the failure fork.
+  // Diagnostic: log the actual conversion outcome so the legality expansion
+  // can be matched to glibc behavior.
+  if (ret == (size_t)-1) {
+    int e = errno;
+    Printf("[RT-DIAG] iconv ret=-1 errno=%d inbytesleft=%zu outbytesleft=%zu "
+           "inbuf_head=%02x\n",
+           e, inbytesleft ? *inbytesleft : 0,
+           outbytesleft ? *outbytesleft : 0,
+           (inbuf && *inbuf) ? (unsigned char)**inbuf : 0);
+  }
+  // The return value stays unmodeled; the caller's errno branch carries the
+  // failure fork (to be expanded per-unit by the wrapper once the exact
+  // glibc rules for the observed conversion are measured).
   *ret_label = 0;
   return ret;
 }

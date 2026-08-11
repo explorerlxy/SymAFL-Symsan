@@ -1206,6 +1206,26 @@ static bool replay_check_trace(my_mutator_t *data,
         report.expected_cid, report.observed_cid,
         report.evaluated_dir, report.observed_dir,
         is_suffix ? "suffix" : "full");
+  if (data->tree.conflict_diag() && buf && buf_size > 0 &&
+      report.error != pcbt::Tree::ReplayError::TruncatedTrace) {
+    static uint64_t diag_mismatch_inputs = 0;
+    if (diag_mismatch_inputs < 8) {
+      diag_mismatch_inputs++;
+      size_t shown = buf_size < 64 ? buf_size : 64;
+      fprintf(stderr, "[pcbt-replay] %s mismatch input len=%zu hex=",
+              err_name, buf_size);
+      for (size_t k = 0; k < shown; ++k)
+        fprintf(stderr, "%02x", buf[k]);
+      fprintf(stderr, "%s\n", shown < buf_size ? " TRUNC" : "");
+    }
+  }
+  if (data->tree.conflict_diag() &&
+      report.mismatch_node != pcbt::kUnexplored &&
+      report.error != pcbt::Tree::ReplayError::TruncatedTrace && buf) {
+    // Dump the stored predicate at the mismatch node so the branch site can
+    // be identified (which bytes it reads, what comparison it performs).
+    data->tree.DebugPredicate(report.mismatch_node, buf, (uint32_t)buf_size);
+  }
   if (data->tree.conflict_diag() &&
       report.error == pcbt::Tree::ReplayError::TruncatedTrace && buf &&
       buf_size > 0) {
