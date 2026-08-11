@@ -669,7 +669,12 @@ Tree::ReplayReport Tree::ReplayFullTrace(
           r.reached_frontier = true;
           r.frontier_node = cur;
           r.frontier_dir = dir;
-          r.suffix_begin = logic;
+          // A false edge of a constraint node is a value-fork refinement:
+          // the observed constraint event must be re-emitted at the same
+          // stream position when InsertSuffix mines this edge.  skip_for()
+          // therefore returns the position before this logical event, while
+          // ordinary and pinned constraint edges start after it.
+          r.suffix_begin = logic - (ev.constraint && dir == 0 ? 1 : 0);
           return false;
         }
 
