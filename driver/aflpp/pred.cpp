@@ -881,16 +881,14 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     uint32_t b = conv_child(info->l2, info->op2.i, size);
     if (a == kInvalidNode || b == kInvalidNode)
       return kInvalidNode;
-    // An ICmp label always carries the concrete operand bit patterns in
-    // op1/op2 (the runtime keeps them for the solver).  When the derived
-    // operand DAGs are input-independent, the label arithmetic can
-    // reconstruct a different constant than the runtime actually compared
-    // (address-derived operands: the branch depends on heap layout, not
-    // input bytes).  Rebuild such operands from the captured concrete values
-    // so the stored predicate matches the observed direction instead of
-    // poisoning the node unstable on replay.
-    if (subtree_input_free(*arena_, a)) a = add_const(info->op1.i, size);
-    if (subtree_input_free(*arena_, b)) b = add_const(info->op2.i, size);
+    // REMOVED: subtree_input_free() pinning (38309bf).
+    // Pinning masked the symptom (direction mismatch) but did not fix the
+    // root cause. If pointer/heap-derived values produce mismatches, the real
+    // issue is either (a) an earlier omitted decision event, or (b) a genuine
+    // heap-layout expressiveness limit. Either way, the predicate must fail
+    // closed (UnsupportedOp -> opaque) or the omission must be fixed, not
+    // pinned to trace-time constants. Sqlite dir_mismatch will reappear;
+    // forensic snapshot required to diagnose the true root cause.
     return add(kind, size, a, b);
   }
   if (op_lo == FCmp) {
