@@ -54,6 +54,72 @@ static bool label_depends_on(const dfsan_label_info *table, size_t labels,
   return false;
 }
 
+// A 48/64-bit Const above the 32-bit space is almost always a frozen
+// stack/heap base from the training run, not a candidate-invariant value.
+static bool is_abs_addr_const(const PNode &nd) {
+  if (nd.kind != PKind::Const || nd.bits < 48) return false;
+  return nd.value > 0xFFFFFFFFULL && nd.value < (~uint64_t{0} - 0xFFFFULL);
+}
+
+// Peel absolute-base structure from a pointer-like expression:
+//   base
+//   base + r
+//   r + base
+//   small + (base + r)   /  (base + r) + small   (e.g. oend - 32)
+// Returns the absolute base and two residual pieces that rebuild as
+// residual = (inner_residual) + (optional wrap_const). wrap_const is
+// kNoChild when absent; inner_residual is kNoChild for a pure base.
+static bool peel_abs_base(const PredArena &arena, uint32_t node,
+                          uint64_t *base_out, uint32_t *inner_residual_out,
+                          uint32_t *wrap_const_out) {
+  if (node == kNoChild || node == kInvalidNode || node >= arena.nodes.size() ||
+      base_out == nullptr || inner_residual_out == nullptr ||
+      wrap_const_out == nullptr)
+    return false;
+  *wrap_const_out = kNoChild;
+  const PNode &nd = arena.nodes[node];
+  if (is_abs_addr_const(nd)) {
+    *base_out = nd.value;
+    *inner_residual_out = kNoChild;
+    return true;
+  }
+  if (nd.kind != PKind::Add) return false;
+
+  auto peel_direct = [&](uint32_t a, uint32_t b) -> bool {
+    if (a != kNoChild && a < arena.nodes.size() &&
+        is_abs_addr_const(arena.nodes[a])) {
+      *base_out = arena.nodes[a].value;
+      *inner_residual_out = b;
+      return true;
+    }
+    if (b != kNoChild && b < arena.nodes.size() &&
+        is_abs_addr_const(arena.nodes[b])) {
+      *base_out = arena.nodes[b].value;
+      *inner_residual_out = a;
+      return true;
+    }
+    return false;
+  };
+  if (peel_direct(nd.a, nd.b)) return true;
+
+  // One outer small-const Add around a base Add (oend_w = oend + (-32)).
+  for (int swap = 0; swap < 2; ++swap) {
+    uint32_t ca = swap ? nd.b : nd.a;
+    uint32_t inn = swap ? nd.a : nd.b;
+    if (ca == kNoChild || ca >= arena.nodes.size()) continue;
+    if (arena.nodes[ca].kind != PKind::Const ||
+        is_abs_addr_const(arena.nodes[ca]))
+      continue;
+    if (inn == kNoChild || inn >= arena.nodes.size()) continue;
+    const PNode &inner = arena.nodes[inn];
+    if (inner.kind != PKind::Add) continue;
+    if (!peel_direct(inner.a, inner.b)) continue;
+    *wrap_const_out = ca;
+    return true;
+  }
+  return false;
+}
+
 // True when the converted arena subtree has no input-dependent leaves. An
 // ICmp operand derived only from constants (e.g. fstrlen with a programmatic
 // NUL, folded pointer arithmetic) does not depend on the candidate, so the
@@ -899,6 +965,31 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     if (subtree_input_free(*arena_, b)) {
       b = add_const(info->op2.i, size);
       if (b == kInvalidNode) return kInvalidNode;
+    }
+    // Cancel a shared frozen absolute base from both sides of a pointer
+    // comparison: ugt(base+x, base+y-32) -> ugt(x, y+(-32)). Keeps the
+    // input-dependent offset model while dropping training-run stack/heap
+    // bases that otherwise poison screening of later candidates.
+    {
+      uint64_t base_a = 0, base_b = 0;
+      uint32_t ir_a = kNoChild, ir_b = kNoChild;
+      uint32_t wrap_a = kNoChild, wrap_b = kNoChild;
+      if (peel_abs_base(*arena_, a, &base_a, &ir_a, &wrap_a) &&
+          peel_abs_base(*arena_, b, &base_b, &ir_b, &wrap_b) &&
+          base_a == base_b) {
+        auto rebuild = [&](uint32_t ir, uint32_t wrap) -> uint32_t {
+          uint32_t body = ir;
+          if (body == kNoChild) {
+            body = add_const(0, size);
+            if (body == kInvalidNode) return kInvalidNode;
+          }
+          if (wrap == kNoChild) return body;
+          return add(PKind::Add, size, body, wrap);
+        };
+        a = rebuild(ir_a, wrap_a);
+        b = rebuild(ir_b, wrap_b);
+        if (a == kInvalidNode || b == kInvalidNode) return kInvalidNode;
+      }
     }
     return add(kind, size, a, b);
   }
