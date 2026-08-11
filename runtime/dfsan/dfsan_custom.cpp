@@ -4931,12 +4931,16 @@ static dfsan_label iconv_utf8_seq_valid_label(const uint8_t *p, size_t i,
 // Emit per-byte UTF-8 legality checks as ordinary ICmp events (glibc UTF-8
 // decoder): the nine byte-class checks (ASCII <0x80, 2-byte lead [0xC2,0xDF],
 // 3-byte lead [0xE0,0xEF], 4-byte lead [0xF0,0xF4], continuation [0x80,0xBF])
-// plus one cross-byte sequence-validity event per position.  The fixed event
-// sequence per byte keeps candidate streams position-stable; the window
-// (first 32 bytes = encoding-head constraint) bounds the event volume.
+// plus one cross-byte sequence-validity event per position. The fixed event
+// sequence per byte keeps candidate streams position-stable. Process ALL bytes
+// to ensure every legality decision is captured (fail-closed principle).
 static void iconv_emit_utf8_checks(const char *p, size_t remaining) {
-  const size_t limit = remaining < 32 ? remaining : 32;
-  for (size_t i = 0; i < limit; ++i) {
+  // REMOVED 32-byte cap: every byte's legality must be checked.
+  // Omitting events beyond byte 32 violates fail-closed: if conversion fails
+  // at byte 40, the decision is not captured, and later candidates with
+  // different byte 40 hit terminal veto. Event volume is not a valid reason
+  // to omit symbolic decisions.
+  for (size_t i = 0; i < remaining; ++i) {
     uint8_t b = (uint8_t)p[i];
     dfsan_label bl = dfsan_read_label(p + i, 1);
     if (bl == 0) continue;
@@ -5005,13 +5009,30 @@ size_t __dfsw_iconv(iconv_t cd, char **inbuf, size_t *inbytesleft,
                     dfsan_label outbytesleft_label, dfsan_label *ret_label) {
   // Expand the legality decision into per-unit ordinary symbolic events
   // BEFORE the actual conversion (the input buffer is still unmodified).
+  bool emitted_events = false;
   if (inbuf != nullptr && *inbuf != nullptr && inbytesleft != nullptr &&
       *inbytesleft > 0) {
     bool be = false;
     if (iconv_fromcode_is_ucs4(g_iconv_fromcode, &be)) {
       iconv_emit_ucs4_checks(*inbuf, *inbytesleft, be);
+      emitted_events = true;
     } else if (iconv_fromcode_is_utf8(g_iconv_fromcode)) {
       iconv_emit_utf8_checks(*inbuf, *inbytesleft);
+      emitted_events = true;
+    } else {
+      // Unsupported encoding - fail-closed check
+      dfsan_label input_label = dfsan_read_label(*inbuf, *inbytesleft);
+      if (input_label != 0) {
+        Report("FATAL: iconv from unsupported encoding with tainted input\n");
+        Report("  encoding: %s\n", g_iconv_fromcode ? g_iconv_fromcode : "(null)");
+        Report("  input size: %zu bytes\n", *inbytesleft);
+        Report("  SymSan currently models only UTF-8 and UCS-4 legality checks.\n");
+        Report("  Cannot clear *inbytesleft shadow without emitting per-unit events.\n");
+        Report("  This is a fail-closed error: either add modeling for this encoding\n");
+        Report("  or use targets that only process UTF-8/UCS-4.\n");
+        Die();
+      }
+      // Input is concrete - safe to clear (no decisions to capture)
     }
   }
   size_t ret = iconv(cd, inbuf, inbytesleft, outbuf, outbytesleft);
@@ -5028,6 +5049,9 @@ size_t __dfsw_iconv(iconv_t cd, char **inbuf, size_t *inbytesleft,
   // instead of storing a wrong predicate.  (The same stale-shadow pattern
   // then makes the caller's `*inlen -= icv_inlen` keep the original label,
   // and the subsequent xmlBufShrink length becomes x-x = 0, both consistent.)
+  //
+  // Only clear if we emitted per-unit events OR input was concrete.
+  // For unsupported encodings with tainted input, we already Die() above.
   if (inbytesleft != nullptr)
     dfsan_set_label(0, inbytesleft, sizeof(size_t));
   // The return value stays unmodeled; the per-unit legality events above
