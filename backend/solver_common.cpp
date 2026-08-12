@@ -73,6 +73,36 @@ bool IsTraceStreamEnabled() {
          mode == SYMAFL_TRACE_SUFFIX_PIPE;
 }
 
+// Write a complete buffer to the event pipe. internal_write returns uptr, so a
+// failed write (-1) becomes a huge unsigned value: the old `res < 0` check was
+// always false and silently dropped events (AFL short pure-prefix captures).
+// Also loop on short writes so a message is never partially published.
+static bool pipe_write_all(const void *buf, uptr n) {
+  if (__pipe_fd < 0 || n == 0) return false;
+  const char *p = static_cast<const char *>(buf);
+  uptr left = n;
+  while (left > 0) {
+    sptr w = static_cast<sptr>(internal_write(__pipe_fd, p, left));
+    int err = 0;
+    if (internal_iserror(static_cast<uptr>(w), &err) || w == 0) {
+      // Reader gone (EPIPE) or fatal: stop emitting for this process. Do not
+      // Die() here — exit-time flush must not recurse through Die callbacks.
+      static int once = 0;
+      if (once < 3) {
+        once++;
+        Printf("[pcbt-pipe] write failed fd=%d left=%zu err=%d (events may "
+               "be truncated)\n",
+               __pipe_fd, (size_t)left, err);
+      }
+      __pipe_fd = -1;
+      return false;
+    }
+    p += w;
+    left -= static_cast<uptr>(w);
+  }
+  return true;
+}
+
 //===----------------------------------------------------------------------===//
 // PCBT trace folding
 //===----------------------------------------------------------------------===//
@@ -255,9 +285,8 @@ static void write_fold_frame(uint32_t cid, dfsan_label label, uint8_t result,
     .result = result,
     .count = wire_count,
   };
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    // Ignore (EPIPE during exit flush).
-  }
+  // Exit-time fold flush: tolerate failure (reader may already be gone).
+  (void)pipe_write_all(&msg, sizeof(msg));
 }
 
 static void flush_slot() {
@@ -430,7 +459,10 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
     .count = 0
   };
 
-  if (internal_write(__pipe_fd, &msg, sizeof(msg)) < 0) {
-    Die();
+  // Must use pipe_write_all: a bare internal_write(...) < 0 is always false
+  // for uptr error returns and silently dropped the rest of the stream.
+  if (!pipe_write_all(&msg, sizeof(msg))) {
+    // Pipe dead mid-run: stop further emission (pipe_write_all clears fd).
+    return;
   }
 }

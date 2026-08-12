@@ -523,6 +523,16 @@ static void init_forkserver_capture(my_mutator_t *data) {
                          flags | O_NONBLOCK)) {
     PFATAL("Failed to configure forkserver full-trace pipe");
   }
+  // Grow the kernel pipe buffer so a REPLAY_ALL full stream (tens of KiB of
+  // cond frames) does not block the child if the parent is briefly busy. A
+  // blocked child under -t 2000 is SIGKILL'd and looks like a short capture.
+#ifdef F_SETPIPE_SZ
+  {
+    const int want = 1 << 20;  // 1 MiB
+    (void)fcntl(pipefd[0], F_SETPIPE_SZ, want);
+    (void)fcntl(pipefd[1], F_SETPIPE_SZ, want);
+  }
+#endif
   data->afl->fsrv.sym_trace_fd = data->full_stream_read_fd;
 
   const char *old_options = getenv("TAINT_OPTIONS");
@@ -2529,6 +2539,14 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
 
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   (void)filename;
+  // Forkserver is up by the first queue_get. Drop the parent's write end so
+  // only the target forkserver/children hold it. Keeping it open in afl-fuzz
+  // prevents EOF on the read side and is a common source of incomplete
+  // post-status drains under load.
+  if (data->full_stream_write_fd >= 0) {
+    close(data->full_stream_write_fd);
+    data->full_stream_write_fd = -1;
+  }
   data->bootstrap_done = true;
   if (data->concolic_deadline && !data->phase_start) {
     data->phase_start = time(nullptr);
