@@ -8,26 +8,18 @@ namespace {
 // rather than by input-only decisions. Resolved via djbHash of
 // "<abs-path>/dict.c:LINE:COL" for the Realworld build path used here, plus
 // basename forms for portability when SourceInfo is shortened.
-// Pairs historically: 233(AddString pool) <-> 865(Lookup for-cond),
-// 301(QString pool) <-> 1108(QLookup for-cond).
-// RCA 2026-08-13 (libxml2 cid_mismatch event=192): QLookup chain length
-// short (for next==NULL → post-loop 1115 only) vs long (for enters body →
-// 1110 then 1115). Tree inserted short order; probe long order → mismatch
-// without a true input-only omission. Same class for subdict 1135/1137/1142.
+// Pairs historically: 233(AddString pool) <-> 865(Lookup okey/len),
+// 301(QString pool) <-> 1108(QLookup). Emitting them as PCBT events creates
+// rare cid_mismatch at equal depth without a true input-only omission.
 static bool is_libxml_dict_layout_cid(uint32_t cid) {
   switch (cid) {
     // Full path .../libxml2/src/dict.c:LINE:COL (Realworld ko-clang builds)
     case 2643614513u:  // :233:6 pool freeness
     case 2644690445u:  // :301:6
     case 2650836764u:  // :862:9
-    case 1578374895u:  // :865:18 lookup for next!=NULL
+    case 1578374895u:  // :865:18 lookup okey/len
     case 2651919230u:  // :936:9
-    case 4189721270u:  // :1108:18 QLookup for next!=NULL
-    case 4190619756u:  // :1110:33 QLookup in-loop okey/len
-    case 4190799414u:  // :1115:29 QLookup post-loop last-node okey/len
-    case 4193171222u:  // :1135:18 subdict QLookup for next!=NULL
-    case 4193243157u:  // :1137:33 subdict QLookup in-loop
-    case 4194249366u:  // :1142:29 subdict QLookup post-loop
+    case 4189721270u:  // :1108:18
     case 1580602981u:  // :881:10 final-chain memcmp site (also soft-paired)
     // Basename dict.c:LINE:COL
     case 1186823932u:  // dict.c:233:6
@@ -36,11 +28,6 @@ static bool is_libxml_dict_layout_cid(uint32_t cid) {
     case 748925978u:   // dict.c:865:18
     case 1195128649u:  // dict.c:936:9
     case 2587710785u:  // dict.c:1108:18
-    case 2588609271u:  // dict.c:1110:33
-    case 2588788929u:  // dict.c:1115:29
-    case 2591160737u:  // dict.c:1135:18
-    case 2591232672u:  // dict.c:1137:33
-    case 2592238881u:  // dict.c:1142:29
     case 751154064u:   // dict.c:881:10
       return true;
     default:
