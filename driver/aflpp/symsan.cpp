@@ -1174,10 +1174,11 @@ static bool decode_full_stream(const u8 *wire, size_t wire_size,
     if (trailer > wire_size - offset) return false;
     offset += trailer;
   }
-  fprintf(stderr, "[pcbt-debug] decode: bytes=%zu cond=%zu dropped_zero=%zu "
-          "dropped_init=%zu kept=%zu\n",
-          wire_size, n_cond, n_dropped_zero, n_dropped_init,
-          events->size());
+  // Intentionally silent: per-call decode logging on REPLAY_ALL filled a 22 G
+  // afl-fuzz.log and the root disk. Drop counts are unused outside diagnostics.
+  (void)n_cond;
+  (void)n_dropped_zero;
+  (void)n_dropped_init;
   return true;
 }
 
