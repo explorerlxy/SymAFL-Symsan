@@ -222,8 +222,10 @@ class Tree {
   uint64_t num_traces = 0;
   uint64_t num_events = 0;
   uint64_t num_conflicts = 0;
-  uint64_t num_opaque = 0;     // legacy converter-fail telemetry (prefer tautology)
+  uint64_t num_opaque = 0;     // residual converter-opaque (should stay ~0)
   uint64_t num_tautology = 0;  // fixed-direction constant decisions
+  // Convert fail or train-eval mismatch: insertion stops; no node written.
+  uint64_t insert_structural_error = 0;
   uint64_t max_depth = 0;
   uint64_t check_admit_empty = 0;
   uint64_t check_admit_opaque = 0;  // DEPRECATED: opaque no longer whole-admits

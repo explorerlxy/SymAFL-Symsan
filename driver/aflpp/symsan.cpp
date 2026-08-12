@@ -753,7 +753,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   const pcbt::Tree &t = data->tree;
   fprintf(stderr,
           "[pcbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
-          "opaque=%llu tautology=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
+          "opaque=%llu tautology=%llu struct_err=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
           "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
           "single_pass=%llu single_pass_overflow=%llu "
           "admit_empty=%llu admit_opaque=%llu follow_tautology=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
@@ -768,6 +768,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.num_conflicts,
           (unsigned long long)t.num_opaque,
           (unsigned long long)t.num_tautology,
+          (unsigned long long)t.insert_structural_error,
           (unsigned long long)data->failed_runs,
           (unsigned long long)data->trace_timeouts,
           (unsigned long long)data->memerr_events,

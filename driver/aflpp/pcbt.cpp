@@ -184,46 +184,59 @@ static inline uint32_t child_skip_cnt(const Node &parent, uint8_t parent_dir,
 }
 
 // True when the DAG freezes a large absolute constant that is neither a
-// Classify an inserted predicate (D1 tautology / D2-A no abs-addr flood):
-// - Converter-opaque, train-eval mismatch, or input-free constant decisions
-//   become tautology nodes: unique fixed_dir; CheckInput continues walk.
-// - Absolute-address + input is NOT fail-closed: leave evaluable so screening
-//   stays active (P2 must complete taint for those models).
-static Predicate classify_inserted_predicate(const PredArena &arena,
-                                             Predicate pred,
-                                             const uint8_t *input,
-                                             uint32_t len,
-                                             uint8_t expected_result) {
-  const uint8_t fixed = expected_result ? 1 : 0;
-  auto as_tautology = [&](Predicate p) {
-    p.tautology = true;
-    p.fixed_dir = fixed;
-    p.opaque = false;  // screening uses tautology, not whole-admit opaque
-    return p;
-  };
+// Insertion classification (policy A for structural faults):
+// - Converter opaque / train-eval mismatch → StructuralError: STOP insert,
+//   write no node (exposes SEDBT collection/model defects).
+// - Input-free constant decision that matches train → Tautology (fixed_dir).
+// - Otherwise Accept as ordinary evaluable predicate.
+// Absolute-address + input stays evaluable (D2-A); P2 must complete taint.
+enum class InsertPredClass : uint8_t { Accept, Tautology, StructuralError };
 
-  if (pred.opaque) return as_tautology(pred);
+static InsertPredClass classify_inserted_predicate(const PredArena &arena,
+                                                   Predicate *pred,
+                                                   const uint8_t *input,
+                                                   uint32_t len,
+                                                   uint8_t expected_result) {
+  if (pred == nullptr) return InsertPredClass::StructuralError;
+  const uint8_t fixed = expected_result ? 1 : 0;
+
+  // Conversion failure: runtime emitted a symbolic event we cannot model.
+  if (pred->opaque) return InsertPredClass::StructuralError;
+
+  const bool candidate_independent =
+      pred->reads.empty() && !pred_has_len_kind(arena, *pred);
 
   if (input == nullptr) {
-    if (pred.reads.empty() && !pred_has_len_kind(arena, pred))
-      return as_tautology(pred);
-    return pred;
+    // No training bytes: cannot self-check eval direction. Accept ordinary
+    // predicates (unit tests / rare paths); only pure constants become
+    // tautology with the wire-recorded direction.
+    if (candidate_independent) {
+      pred->tautology = true;
+      pred->fixed_dir = fixed;
+      pred->opaque = false;
+      return InsertPredClass::Tautology;
+    }
+    return InsertPredClass::Accept;
   }
 
   uint64_t v = 0;
-  const bool ok = eval_predicate(arena, pred, input, len, &v);
+  const bool ok = eval_predicate(arena, *pred, input, len, &v);
   const uint8_t edir = (ok && v != 0) ? 1 : 0;
   if (!ok || edir != fixed) {
-    if (!ok) pred.error = PredError::UnsupportedOp;
-    return as_tautology(pred);
+    // Model disagrees with the same input that produced the event: structural
+    // defect. Do not freeze a lying or un-evaluable node into the tree.
+    return InsertPredClass::StructuralError;
   }
 
-  // Candidate-independent decision: no input-byte reads and no length/count
-  // leaves (EofRead/Count* still candidate-dependent via input length).
-  if (pred.reads.empty() && !pred_has_len_kind(arena, pred))
-    return as_tautology(pred);
+  // Candidate-independent decision → tautology with unique direction.
+  if (candidate_independent) {
+    pred->tautology = true;
+    pred->fixed_dir = fixed;
+    pred->opaque = false;
+    return InsertPredClass::Tautology;
+  }
 
-  return pred;
+  return InsertPredClass::Accept;
 }
 
 uint32_t Tree::InsertTrace(const std::vector<Event> &events,
@@ -340,12 +353,13 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
 
   RunConverter conv(table, table_labels, &pred_arena_);
   uint32_t created = 0;
+  bool structural_stop = false;
 
   // Diagnostics: detect label pollution (non-zero label but no input dependency)
   static bool label_pollution_diagnostics = getenv("SYMAFL_LABEL_POLLUTION_DEBUG") != nullptr;
   static uint32_t pollution_logged = 0;
 
-  for (; i < events.size(); ++i) {
+  for (; i < events.size() && !structural_stop; ++i) {
     const Event &ev = events[i];
     std::vector<Predicate> preds;
     if (ev.count > 1) {
@@ -356,9 +370,26 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       preds.push_back(conv.conv(ev.label));
     }
     k = 0;
-    for (const Predicate &raw_pred : preds) {
-      Predicate pred =
-          classify_inserted_predicate(pred_arena_, raw_pred, input, len, ev.result);
+    for (Predicate pred : preds) {
+      const InsertPredClass cls = classify_inserted_predicate(
+          pred_arena_, &pred, input, len, ev.result);
+      if (cls == InsertPredClass::StructuralError) {
+        // Policy A: do not write a node; leave the frontier edge unexplored.
+        insert_structural_error += 1;
+        if (pred.error != PredError::None) {
+          opaque_by_error[static_cast<size_t>(pred.error)] += 1;
+          if (pred.error_op) opaque_by_op[pred.error_op] += 1;
+        }
+        opaque_by_cid[ev.cid] += 1;
+        if (diag_conflicts_) {
+          fprintf(stderr,
+                  "[pcbt-struct] InsertTrace stop cid=%u label=%u result=%u "
+                  "created=%u (convert/train mismatch)\n",
+                  ev.cid, ev.label, ev.result, created);
+        }
+        structural_stop = true;
+        break;
+      }
       Node new_node;
       new_node.cid = ev.cid;
       new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
@@ -368,17 +399,8 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.pred = pred;
       new_node.constraint = ev.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
-      if (pred.tautology) {
+      if (cls == InsertPredClass::Tautology) {
         num_tautology += 1;
-        if (pred.error != PredError::None) {
-          opaque_by_error[static_cast<size_t>(pred.error)] += 1;
-          if (pred.error_op) opaque_by_op[pred.error_op] += 1;
-        }
-      } else if (pred.opaque) {
-        num_opaque += 1;
-        opaque_by_error[static_cast<size_t>(pred.error)] += 1;
-        if (pred.error_op) opaque_by_op[pred.error_op] += 1;
-        opaque_by_cid[ev.cid] += 1;
       }
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) return created;
@@ -390,14 +412,12 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     }
   }
 
-  // The trace's last event terminates here. For a constraint event this
-  // records the pinned value's branch as terminal — the constraint node's
-  // dir-1 edge is explored the moment the node is created (either by the
-  // creating candidate's follow-up or by this terminal), so a later
-  // same-value candidate walks into the recorded edge and never admits on
-  // it. The value-fork direction (dir-0) of a chain node is untouched and
-  // stays unexplored.
-  node(parent).child[dir] = kTerminal;
+  // Close terminal only when the full remaining stream was inserted. A
+  // structural stop leaves the current edge unexplored so later candidates
+  // can still be admitted there once the model is fixed.
+  if (!structural_stop) {
+    node(parent).child[dir] = kTerminal;
+  }
   num_nodes += created;
   if (trace_depth > max_depth) max_depth = trace_depth;
   if (out_tail_node) *out_tail_node = parent;
@@ -457,6 +477,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   uint32_t created = 0;
   uint8_t dir = direction;
   NodeRef cur = parent;
+  bool structural_stop = false;
 
   // Diagnostics: count events with empty reads (label pollution candidates)
   static bool label_pollution_diagnostics = getenv("SYMAFL_LABEL_POLLUTION_DEBUG") != nullptr;
@@ -466,16 +487,17 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   static bool diagnostics_banner_printed = false;
 
   for (const Event &event : events) {
+    if (structural_stop) break;
     std::vector<Predicate> preds;
     if (event.count > 1) {
       conv.expand_fold(event.label, event.count, 0, &preds);
     } else {
       preds.push_back(conv.conv(event.label));
     }
-    for (const Predicate &raw_pred : preds) {
-      Predicate pred = classify_inserted_predicate(pred_arena_, raw_pred, input, len,
-                                           event.result);
+    for (Predicate pred : preds) {
       total_events_seen++;
+      const InsertPredClass cls = classify_inserted_predicate(
+          pred_arena_, &pred, input, len, event.result);
 
       if (!diagnostics_banner_printed) {
         if (label_pollution_diagnostics) {
@@ -484,7 +506,25 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
         diagnostics_banner_printed = true;
       }
 
-      if (!pred.opaque && pred.reads.empty() && !pred_has_len_kind(pred_arena_, pred)) {
+      if (cls == InsertPredClass::StructuralError) {
+        insert_structural_error += 1;
+        if (pred.error != PredError::None) {
+          opaque_by_error[static_cast<size_t>(pred.error)] += 1;
+          if (pred.error_op) opaque_by_op[pred.error_op] += 1;
+        }
+        opaque_by_cid[event.cid] += 1;
+        if (diag_conflicts_) {
+          fprintf(stderr,
+                  "[pcbt-struct] InsertSuffix stop cid=%u label=%u result=%u "
+                  "created=%u (convert/train mismatch)\n",
+                  event.cid, event.label, event.result, created);
+        }
+        structural_stop = true;
+        break;
+      }
+
+      if (cls == InsertPredClass::Tautology && pred.reads.empty() &&
+          !pred_has_len_kind(pred_arena_, pred)) {
         empty_reads_seen++;
         static FILE *poll_file = nullptr;
         static bool poll_file_checked = false;
@@ -505,16 +545,6 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
           fflush(poll_file);
           pollution_logged++;
         }
-        if (label_pollution_diagnostics && pollution_logged < 50) {
-          fprintf(stderr, "[label-pollution] #%u cid=%u label=%u result=%u\n",
-                  pollution_logged, event.cid, event.label, event.result);
-          fprintf(stderr, "  label_info: op=0x%x l1=%u l2=%u size=%u op1=%llu op2=%llu\n",
-                  table[event.label].op, table[event.label].l1, table[event.label].l2,
-                  table[event.label].size,
-                  (unsigned long long)table[event.label].op1.i,
-                  (unsigned long long)table[event.label].op2.i);
-          pollution_logged++;
-        }
       }
 
       Node new_node;
@@ -524,18 +554,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.pred = pred;
       new_node.constraint = event.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
-      if (pred.tautology) {
-        num_tautology += 1;
-        if (pred.error != PredError::None) {
-          opaque_by_error[static_cast<size_t>(pred.error)] += 1;
-          if (pred.error_op) opaque_by_op[pred.error_op] += 1;
-        }
-      } else if (pred.opaque) {
-        num_opaque += 1;
-        opaque_by_error[static_cast<size_t>(pred.error)] += 1;
-        if (pred.error_op) opaque_by_op[pred.error_op] += 1;
-        opaque_by_cid[event.cid] += 1;
-      }
+      if (cls == InsertPredClass::Tautology) num_tautology += 1;
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) return created;
       node(cur).child[dir] = next;
@@ -545,10 +564,10 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     }
   }
 
-  // The suffix's last event terminates here (see the InsertTrace tail
-  // comment): a constraint tail records the pinned value's branch as
-  // terminal — the constraint node's dir-1 edge is explored at creation.
-  node(cur).child[dir] = kTerminal;
+  // Terminal only if the full suffix was accepted (policy A).
+  if (!structural_stop) {
+    node(cur).child[dir] = kTerminal;
+  }
   num_nodes += created;
   if (node(cur).depth > max_depth) max_depth = node(cur).depth;
 
