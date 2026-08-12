@@ -95,6 +95,11 @@ struct my_mutator_t {
     if (probe_terminal_dir) ck_free(probe_terminal_dir);
     if (probe_rlimit_dir) ck_free(probe_rlimit_dir);
     if (forensics_dir) ck_free(forensics_dir);
+    if (anomaly_case_dir) ck_free(anomaly_case_dir);
+    if (anomaly_index) {
+      fclose(anomaly_index);
+      anomaly_index = nullptr;
+    }
     if (pair_log_path) ck_free(pair_log_path);
   }
 
@@ -254,6 +259,18 @@ struct my_mutator_t {
   uint64_t forensic_struct_seen = 0;
   uint64_t forensic_struct_captured = 0;
   uint64_t forensic_struct_suppressed = 0;
+  // Transport / hard-replay anomaly cases (entry_artifact, cid/dir/afterT/trunc).
+  // These must always dump the candidate input when a forensics dir or out_dir
+  // is available — without the bytes the counter is not actionable.
+  uint64_t forensic_entry_seen = 0;
+  uint64_t forensic_entry_captured = 0;
+  uint64_t forensic_entry_suppressed = 0;
+  uint64_t forensic_replay_seen = 0;
+  uint64_t forensic_replay_captured = 0;
+  uint64_t forensic_replay_suppressed = 0;
+  // Append-only index under forensics_dir (or <out_dir>/anomaly-cases).
+  FILE *anomaly_index = nullptr;
+  char *anomaly_case_dir = nullptr;
   // Saturation via probe-gain windows (SYMAFL_SAT_WINDOW / SYMAFL_SAT_MIN_GAINS,
   // default off): once a window of probe outcomes yields fewer than
   // sat_min_gains coverage gains, the vetoed population no longer carries
@@ -567,6 +584,44 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
             data->forensics_dir,
             (unsigned long long)data->forensic_limit);
   }
+  // Hard-anomaly case dump (entry_artifact, cid/dir/afterT/trunc). Prefer
+  // SYMAFL_FORENSICS_DIR/anomaly-cases; otherwise <out_dir>/anomaly-cases so
+  // REPLAY_ALL runs never lose the offending input.
+  {
+    char *case_dir = nullptr;
+    if (data->forensics_dir) {
+      case_dir = alloc_printf("%s/anomaly-cases", data->forensics_dir);
+    } else if (afl->out_dir && *afl->out_dir) {
+      case_dir = alloc_printf("%s/anomaly-cases", afl->out_dir);
+    }
+    if (case_dir) {
+      if (mkdir(case_dir, 0755) && errno != EEXIST) {
+        WARNF("cannot create anomaly case directory %s: %s\n", case_dir,
+              strerror(errno));
+        ck_free(case_dir);
+      } else {
+        data->anomaly_case_dir = case_dir;
+        char *index_path =
+            alloc_printf("%s/index.tsv", data->anomaly_case_dir);
+        data->anomaly_index = fopen(index_path, "a");
+        if (data->anomaly_index) {
+          // Header only when the file is empty (first open of a new run).
+          if (ftell(data->anomaly_index) == 0) {
+            fprintf(data->anomaly_index,
+                    "seq\treason\tinput_len\tpipe_bytes\tevents\t"
+                    "first_cid\tfirst_constraint\tkill_sig\ttimeout\t"
+                    "mode\tentry_cid\tentry_constraint\tpath\n");
+            fflush(data->anomaly_index);
+          }
+        }
+        ck_free(index_path);
+        fprintf(stderr,
+                "[pcbt] anomaly case dump: %s (entry/replay hard faults "
+                "save input+pipe+meta)\n",
+                data->anomaly_case_dir);
+      }
+    }
+  }
 
   if (getenv("SYMAFL_REPLAY_CHECK")) {
     data->replay_check = true;
@@ -816,13 +871,16 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->profile_insert_calls,
           (unsigned long long)data->profile_exec_ns,
           (unsigned long long)data->profile_exec_calls);
-  if (data->forensics_dir) {
+  if (data->forensics_dir || data->anomaly_case_dir) {
     fprintf(stderr,
-            "[pcbt-forensics] dir=%s opaque_seen=%llu opaque_captured=%llu "
-            "opaque_suppressed=%llu terminal_seen=%llu "
+            "[pcbt-forensics] dir=%s anomaly_dir=%s opaque_seen=%llu "
+            "opaque_captured=%llu opaque_suppressed=%llu terminal_seen=%llu "
             "terminal_captured=%llu terminal_suppressed=%llu "
-            "struct_seen=%llu struct_captured=%llu struct_suppressed=%llu\n",
-            data->forensics_dir,
+            "struct_seen=%llu struct_captured=%llu struct_suppressed=%llu "
+            "entry_seen=%llu entry_captured=%llu entry_suppressed=%llu "
+            "replay_seen=%llu replay_captured=%llu replay_suppressed=%llu\n",
+            data->forensics_dir ? data->forensics_dir : "(none)",
+            data->anomaly_case_dir ? data->anomaly_case_dir : "(none)",
             (unsigned long long)data->forensic_opaque_seen,
             (unsigned long long)data->forensic_opaque_captured,
             (unsigned long long)data->forensic_opaque_suppressed,
@@ -831,7 +889,13 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
             (unsigned long long)data->forensic_terminal_suppressed,
             (unsigned long long)data->forensic_struct_seen,
             (unsigned long long)data->forensic_struct_captured,
-            (unsigned long long)data->forensic_struct_suppressed);
+            (unsigned long long)data->forensic_struct_suppressed,
+            (unsigned long long)data->forensic_entry_seen,
+            (unsigned long long)data->forensic_entry_captured,
+            (unsigned long long)data->forensic_entry_suppressed,
+            (unsigned long long)data->forensic_replay_seen,
+            (unsigned long long)data->forensic_replay_captured,
+            (unsigned long long)data->forensic_replay_suppressed);
   }
   if (t.insert_structural_error) {
     fprintf(stderr,
@@ -1161,6 +1225,10 @@ static void dump_label_dag(dfsan_label root) {
   }
 }
 
+static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
+                                 const std::vector<pcbt::Event> &events,
+                                 const u8 *input, size_t input_len);
+
 static bool replay_check_trace(my_mutator_t *data,
                                const std::vector<pcbt::Event> &events,
                                const u8 *buf, size_t buf_size,
@@ -1183,26 +1251,38 @@ static bool replay_check_trace(my_mutator_t *data,
     data->replay_run_done = false;
     return true;
   }
-  // Entry-fork / empty-capture artifact guard (restored from aeda20e).
-  // Every real full capture starts with the entry constraint (fread length
-  // fork, typically cid 1). Empty events with non-empty input, or a first
-  // event that is not a constraint, is a stale/partial pipe or taint-file
-  // registration failure — not a tree decision omission. Skip without
-  // inflating truncated/conflicts.
+  // Entry-fork / empty-capture artifact guard (restored from aeda20e,
+  // broadened). Transport defects, not tree decision omissions:
+  //   (1) empty full stream with non-empty input (taint not registered, mode
+  //       OFF, or pipe write never happened) — always quarantine;
+  //   (2) non-empty full stream whose first event is not a constraint while
+  //       the learned tree entry is a constraint (stale/partial pipe).
+  // Always dump the candidate input + raw pipe into anomaly-cases so the
+  // counter is reproducible offline.
   if (!is_suffix) {
     const pcbt::NodeRef entry = data->tree.root_child0();
-    if (entry != pcbt::kUnexplored && entry != pcbt::kTerminal &&
-        data->tree.is_constraint(entry)) {
-      if ((events.empty() && buf_size > 0) ||
-          (!events.empty() && !events.front().constraint)) {
-        data->replay_entry_artifact += 1;
-        WARNF("[pcbt-replay] entry-fork artifact: first event cid=%u "
-              "constraint=%u events=%zu vs entry cid=%u constraint=1; skip\n",
-              events.empty() ? 0 : events.front().cid,
-              events.empty() ? 0u : (events.front().constraint ? 1u : 0u),
-              events.size(), data->tree.cid_of(entry));
-        return true;
-      }
+    const bool have_entry =
+        entry != pcbt::kUnexplored && entry != pcbt::kTerminal;
+    const bool entry_is_constraint =
+        have_entry && data->tree.is_constraint(entry);
+    const bool empty_nonempty_input = events.empty() && buf_size > 0;
+    const bool first_not_constraint =
+        entry_is_constraint && !events.empty() && !events.front().constraint;
+    if (empty_nonempty_input || first_not_constraint) {
+      data->replay_entry_artifact += 1;
+      WARNF("[pcbt-replay] entry-fork artifact: first event cid=%u "
+            "constraint=%u events=%zu vs entry cid=%u entry_constraint=%d; "
+            "pipe_bytes=%zu kill_sig=%u timeout=%u; skip\n",
+            events.empty() ? 0 : events.front().cid,
+            events.empty() ? 0u : (events.front().constraint ? 1u : 0u),
+            events.size(),
+            have_entry ? data->tree.cid_of(entry) : 0u,
+            entry_is_constraint ? 1 : 0, data->afl->fsrv.sym_trace_len,
+            data->afl->fsrv.last_kill_signal,
+            data->afl->fsrv.last_run_timed_out);
+      (void)capture_anomaly_case(data, "entry-artifact", events, buf,
+                                 buf_size);
+      return true;
     }
   }
   // A full capture must validate an empty stream against the learned tree:
@@ -1233,21 +1313,26 @@ static bool replay_check_trace(my_mutator_t *data,
   // an unverified path; the divergence is a collection/derivation defect to
   // diagnose, not something the tree should learn around.
   const char *err_name = "unknown";
+  const char *case_reason = "replay-mismatch";
   switch (report.error) {
     case pcbt::Tree::ReplayError::CidMismatch:
       err_name = "cid_mismatch";
+      case_reason = "cid-mismatch";
       data->replay_cid_mismatch += 1;
       break;
     case pcbt::Tree::ReplayError::DirectionMismatch:
       err_name = "direction_mismatch";
+      case_reason = "dir-mismatch";
       data->replay_direction_mismatch += 1;
       break;
     case pcbt::Tree::ReplayError::AfterTerminal:
       err_name = "after_terminal";
+      case_reason = "after-terminal";
       data->replay_after_terminal += 1;
       break;
     case pcbt::Tree::ReplayError::TruncatedTrace:
       err_name = "truncated";
+      case_reason = "truncated";
       data->replay_truncated += 1;
       break;
     default: break;
@@ -1333,6 +1418,8 @@ static bool replay_check_trace(my_mutator_t *data,
       dump_label_dag(ev.label);
     }
   }
+  // Dump the candidate so hard-gate counters are always offline-reproducible.
+  (void)capture_anomaly_case(data, case_reason, events, buf, buf_size);
   return false;  // discard mismatched trace
 }
 
@@ -1363,6 +1450,142 @@ static void write_forensic_input(const std::string &path, const u8 *input,
   if (fd < 0) PFATAL("cannot create forensic input %s", path.c_str());
   if (input_len) ck_write(fd, const_cast<u8 *>(input), input_len, path.c_str());
   close(fd);
+}
+
+// Persist a hard-anomaly test case so counters are always actionable.
+// Writes under anomaly_case_dir:
+//   case-NNNNNN-<reason>-input.bin
+//   case-NNNNNN-<reason>-pipe.bin   (raw drained bytes; may be empty)
+//   case-NNNNNN-<reason>-events.tsv
+//   case-NNNNNN-<reason>-meta.txt
+//   index.tsv (append one row)
+// Entry-artifact cases use a high limit (default max(forensic_limit, 64));
+// replay mismatches share the same budget so rare faults are not dropped.
+static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
+                                 const std::vector<pcbt::Event> &events,
+                                 const u8 *input, size_t input_len) {
+  if (!data->anomaly_case_dir) return false;
+
+  const bool is_entry = (strcmp(reason, "entry-artifact") == 0);
+  uint64_t *seen = is_entry ? &data->forensic_entry_seen
+                            : &data->forensic_replay_seen;
+  uint64_t *captured = is_entry ? &data->forensic_entry_captured
+                                : &data->forensic_replay_captured;
+  uint64_t *suppressed = is_entry ? &data->forensic_entry_suppressed
+                                  : &data->forensic_replay_suppressed;
+  // Entry artifacts are rare (1–2 / 40k) — keep more dumps than generic
+  // opaque/struct snapshots.
+  const uint64_t limit =
+      is_entry ? (data->forensic_limit < 64 ? 64 : data->forensic_limit)
+               : data->forensic_limit;
+  *seen += 1;
+  if (*captured >= limit) {
+    *suppressed += 1;
+    return false;
+  }
+
+  const uint64_t sequence = data->forensic_seq++;
+  char *base = alloc_printf("%s/case-%06llu-%s", data->anomaly_case_dir,
+                            (unsigned long long)sequence, reason);
+  std::string input_path = std::string(base) + "-input.bin";
+  std::string pipe_path = std::string(base) + "-pipe.bin";
+  std::string events_path = std::string(base) + "-events.tsv";
+  std::string meta_path = std::string(base) + "-meta.txt";
+
+  write_forensic_input(input_path, input, input_len);
+
+  // Raw pipe bytes for the just-finished child (may be empty for true empty
+  // streams; non-empty with empty decoded events indicates decode failure).
+  {
+    afl_forkserver_t *fsrv = &data->afl->fsrv;
+    int pfd = open(pipe_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (pfd >= 0) {
+      if (fsrv->sym_trace_buf && fsrv->sym_trace_len) {
+        ck_write(pfd, fsrv->sym_trace_buf, fsrv->sym_trace_len,
+                 pipe_path.c_str());
+      }
+      close(pfd);
+    }
+  }
+
+  FILE *event_file = fopen(events_path.c_str(), "w");
+  if (event_file) {
+    fprintf(event_file, "index\tcid\tlabel\tresult\tconstraint\tcount\n");
+    for (size_t i = 0; i < events.size(); ++i) {
+      const pcbt::Event &ev = events[i];
+      fprintf(event_file, "%zu\t%u\t%u\t%u\t%u\t%u\n", i, ev.cid, ev.label,
+              ev.result, ev.constraint, ev.count);
+    }
+    fclose(event_file);
+  }
+
+  const uint32_t mode =
+      data->single_pass_control
+          ? __atomic_load_n(&data->single_pass_control->mode, __ATOMIC_ACQUIRE)
+          : 0u;
+  const char *mode_name =
+      mode == SYMAFL_TRACE_FULL_STREAM   ? "full"
+      : mode == SYMAFL_TRACE_SUFFIX_SHM  ? "shm-suffix"
+      : mode == SYMAFL_TRACE_SUFFIX_PIPE ? "pipe-suffix"
+                                         : "off";
+  const pcbt::NodeRef entry = data->tree.root_child0();
+  const uint32_t entry_cid =
+      (entry != pcbt::kUnexplored && entry != pcbt::kTerminal)
+          ? data->tree.cid_of(entry)
+          : 0u;
+  const int entry_constraint =
+      (entry != pcbt::kUnexplored && entry != pcbt::kTerminal)
+          ? (data->tree.is_constraint(entry) ? 1 : 0)
+          : -1;
+  const uint32_t first_cid = events.empty() ? 0 : events.front().cid;
+  const uint32_t first_constraint =
+      events.empty() ? 0u : (events.front().constraint ? 1u : 0u);
+  const size_t pipe_bytes = data->afl->fsrv.sym_trace_len;
+  const uint32_t kill_sig = data->afl->fsrv.last_kill_signal;
+  const uint32_t timed_out = data->afl->fsrv.last_run_timed_out;
+
+  FILE *meta_file = fopen(meta_path.c_str(), "w");
+  if (meta_file) {
+    fprintf(meta_file, "snapshot_version=1\nreason=%s\nsequence=%llu\n",
+            reason, (unsigned long long)sequence);
+    fprintf(meta_file, "input=%s\npipe=%s\nevents=%s\n", input_path.c_str(),
+            pipe_path.c_str(), events_path.c_str());
+    fprintf(meta_file,
+            "input_len=%zu\npipe_bytes=%zu\nevents=%zu\n"
+            "first_cid=%u\nfirst_constraint=%u\n"
+            "kill_sig=%u\ntimeout=%u\nmode=%s\nmode_raw=%u\n"
+            "entry_cid=%u\nentry_constraint=%d\n"
+            "armed=%u\nbootstrap_done=%u\nreplay_all=%u\n",
+            input_len, pipe_bytes, events.size(), first_cid, first_constraint,
+            kill_sig, timed_out, mode_name, mode, entry_cid, entry_constraint,
+            data->single_pass_armed ? 1u : 0u, data->bootstrap_done ? 1u : 0u,
+            data->replay_all ? 1u : 0u);
+    // Hex head of input for quick grep without opening the bin.
+    size_t shown = input_len < 64 ? input_len : 64;
+    fprintf(meta_file, "input_hex=");
+    for (size_t k = 0; k < shown; ++k)
+      fprintf(meta_file, "%02x", input ? input[k] : 0);
+    fprintf(meta_file, "%s\n", shown < input_len ? " TRUNC" : "");
+    fclose(meta_file);
+  }
+
+  if (data->anomaly_index) {
+    fprintf(data->anomaly_index,
+            "%llu\t%s\t%zu\t%zu\t%zu\t%u\t%u\t%u\t%u\t%s\t%u\t%d\t%s\n",
+            (unsigned long long)sequence, reason, input_len, pipe_bytes,
+            events.size(), first_cid, first_constraint, kill_sig, timed_out,
+            mode_name, entry_cid, entry_constraint, input_path.c_str());
+    fflush(data->anomaly_index);
+  }
+
+  *captured += 1;
+  WARNF("[pcbt-anomaly] reason=%s case=%s input_len=%zu pipe_bytes=%zu "
+        "events=%zu first_cid=%u first_constraint=%u kill=%u timeout=%u "
+        "mode=%s\n",
+        reason, base, input_len, pipe_bytes, events.size(), first_cid,
+        first_constraint, kill_sig, timed_out, mode_name);
+  ck_free(base);
+  return true;
 }
 
 // Persist the current candidate's raw event stream and the complete label DAG
@@ -1805,13 +2028,18 @@ static char *save_probe_case(my_mutator_t *data, const u8 *buf, size_t len,
   return path;
 }
 
-// The bootstrap input is AFL's .cur_input; replay validation needs its real
-// bytes and length (Len nodes evaluate against the candidate length, so a
-// null buffer / zero length mispredicts length-boundary predicates).
+// The bootstrap input is AFL's candidate file; replay validation needs its
+// real bytes and length (Len nodes evaluate against the candidate length, so
+// a null buffer / zero length mispredicts length-boundary predicates).
+// Prefer fsrv.out_file (correct under AFL_TMPDIR); fall back to
+// <out_dir>/.cur_input for the common default layout.
 static bool read_cur_input(my_mutator_t *data, std::vector<u8> *buf) {
+  if (data->afl->fsrv.out_file && *data->afl->fsrv.out_file) {
+    if (read_queue_file((const char *)data->afl->fsrv.out_file, buf)) {
+      return true;
+    }
+  }
   if (!data->afl->out_dir) return false;
-  // AFL++ points out_dir at the per-fuzzer working directory (which ends in
-  // "/default" for a single fuzzer); .cur_input lives directly in it.
   char *path = alloc_printf("%s/.cur_input", data->afl->out_dir);
   bool ok = read_queue_file(path, buf);
   ck_free(path);

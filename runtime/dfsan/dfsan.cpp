@@ -1825,7 +1825,27 @@ taint_set_file(int dirfd, const char *filename, int fd) {
     path[len] = '\0';
   }
   realpath(filename, path);
-  if (internal_strcmp(tainted.filename, path) == 0) {
+  bool match = (internal_strcmp(tainted.filename, path) == 0);
+  // SymAFL/AFL++: scripts usually set taint_file=<out>/.cur_input while
+  // AFL may write the candidate to AFL_TMPDIR/.cur_input (or another
+  // tmp_dir). Realpath strings then differ and the open never registers,
+  // producing empty full-stream captures (pipe_bytes=0, events=0, kill=0).
+  // When both basenames are the AFL candidate name (.cur_input[.ext]), treat
+  // them as the same taint source. This is safe for single-target forkserver
+  // mode: only one .cur_input is live per run.
+  if (!match && tainted.filename[0] && path[0]) {
+    const char *tbase = internal_strrchr(tainted.filename, '/');
+    tbase = tbase ? tbase + 1 : tainted.filename;
+    const char *pbase = internal_strrchr(path, '/');
+    pbase = pbase ? pbase + 1 : path;
+    if (internal_strcmp(tbase, pbase) == 0 &&
+        (internal_strncmp(tbase, ".cur_input", 10) == 0)) {
+      match = true;
+      AOUT("taint_set_file: basename match %s <-> %s\n", tainted.filename,
+           path);
+    }
+  }
+  if (match) {
     tainted.fd = fd;
     AOUT("fd:%d created\n", fd);
   }
