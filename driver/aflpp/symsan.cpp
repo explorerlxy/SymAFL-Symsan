@@ -164,6 +164,11 @@ struct my_mutator_t {
   uint64_t replay_after_terminal = 0;
   uint64_t replay_truncated = 0;
   uint64_t replay_timeout_skipped = 0;
+  // Full-stream capture artifacts: empty event list (taint/capture not armed)
+  // or first event is not the entry constraint. Counted separately from
+  // truncated decision-omission so hard-gate zeroing is not poisoned by
+  // transport defects (see aeda20e entry-fork guard).
+  uint64_t replay_entry_artifact = 0;
   uint64_t replay_frontier_match = 0;
   uint64_t replay_terminal_match = 0;
 
@@ -872,7 +877,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   fprintf(stderr,
           "[pcbt-replay] checked=%llu cid_mismatch=%llu dir_mismatch=%llu "
           "after_terminal=%llu truncated=%llu frontier_match=%llu "
-          "terminal_match=%llu timeout_skipped=%llu\n",
+          "terminal_match=%llu timeout_skipped=%llu entry_artifact=%llu\n",
           (unsigned long long)data->replay_checked,
           (unsigned long long)data->replay_cid_mismatch,
           (unsigned long long)data->replay_direction_mismatch,
@@ -880,7 +885,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->replay_truncated,
           (unsigned long long)data->replay_frontier_match,
           (unsigned long long)data->replay_terminal_match,
-          (unsigned long long)data->replay_timeout_skipped);
+          (unsigned long long)data->replay_timeout_skipped,
+          (unsigned long long)data->replay_entry_artifact);
   fprintf(stderr,
           "[pcbt-opaque] invalid_root=%llu invalid_label=%llu initializing_label=%llu "
           "invalid_width=%llu depth_limit=%llu bad_load=%llu bad_concat=%llu "
@@ -1176,6 +1182,28 @@ static bool replay_check_trace(my_mutator_t *data,
   if (data->replay_run_done) {
     data->replay_run_done = false;
     return true;
+  }
+  // Entry-fork / empty-capture artifact guard (restored from aeda20e).
+  // Every real full capture starts with the entry constraint (fread length
+  // fork, typically cid 1). Empty events with non-empty input, or a first
+  // event that is not a constraint, is a stale/partial pipe or taint-file
+  // registration failure — not a tree decision omission. Skip without
+  // inflating truncated/conflicts.
+  if (!is_suffix) {
+    const pcbt::NodeRef entry = data->tree.root_child0();
+    if (entry != pcbt::kUnexplored && entry != pcbt::kTerminal &&
+        data->tree.is_constraint(entry)) {
+      if ((events.empty() && buf_size > 0) ||
+          (!events.empty() && !events.front().constraint)) {
+        data->replay_entry_artifact += 1;
+        WARNF("[pcbt-replay] entry-fork artifact: first event cid=%u "
+              "constraint=%u events=%zu vs entry cid=%u constraint=1; skip\n",
+              events.empty() ? 0 : events.front().cid,
+              events.empty() ? 0u : (events.front().constraint ? 1u : 0u),
+              events.size(), data->tree.cid_of(entry));
+        return true;
+      }
+    }
   }
   // A full capture must validate an empty stream against the learned tree:
   // an empty child trace can be truncated before the next learned event. A

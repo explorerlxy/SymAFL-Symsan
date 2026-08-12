@@ -2236,53 +2236,36 @@ static bool eval_fp_binary(PKind kind, uint16_t bits, uint64_t a, uint64_t b,
   }
   return true;
 }
-// True when the arena subtree contains a frozen 48/64-bit absolute address
-// constant (training-run stack/heap base). Used by train calibration to
-// recognize incomplete pointer-diff models.
-static bool subtree_has_abs_addr(const PredArena &arena, uint32_t root) {
-  if (root == kNoChild || root == kInvalidNode || root >= arena.nodes.size())
-    return false;
-  std::vector<uint32_t> stack = {root};
-  std::unordered_set<uint32_t> seen;
-  while (!stack.empty()) {
-    uint32_t idx = stack.back();
-    stack.pop_back();
-    if (idx == kNoChild || idx >= arena.nodes.size() ||
-        !seen.insert(idx).second)
-      continue;
-    const PNode &nd = arena.nodes[idx];
-    if (is_abs_addr_const(nd)) return true;
-    if (nd.a != kNoChild) stack.push_back(nd.a);
-    if (nd.b != kNoChild) stack.push_back(nd.b);
-  }
-  return false;
-}
-
 }  // namespace
 
-static bool label_dag_has_abs_addr(const dfsan_label_info *table, size_t n,
-                                   uint32_t root_label) {
-  if (table == nullptr || root_label == 0 || root_label >= n) return false;
-  std::vector<uint32_t> stack = {root_label};
-  std::unordered_set<uint32_t> seen;
-  while (!stack.empty()) {
-    uint32_t lab = stack.back();
-    stack.pop_back();
-    if (lab == 0 || lab >= n || !seen.insert(lab).second) continue;
-    const dfsan_label_info &info = table[lab];
-    auto is_abs = [](uint64_t v) {
-      return v > 0xFFFFFFFFULL && v < (~uint64_t{0} - 0xFFFFULL);
-    };
-    // Frozen stack/heap bases appear as concrete op values on Add/Sub/PtrToInt.
-    const uint16_t op_lo = info.op & 0xff;
-    if ((op_lo == Add || op_lo == Sub || op_lo == PtrToInt ||
-         op_lo == IntToPtr) &&
-        (is_abs(info.op1.i) || is_abs(info.op2.i)))
-      return true;
-    if (info.l1) stack.push_back(info.l1);
-    if (info.l2) stack.push_back(info.l2);
+// Concrete bit-vector comparison for the captured ICmp operands (masked to
+// the predicate width). Used as a train-calibration safety gate: only repair
+// models when the runtime-captured op1/op2 already realize expected_result.
+static bool concrete_rel_dir(PKind kind, uint64_t a, uint64_t b,
+                             uint16_t bits) {
+  const uint64_t mask =
+      bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+  a &= mask;
+  b &= mask;
+  auto as_signed = [&](uint64_t v) -> int64_t {
+    if (bits == 64) return static_cast<int64_t>(v);
+    const uint64_t sign = uint64_t{1} << (bits - 1);
+    if (v & sign) return static_cast<int64_t>(v | ~mask);
+    return static_cast<int64_t>(v);
+  };
+  switch (kind) {
+    case PKind::Equal: return a == b;
+    case PKind::Distinct: return a != b;
+    case PKind::Ult: return a < b;
+    case PKind::Ule: return a <= b;
+    case PKind::Ugt: return a > b;
+    case PKind::Uge: return a >= b;
+    case PKind::Slt: return as_signed(a) < as_signed(b);
+    case PKind::Sle: return as_signed(a) <= as_signed(b);
+    case PKind::Sgt: return as_signed(a) > as_signed(b);
+    case PKind::Sge: return as_signed(a) >= as_signed(b);
+    default: return false;
   }
-  return false;
 }
 
 bool calibrate_pointer_train_pred(PredArena &arena, Predicate *pred,
@@ -2307,13 +2290,17 @@ bool calibrate_pointer_train_pred(PredArena &arena, Predicate *pred,
   if (root.a == kNoChild || root.b == kNoChild ||
       root.a >= arena.nodes.size() || root.b >= arena.nodes.size())
     return false;
-  // Only calibrate incomplete pointer models. Abs may already have been
-  // cancelled from the converted arena; the source label DAG still shows it.
-  const bool arena_abs = subtree_has_abs_addr(arena, root.a) ||
-                         subtree_has_abs_addr(arena, root.b);
-  const bool source_abs =
-      label_dag_has_abs_addr(table, table_labels, source_label);
-  if (!arena_abs && !source_abs) return false;
+
+  const uint16_t bits = root.bits ? root.bits : 64;
+  if (bits == 0 || bits > 64) return false;
+
+  // Safety: only calibrate when the runtime-captured concrete operands
+  // already agree with the wire result. That means we are repairing an
+  // incomplete symbolic model (abs base residual, lost FSE taint, const vs
+  // residual ugt, ...), not inventing a train direction.
+  const bool concrete_true =
+      concrete_rel_dir(root.kind, concrete_op1, concrete_op2, bits);
+  if (concrete_true != (expected_result != 0)) return false;
 
   auto eval_side = [&](uint32_t node, uint64_t *out) -> bool {
     Predicate side;
@@ -2323,13 +2310,14 @@ bool calibrate_pointer_train_pred(PredArena &arena, Predicate *pred,
   uint64_t va = 0, vb = 0;
   if (!eval_side(root.a, &va) || !eval_side(root.b, &vb)) return false;
 
-  const uint16_t bits = root.bits ? root.bits : 64;
-  if (bits == 0 || bits > 64) return false;
   const uint64_t mask =
       bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
   const uint64_t da = (concrete_op1 - va) & mask;
   const uint64_t db = (concrete_op2 - vb) & mask;
   if (da == 0 && db == 0) return false;  // already concrete-aligned
+  (void)table;
+  (void)table_labels;
+  (void)source_label;
 
   // Append Const/Add for each side that needs a delta, then a new comparison
   // root (post-order: children before parent).
