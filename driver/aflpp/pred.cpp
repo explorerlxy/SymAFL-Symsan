@@ -143,6 +143,7 @@ static bool subtree_input_free(const PredArena &arena, uint32_t root) {
       case PKind::Count:
       case PKind::CountNeg1:
       case PKind::CountElems:
+      case PKind::Crc32:
       case PKind::Opaque:
         return false;
       default:
@@ -1180,6 +1181,61 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     return add(kind, size, a, b);
   }
 
+  // IEEE CRC-32 over a contiguous input range (lzma_crc32 custom wrapper).
+  // l1 = buffer content label; op1 = init CRC; op2 = byte count; size = 32.
+  if (op == __dfsan::fcrc32) {
+    const uint32_t nbytes = static_cast<uint32_t>(info->op2.i);
+    if (nbytes == 0 || nbytes > 256 || info->size != 32) {
+      fail(PredError::InvalidWidth, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    uint32_t base = 0;
+    auto recover_base = [&](dfsan_label content, uint32_t *out_base) -> bool {
+      if (content == 0 || content >= table_labels_) return false;
+      const dfsan_label_info &ci = table_[content];
+      const uint16_t cop = ci.op & 0xff;
+      if (ci.op == 0) {
+        // Single raw input byte.
+        *out_base = static_cast<uint32_t>(ci.op1.i);
+        return true;
+      }
+      if (cop == Load) {
+        // Shape load: l1 = first byte label, l2 = byte count.
+        if (ci.l1 == 0 || ci.l1 >= table_labels_) return false;
+        if (table_[ci.l1].op != 0) return false;
+        *out_base = static_cast<uint32_t>(table_[ci.l1].op1.i);
+        return true;
+      }
+      // Concat of consecutive raw bytes: take the low (first) leaf offset.
+      if (cop == __dfsan::Concat) {
+        dfsan_label cur = content;
+        for (int depth = 0; depth < 32; ++depth) {
+          if (cur == 0 || cur >= table_labels_) return false;
+          const dfsan_label_info &n = table_[cur];
+          if (n.op == 0) {
+            *out_base = static_cast<uint32_t>(n.op1.i);
+            return true;
+          }
+          if ((n.op & 0xff) == Load && n.l1 != 0 && n.l1 < table_labels_ &&
+              table_[n.l1].op == 0) {
+            *out_base = static_cast<uint32_t>(table_[n.l1].op1.i);
+            return true;
+          }
+          if ((n.op & 0xff) != __dfsan::Concat || n.l1 == 0) return false;
+          cur = n.l1;
+        }
+      }
+      return false;
+    };
+    if (!recover_base(info->l1, &base)) {
+      fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
+      return kInvalidNode;
+    }
+    uint32_t init_n = add_const(info->op1.i & 0xFFFFFFFFull, 32);
+    uint32_t len_n = add_const(nbytes, 32);
+    if (init_n == kInvalidNode || len_n == kInvalidNode) return kInvalidNode;
+    return add(PKind::Crc32, 32, init_n, len_n, base);
+  }
   // Input-length boundary ops (flen_* / fsize): length-aware leaf nodes.
   // Their comparison semantics flow through the regular ICmp machinery
   // (EofRead's missing value is EOF, Count-family is a pure len function).
@@ -1915,6 +1971,13 @@ Predicate RunConverter::conv(uint32_t label) {
     const PNode &nd = arena_->nodes[i];
     if (nd.kind == PKind::Read)
       pred.reads.emplace_back((uint32_t)nd.value, nd.bits / 8);
+    else if (nd.kind == PKind::Crc32 && nd.b != kNoChild &&
+             nd.b < arena_->nodes.size() &&
+             arena_->nodes[nd.b].kind == PKind::Const) {
+      // value=base offset, b=Const(nbytes)
+      pred.reads.emplace_back((uint32_t)nd.value,
+                              (uint32_t)arena_->nodes[nd.b].value);
+    }
     if (nd.a != kNoChild) stack.push_back(nd.a);
     if (nd.b != kNoChild) stack.push_back(nd.b);
   }
@@ -2485,6 +2548,22 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
         break;
       }
       case PKind::Const: v = mask_bits(nd.value, bits); break;
+      case PKind::Crc32: {
+        // a = init CRC, b = nbytes, value = base input offset.
+        if (bits != 32 || b == 0 || b > 256) return false;
+        const uint32_t base = static_cast<uint32_t>(nd.value);
+        const uint32_t nbytes = static_cast<uint32_t>(b);
+        if (base > len || nbytes > len - base) return false;
+        uint32_t c = ~static_cast<uint32_t>(a);
+        for (uint32_t i = 0; i < nbytes; ++i) {
+          c ^= input[base + i];
+          for (int j = 0; j < 8; ++j)
+            c = (c >> 1) ^
+                (0xEDB88320u & static_cast<uint32_t>(-(int32_t)(c & 1u)));
+        }
+        v = ~c;
+        break;
+      }
       case PKind::Add: v = mask_bits(a + b, bits); break;
       case PKind::Sub: v = mask_bits(a - b, bits); break;
       case PKind::Mul: v = mask_bits(a * b, bits); break;

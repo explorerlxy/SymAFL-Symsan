@@ -724,6 +724,11 @@ fun:TcmallocSlab_Internal_PopBatch_FixedShift=discard
 fun:TcmallocSlab_Internal_PopBatch_FixedShift_VCPU=uninstrumented
 fun:TcmallocSlab_Internal_PopBatch_FixedShift_VCPU=discard
 
+# liblzma CRC: constant table loads drop return taint and freeze stream/block
+# header CRC icmps as ne(const_train, field). Custom wrapper builds fcrc32.
+fun:lzma_crc32=uninstrumented
+fun:lzma_crc32=custom
+
 # Ignores the dfsan wrappers.
 fun:__dfsw_*=uninstrumented
 fun:__dfsw_*=discard

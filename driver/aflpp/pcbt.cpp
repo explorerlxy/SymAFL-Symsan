@@ -117,6 +117,7 @@ const char *pkind_name(PKind kind) {
     case PKind::Count: return "count";
     case PKind::CountNeg1: return "countneg1";
     case PKind::CountElems: return "countelems";
+    case PKind::Crc32: return "crc32";
   }
   return "?";
 }

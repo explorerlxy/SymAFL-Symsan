@@ -338,7 +338,14 @@ enum operators {
   // fstrcmp, it returns the sign of the first differing byte; the converter
   // lowers it with ASCII tolower folding instead of the plain byte equality.
   fstrcasecmp     = last_llvm_op + 53, // 120
-  LastOp          = last_llvm_op + 54, // 121
+  // IEEE CRC-32 over a contiguous input range (lzma_crc32 / zlib crc32-style
+  // custom wrappers). size is the result width (32); op1 is the init CRC
+  // before the standard complement; op2 is the hashed byte count; l1 holds
+  // the buffer content label used to recover the base input offset. Without
+  // this op, constant CRC table loads drop the return shadow and freeze the
+  // comparison as ne(const_train_crc, stored_field).
+  fcrc32          = last_llvm_op + 54, // 121
+  LastOp          = last_llvm_op + 55, // 122
 };
 
 // fmemcmp and the fstrcmp family keep their base opcode in the low byte. The

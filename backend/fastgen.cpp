@@ -246,10 +246,10 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
 
   // SymAFL v2: pin the tainted index to its observed concrete value so the
   // PCBT diverges when a mutated input selects a different array element.
-  // Reuses cond_type + PKind::Equal (bveq); PCBT consumes it as an ordinary
-  // branch node (result is always 1 for the traced run). Emitted through
-  // __taint_send_cond (all transport modes), unlike the gep pipe frame which
-  // is suppressed under SUFFIX_SHM by IsTraceStreamEnabled().
+  // Reuses cond_type + PKind::equal (bveq); result is always 1 for the
+  // traced run. Multiple GEPs (multi-index or load+store of a[i]+=f(a[i]))
+  // correctly produce multiple constraint nodes: each access is a symbolic
+  // data-state step. Do not collapse or suppress these as "duplicate noise".
   if (flags().taint_trace_addr_cond) {
     dfsan_label_info *idx_info = get_label_info(index_label);
     uint16_t width = idx_info->size;

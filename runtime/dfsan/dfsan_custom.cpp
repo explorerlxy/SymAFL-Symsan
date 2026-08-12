@@ -1094,6 +1094,58 @@ void *__dfsw_memset(void *s, int c, size_t n,
 }
 #endif // USE_UCSAN_CUSTOM
 
+// IEEE CRC-32 (poly 0xEDB88320), matching liblzma/zlib bit order. Self-
+// contained so the runtime does not depend on linking liblzma.
+static uint32_t symafl_crc32_ieee(const uint8_t *buf, size_t size,
+                                  uint32_t crc) {
+  crc = ~crc;
+  for (size_t i = 0; i < size; ++i) {
+    crc ^= buf[i];
+    for (int j = 0; j < 8; ++j)
+      crc = (crc >> 1) ^ (0xEDB88320u & (uint32_t)(-(int32_t)(crc & 1u)));
+  }
+  return ~crc;
+}
+
+// Cap symbolic CRC expansion: stream/block headers are small; multi-MB
+// payload CRCs stay unlabeled (same as the previous table-load hole) rather
+// than building huge fcrc32 regions.
+static constexpr size_t kFcrc32MaxBytes = 256;
+
+// liblzma public API: uint32_t lzma_crc32(const uint8_t *buf, size_t size,
+//                                        uint32_t crc). Marked custom in
+// done_abilist so instrumented call sites become this wrapper; the real
+// body is left uninstrumented and is not invoked (we recompute concretely).
+SANITIZER_INTERFACE_ATTRIBUTE
+uint32_t __dfsw_lzma_crc32(const uint8_t *buf, size_t size, uint32_t crc,
+                           dfsan_label buf_label, dfsan_label size_label,
+                           dfsan_label crc_label, dfsan_label *ret_label) {
+  (void)buf_label;
+  (void)size_label;
+  const uint32_t ret = (buf != nullptr || size == 0)
+                           ? symafl_crc32_ieee(buf, size, crc)
+                           : 0;
+  // Symbolic init CRCs are rare for xz (always 0 at stream/block headers).
+  // Leave unlabeled rather than inventing a wrong composition.
+  if (crc_label != 0 && crc_label != kInitializingLabel) {
+    *ret_label = 0;
+    return ret;
+  }
+  if (size == 0 || size > kFcrc32MaxBytes || buf == nullptr) {
+    *ret_label = 0;
+    return ret;
+  }
+  dfsan_label content = dfsan_read_label(buf, size);
+  if (content == 0 || content == kInitializingLabel) {
+    *ret_label = 0;
+    return ret;
+  }
+  // fcrc32: result width 32, op1 = init CRC, op2 = byte count, l1 = content
+  // used by the converter to recover the base input offset.
+  *ret_label = dfsan_union(content, 0, __dfsan::fcrc32, 32, crc, (uint64_t)size);
+  return ret;
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE
 int __dfsw_tolower(int c, dfsan_label c_label, dfsan_label *ret_label) {
   int ret = tolower(c);

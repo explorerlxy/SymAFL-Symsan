@@ -53,6 +53,10 @@ enum class PKind : uint8_t {
   CountElems, // value=pre-read pos, a=nmemb expression (or Const fallback),
               // b=Const(item size); eval = len <= pos ? 0 :
               // min((len - pos) / size, nmemb)
+  // IEEE CRC-32 over input[value .. value+b): a=Const(init_crc), b=nbytes.
+  // Eval recomputes the poly on the candidate so CRC checks track flag bytes
+  // rather than a train-time frozen constant.
+  Crc32,
 };
 
 // A conversion failure is never a predicate result.  It is retained as

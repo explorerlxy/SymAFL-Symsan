@@ -3975,6 +3975,10 @@ void TaintFunction::visitGEPInst(GetElementPtrInst *I) {
   auto &DL = M->getDataLayout();
   int64_t CurrentOffset = 0;
   bool HasSymbolicIndex = false;
+  // Each tainted index of a GEP is one symbolic data-state step and emits its
+  // own ConstraintFlag pin (via __taint_trace_gep). Multi-index a[i][j] and
+  // load/store pairs that lower to multiple GEPs correctly produce multiple
+  // constraint nodes — that is intended SEDBT differentiation, not noise.
 
   IRBuilder<> IRB(I);
   Value *Base = I->getPointerOperand();
