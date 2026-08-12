@@ -224,9 +224,41 @@ class Tree {
   uint64_t num_conflicts = 0;
   uint64_t num_opaque = 0;     // residual converter-opaque (should stay ~0)
   uint64_t num_tautology = 0;  // fixed-direction constant decisions
-  // Convert fail or train-eval mismatch: insertion stops; no node written.
+  // Structural insert faults (policy A): insertion stops; no node written.
+  // insert_structural_error == convert_fail + train_mismatch.
   uint64_t insert_structural_error = 0;
+  uint64_t insert_struct_convert_fail = 0;   // converter opaque / unmodelable
+  uint64_t insert_struct_train_mismatch = 0; // train eval != event.result
+  // Per-CID census for structural faults (deinit prints top entries).
+  std::unordered_map<uint32_t, uint64_t> struct_error_by_cid;
   uint64_t max_depth = 0;
+
+  // Last structural fault detail for forensic capture (consumed by mutator).
+  enum class StructFaultReason : uint8_t {
+    None = 0,
+    ConvertFail,
+    TrainMismatch,
+  };
+  struct StructuralFault {
+    StructFaultReason reason = StructFaultReason::None;
+    uint32_t cid = 0;
+    uint32_t label = 0;
+    uint8_t result = 0;
+    size_t event_index = 0;  // logical frame index in the insert stream
+    bool from_suffix = false;
+    bool pending = false;
+  };
+  // Pop the pending fault if any (clears pending). Returns true if a fault
+  // was available.
+  bool take_structural_fault(StructuralFault *out) {
+    if (!last_struct_fault_.pending) return false;
+    if (out) *out = last_struct_fault_;
+    last_struct_fault_.pending = false;
+    return true;
+  }
+  const StructuralFault &peek_structural_fault() const {
+    return last_struct_fault_;
+  }
   uint64_t check_admit_empty = 0;
   uint64_t check_admit_opaque = 0;  // DEPRECATED: opaque no longer whole-admits
   uint64_t check_follow_tautology = 0;  // walked through a tautology node
@@ -261,6 +293,7 @@ class Tree {
   bool profile_ = false;
   bool rlimit_unlimited_ = false;
   bool diag_conflicts_ = false;
+  StructuralFault last_struct_fault_{};
   // Persistent eval context for CheckInput: the values_/stamps_ vectors are
   // keyed by arena index, so they must only grow (the arena is append-only
   // between checks); a fresh context per check zero-fills up to the arena

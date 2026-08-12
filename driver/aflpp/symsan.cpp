@@ -246,6 +246,9 @@ struct my_mutator_t {
   uint64_t forensic_terminal_seen = 0;
   uint64_t forensic_terminal_captured = 0;
   uint64_t forensic_terminal_suppressed = 0;
+  uint64_t forensic_struct_seen = 0;
+  uint64_t forensic_struct_captured = 0;
+  uint64_t forensic_struct_suppressed = 0;
   // Saturation via probe-gain windows (SYMAFL_SAT_WINDOW / SYMAFL_SAT_MIN_GAINS,
   // default off): once a window of probe outcomes yields fewer than
   // sat_min_gains coverage gains, the vetoed population no longer carries
@@ -753,7 +756,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   const pcbt::Tree &t = data->tree;
   fprintf(stderr,
           "[pcbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
-          "opaque=%llu tautology=%llu struct_err=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
+          "opaque=%llu tautology=%llu struct_err=%llu struct_convert=%llu struct_train=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
           "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
           "single_pass=%llu single_pass_overflow=%llu "
           "admit_empty=%llu admit_opaque=%llu follow_tautology=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
@@ -769,6 +772,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.num_opaque,
           (unsigned long long)t.num_tautology,
           (unsigned long long)t.insert_structural_error,
+          (unsigned long long)t.insert_struct_convert_fail,
+          (unsigned long long)t.insert_struct_train_mismatch,
           (unsigned long long)data->failed_runs,
           (unsigned long long)data->trace_timeouts,
           (unsigned long long)data->memerr_events,
@@ -810,14 +815,36 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
     fprintf(stderr,
             "[pcbt-forensics] dir=%s opaque_seen=%llu opaque_captured=%llu "
             "opaque_suppressed=%llu terminal_seen=%llu "
-            "terminal_captured=%llu terminal_suppressed=%llu\n",
+            "terminal_captured=%llu terminal_suppressed=%llu "
+            "struct_seen=%llu struct_captured=%llu struct_suppressed=%llu\n",
             data->forensics_dir,
             (unsigned long long)data->forensic_opaque_seen,
             (unsigned long long)data->forensic_opaque_captured,
             (unsigned long long)data->forensic_opaque_suppressed,
             (unsigned long long)data->forensic_terminal_seen,
             (unsigned long long)data->forensic_terminal_captured,
-            (unsigned long long)data->forensic_terminal_suppressed);
+            (unsigned long long)data->forensic_terminal_suppressed,
+            (unsigned long long)data->forensic_struct_seen,
+            (unsigned long long)data->forensic_struct_captured,
+            (unsigned long long)data->forensic_struct_suppressed);
+  }
+  if (t.insert_structural_error) {
+    fprintf(stderr,
+            "[pcbt-struct] total=%llu convert_fail=%llu train_mismatch=%llu\n",
+            (unsigned long long)t.insert_structural_error,
+            (unsigned long long)t.insert_struct_convert_fail,
+            (unsigned long long)t.insert_struct_train_mismatch);
+    if (!t.struct_error_by_cid.empty()) {
+      std::vector<std::pair<uint32_t, uint64_t>> ranked(
+          t.struct_error_by_cid.begin(), t.struct_error_by_cid.end());
+      std::sort(ranked.begin(), ranked.end(),
+                [](const auto &a, const auto &b) { return a.second > b.second; });
+      const size_t n = ranked.size() < 32 ? ranked.size() : 32;
+      for (size_t i = 0; i < n; ++i) {
+        fprintf(stderr, "[pcbt-struct-cid] cid=%u count=%llu\n",
+                ranked[i].first, (unsigned long long)ranked[i].second);
+      }
+    }
   }
   if (data->profile_enabled) {
     const uint64_t calls = data->profile_check_calls;
@@ -1294,6 +1321,12 @@ struct ForensicSnapshotMeta {
   uint32_t veto_depth = 0;
   uint8_t new_bits = 0;
   const char *pair_log = nullptr;
+  // Structural-fault forensics (insert convert_fail / train_mismatch).
+  uint32_t struct_cid = 0;
+  uint32_t struct_label = 0;
+  uint8_t struct_result = 0;
+  size_t struct_event_index = 0;
+  uint8_t struct_from_suffix = 0;
 };
 
 static void write_forensic_input(const std::string &path, const u8 *input,
@@ -1325,6 +1358,11 @@ static bool capture_forensic_snapshot(
     seen_count = &data->forensic_terminal_seen;
     captured_count = &data->forensic_terminal_captured;
     suppressed_count = &data->forensic_terminal_suppressed;
+  } else if (strcmp(reason, "struct-convert-fail") == 0 ||
+             strcmp(reason, "struct-train-mismatch") == 0) {
+    seen_count = &data->forensic_struct_seen;
+    captured_count = &data->forensic_struct_captured;
+    suppressed_count = &data->forensic_struct_suppressed;
   } else {
     FATAL("unknown forensic snapshot reason: %s", reason);
   }
@@ -1419,11 +1457,64 @@ static bool capture_forensic_snapshot(
                               : 0u,
           meta.veto_dir, meta.veto_kind, meta.veto_depth, meta.new_bits);
   fprintf(meta_file, "pair_log=%s\n", meta.pair_log ? meta.pair_log : "");
+  if (meta.struct_cid || meta.struct_label ||
+      strcmp(reason, "struct-convert-fail") == 0 ||
+      strcmp(reason, "struct-train-mismatch") == 0) {
+    fprintf(meta_file,
+            "struct_cid=%u\nstruct_label=%u\nstruct_result=%u\n"
+            "struct_event_index=%zu\nstruct_from_suffix=%u\n",
+            meta.struct_cid, meta.struct_label, meta.struct_result,
+            meta.struct_event_index, meta.struct_from_suffix);
+  }
   fclose(meta_file);
   *captured_count += 1;
   fprintf(stderr, "[pcbt-forensics] reason=%s snapshot=%s events=%zu labels=%zu\n",
           reason, meta_path.c_str(), events.size(), seen.size());
   return true;
+}
+
+// After InsertTrace/InsertSuffix: if a structural fault was recorded, persist
+// a limited forensic snapshot (input + events + labels + tree) for root-cause
+// analysis. Always on when forensics_dir is set (quality/REPLAY_ALL paths).
+static void capture_structural_fault_if_any(
+    my_mutator_t *data, const std::vector<pcbt::Event> &events,
+    const dfsan_label_info *table, size_t table_labels, const u8 *input,
+    size_t input_len, const char *trace_mode, uint32_t skip_depth,
+    uint32_t raw_event_count, bool trace_overflow) {
+  pcbt::Tree::StructuralFault fault;
+  if (!data->tree.take_structural_fault(&fault)) return;
+  const char *reason =
+      fault.reason == pcbt::Tree::StructFaultReason::ConvertFail
+          ? "struct-convert-fail"
+          : "struct-train-mismatch";
+  ForensicSnapshotMeta meta;
+  meta.trace_mode = trace_mode;
+  meta.skip_depth = skip_depth;
+  meta.raw_event_count = raw_event_count;
+  meta.trace_overflow = trace_overflow;
+  meta.struct_cid = fault.cid;
+  meta.struct_label = fault.label;
+  meta.struct_result = fault.result;
+  meta.struct_event_index = fault.event_index;
+  meta.struct_from_suffix = fault.from_suffix ? 1u : 0u;
+  meta.pair_log = data->pair_log_path;
+  if (capture_forensic_snapshot(data, reason, events, table, table_labels,
+                                input, input_len, meta)) {
+    WARNF("[pcbt-struct] %s cid=%u label=%u result=%u event_index=%zu "
+          "suffix=%u forensic captured\n",
+          reason, fault.cid, fault.label, fault.result, fault.event_index,
+          fault.from_suffix ? 1u : 0u);
+  } else if (data->forensics_dir) {
+    WARNF("[pcbt-struct] %s cid=%u label=%u result=%u event_index=%zu "
+          "suffix=%u (forensic suppressed or unavailable)\n",
+          reason, fault.cid, fault.label, fault.result, fault.event_index,
+          fault.from_suffix ? 1u : 0u);
+  } else {
+    WARNF("[pcbt-struct] %s cid=%u label=%u result=%u event_index=%zu "
+          "suffix=%u\n",
+          reason, fault.cid, fault.label, fault.result, fault.event_index,
+          fault.from_suffix ? 1u : 0u);
+  }
 }
 
 static bool decode_probe_capture(my_mutator_t *data,
@@ -1498,6 +1589,9 @@ static bool insert_full_stream(my_mutator_t *data, const u8 *buf,
   fprintf(stderr, "[pcbt-trace] %s mode=full events=%zu expanded=%llu "
           "created=%u\n", fname, events.size(),
           (unsigned long long)expanded, created);
+  capture_structural_fault_if_any(data, events, __dfsan_label_info, MAX_LABEL,
+                                  buf, buf_size, "pipe-full", 0,
+                                  (uint32_t)events.size(), false);
   capture_opaque_if_new(data, opaque_before, events, __dfsan_label_info,
                         MAX_LABEL, buf, buf_size, "pipe-full", 0,
                         (uint32_t)events.size(), false);
@@ -1531,6 +1625,9 @@ static bool insert_pipe_suffix_capture(my_mutator_t *data, const u8 *buf,
           "created=%u\n",
           fname, data->tree.depth(data->last_node), events.size(),
           (unsigned long long)expanded, created);
+  capture_structural_fault_if_any(
+      data, events, __dfsan_label_info, MAX_LABEL, buf, buf_size, "pipe-suffix",
+      data->tree.depth(data->last_node), (uint32_t)events.size(), false);
   capture_opaque_if_new(data, opaque_before, events, __dfsan_label_info,
                         MAX_LABEL, buf, buf_size, "pipe-suffix",
                         data->tree.depth(data->last_node),
@@ -1602,6 +1699,10 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
           fname, root_capture ? "root-shm" : "suffix",
           root_capture ? 0 : data->tree.depth(data->last_node), events.size(),
           (unsigned long long)expanded, created);
+  capture_structural_fault_if_any(
+      data, events, data->single_pass_label_info, MAX_LABEL, buf, buf_size,
+      root_capture ? "root-shm" : "shm-suffix",
+      root_capture ? 0 : data->tree.depth(data->last_node), count, false);
   capture_opaque_if_new(data, opaque_before, events,
                         data->single_pass_label_info, MAX_LABEL, buf,
                         buf_size, root_capture ? "root-shm" : "shm-suffix",
@@ -2029,6 +2130,10 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
               data->probe_capture_node, data->probe_capture_dir, events,
               __dfsan_label_info, MAX_LABEL, buf, (uint32_t)buf_size, nullptr,
               nullptr);
+          capture_structural_fault_if_any(
+              data, events, __dfsan_label_info, MAX_LABEL, buf, buf_size,
+              "probe-learn-suffix", data->tree.depth(data->probe_capture_node),
+              raw_event_count, trace_overflow);
           if (created > 0) {
             // A nonempty learned suffix proves the edge has real follow-up
             // paths; refresh the budget so later candidates can reach them.

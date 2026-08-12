@@ -185,23 +185,33 @@ static inline uint32_t child_skip_cnt(const Node &parent, uint8_t parent_dir,
 
 // True when the DAG freezes a large absolute constant that is neither a
 // Insertion classification (policy A for structural faults):
-// - Converter opaque / train-eval mismatch → StructuralError: STOP insert,
-//   write no node (exposes SEDBT collection/model defects).
+// - Converter opaque → StructConvertFail: STOP insert, no node.
+// - Train-eval mismatch → StructTrainMismatch: STOP insert, no node.
 // - Input-free constant decision that matches train → Tautology (fixed_dir).
 // - Otherwise Accept as ordinary evaluable predicate.
 // Absolute-address + input stays evaluable (D2-A); P2 must complete taint.
-enum class InsertPredClass : uint8_t { Accept, Tautology, StructuralError };
+enum class InsertPredClass : uint8_t {
+  Accept,
+  Tautology,
+  StructConvertFail,
+  StructTrainMismatch,
+};
+
+static bool is_struct_fault(InsertPredClass cls) {
+  return cls == InsertPredClass::StructConvertFail ||
+         cls == InsertPredClass::StructTrainMismatch;
+}
 
 static InsertPredClass classify_inserted_predicate(const PredArena &arena,
                                                    Predicate *pred,
                                                    const uint8_t *input,
                                                    uint32_t len,
                                                    uint8_t expected_result) {
-  if (pred == nullptr) return InsertPredClass::StructuralError;
+  if (pred == nullptr) return InsertPredClass::StructConvertFail;
   const uint8_t fixed = expected_result ? 1 : 0;
 
   // Conversion failure: runtime emitted a symbolic event we cannot model.
-  if (pred->opaque) return InsertPredClass::StructuralError;
+  if (pred->opaque) return InsertPredClass::StructConvertFail;
 
   const bool candidate_independent =
       pred->reads.empty() && !pred_has_len_kind(arena, *pred);
@@ -225,7 +235,7 @@ static InsertPredClass classify_inserted_predicate(const PredArena &arena,
   if (!ok || edir != fixed) {
     // Model disagrees with the same input that produced the event: structural
     // defect. Do not freeze a lying or un-evaluable node into the tree.
-    return InsertPredClass::StructuralError;
+    return InsertPredClass::StructTrainMismatch;
   }
 
   // Candidate-independent decision → tautology with unique direction.
@@ -373,19 +383,35 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     for (Predicate pred : preds) {
       const InsertPredClass cls = classify_inserted_predicate(
           pred_arena_, &pred, input, len, ev.result);
-      if (cls == InsertPredClass::StructuralError) {
+      if (is_struct_fault(cls)) {
         // Policy A: do not write a node; leave the frontier edge unexplored.
         insert_structural_error += 1;
+        if (cls == InsertPredClass::StructConvertFail)
+          insert_struct_convert_fail += 1;
+        else
+          insert_struct_train_mismatch += 1;
+        struct_error_by_cid[ev.cid] += 1;
         if (pred.error != PredError::None) {
           opaque_by_error[static_cast<size_t>(pred.error)] += 1;
           if (pred.error_op) opaque_by_op[pred.error_op] += 1;
         }
-        opaque_by_cid[ev.cid] += 1;
+        last_struct_fault_ = StructuralFault{
+            cls == InsertPredClass::StructConvertFail
+                ? StructFaultReason::ConvertFail
+                : StructFaultReason::TrainMismatch,
+            ev.cid,
+            ev.label,
+            ev.result,
+            i,
+            /*from_suffix=*/false,
+            /*pending=*/true};
         if (diag_conflicts_) {
           fprintf(stderr,
-                  "[pcbt-struct] InsertTrace stop cid=%u label=%u result=%u "
-                  "created=%u (convert/train mismatch)\n",
-                  ev.cid, ev.label, ev.result, created);
+                  "[pcbt-struct] InsertTrace stop reason=%s cid=%u label=%u "
+                  "result=%u event_index=%zu created=%u\n",
+                  cls == InsertPredClass::StructConvertFail ? "convert_fail"
+                                                              : "train_mismatch",
+                  ev.cid, ev.label, ev.result, i, created);
         }
         structural_stop = true;
         break;
@@ -506,17 +532,33 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
         diagnostics_banner_printed = true;
       }
 
-      if (cls == InsertPredClass::StructuralError) {
+      if (is_struct_fault(cls)) {
         insert_structural_error += 1;
+        if (cls == InsertPredClass::StructConvertFail)
+          insert_struct_convert_fail += 1;
+        else
+          insert_struct_train_mismatch += 1;
+        struct_error_by_cid[event.cid] += 1;
         if (pred.error != PredError::None) {
           opaque_by_error[static_cast<size_t>(pred.error)] += 1;
           if (pred.error_op) opaque_by_op[pred.error_op] += 1;
         }
-        opaque_by_cid[event.cid] += 1;
+        last_struct_fault_ = StructuralFault{
+            cls == InsertPredClass::StructConvertFail
+                ? StructFaultReason::ConvertFail
+                : StructFaultReason::TrainMismatch,
+            event.cid,
+            event.label,
+            event.result,
+            total_events_seen > 0 ? total_events_seen - 1 : 0,
+            /*from_suffix=*/true,
+            /*pending=*/true};
         if (diag_conflicts_) {
           fprintf(stderr,
-                  "[pcbt-struct] InsertSuffix stop cid=%u label=%u result=%u "
-                  "created=%u (convert/train mismatch)\n",
+                  "[pcbt-struct] InsertSuffix stop reason=%s cid=%u label=%u "
+                  "result=%u created=%u\n",
+                  cls == InsertPredClass::StructConvertFail ? "convert_fail"
+                                                              : "train_mismatch",
                   event.cid, event.label, event.result, created);
         }
         structural_stop = true;
