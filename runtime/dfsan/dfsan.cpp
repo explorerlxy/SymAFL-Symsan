@@ -2415,6 +2415,26 @@ static bool label_has_input_leaf(dfsan_label label, int depth) {
   return false;
 }
 
+// True when the DAG is (or wraps) an input-length boundary value: flen_*/
+// fsize, possibly under Add/Sub used for `iend = istart + hbSize`. These are
+// streaming buffer-end decisions, not path-local allocator layout.
+static bool label_is_length_boundary_shape(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return false;
+  if (depth > kHeapLayoutWalkDepth) return false;
+  const dfsan_label_info *info = dfsan_get_label_info(label);
+  if (label_is_input_len_op(info->op)) return true;
+  uint16_t base = info->op & 0xff;
+  if (base == ZExt || base == SExt || base == Trunc || base == BitCast ||
+      base == Add || base == Sub || base == And || base == Or || base == Mul ||
+      base == Shl || base == LShr || base == AShr) {
+    return (info->l1 >= CONST_OFFSET &&
+            label_is_length_boundary_shape(info->l1, depth + 1)) ||
+           (info->l2 >= CONST_OFFSET &&
+            label_is_length_boundary_shape(info->l2, depth + 1));
+  }
+  return false;
+}
+
 static bool label_is_pointer_value(dfsan_label label, int depth);
 
 // True when label is Sub of two pointer-shaped values (pool->end - pool->free).
@@ -2510,13 +2530,30 @@ static bool icmp_is_heap_layout(dfsan_label label, int depth) {
                  label_has_pointer_shape(info->l2, 0));
   bool l1_inp = info->l1 >= CONST_OFFSET && label_has_input_leaf(info->l1, 0);
   bool l2_inp = info->l2 >= CONST_OFFSET && label_has_input_leaf(info->l2, 0);
-  // Pure heap pointer/pointer-diff comparison.
+  // Length-boundary shapes (flen_*/fsize, including iend = base + size) must
+  // stay in the PCBT. FSE/xz buffer-end checks `ip <= iend-K` were previously
+  // dropped as "pointer vs input" heap layout, so short streams ended mid-
+  // loop without a diverge event (TruncatedTrace vs a longer train path).
+  bool l1_len = info->l1 >= CONST_OFFSET &&
+                label_is_length_boundary_shape(info->l1, 0);
+  bool l2_len = info->l2 >= CONST_OFFSET &&
+                label_is_length_boundary_shape(info->l2, 0);
+  if (l1_len || l2_len) return false;
+  // Pure heap pointer/pointer-diff comparison (no input dependence).
   if ((l1_ptr || l2_ptr) && !l1_inp && !l2_inp) return true;
-  // Pointer-diff or pointer vs input (dict pool free space vs namelen).
-  if (l1_ptr && l2_inp && !l1_inp) return true;
-  if (l2_ptr && l1_inp && !l2_inp) return true;
-  // Both operands pointer-shaped (hash-chain pointer walks).
-  if (l1_ptr && l2_ptr) return true;
+  // Pointer vs content input only when the input side is *not* also
+  // pointer-shaped. Dict freelist: pointer_diff vs namelen Read. FSE/xz
+  // buffer ends: ip vs (istart+size) are both pointer-shaped *and*
+  // input-dependent — keep those (they used to be dropped here, causing
+  // TruncatedTrace mid-loop).
+  if (l1_ptr && l2_inp && !l1_inp && !l2_ptr) return true;
+  if (l2_ptr && l1_inp && !l2_inp && !l1_ptr) return true;
+  // Both pointer-shaped: suppress pure heap walks; keep input-dependent
+  // buffer-cursor checks (ip <= iend-K).
+  if (l1_ptr && l2_ptr) {
+    if (l1_inp || l2_inp) return false;
+    return true;
+  }
   return false;
 }
 
