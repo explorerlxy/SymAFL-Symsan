@@ -39,6 +39,10 @@ extern "C" {
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <fcntl.h>
+#include <spawn.h>
+#include <signal.h>
+
+extern char **environ;
 
 using namespace __dfsan;
 
@@ -1211,8 +1215,8 @@ static bool decode_pipe_events(my_mutator_t *data,
 }
 
 // Direct re-exec of the concolic target for TruncatedTrace isolation.
-// Returns true when a longer/divergent stream was collected into *out.
-// Bounded: one attempt, short wall timeout, no single-pass SHM.
+// Uses posix_spawn (AFL is multi-threaded; plain fork is unsafe).
+// Returns true when a stream was collected into *out.
 static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
                                size_t buf_size,
                                std::vector<pcbt::Event> *out) {
@@ -1221,7 +1225,10 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
 
   char tmpl[] = "/home/hahafish/symafl2-work/pcbt-reexec-XXXXXX";
   int ifd = mkstemp(tmpl);
-  if (ifd < 0) return false;
+  if (ifd < 0) {
+    fprintf(stderr, "[pcbt-reexec] mkstemp failed: %s\n", strerror(errno));
+    return false;
+  }
   if (write(ifd, buf, buf_size) != (ssize_t)buf_size) {
     close(ifd);
     unlink(tmpl);
@@ -1235,40 +1242,50 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
     return false;
   }
 
-  pid_t pid = fork();
-  if (pid < 0) {
+  char taint[512];
+  snprintf(taint, sizeof(taint),
+           "taint_file=%s:taint_max_len=65536:pipe_fd=%d:exit_on_memerror=false",
+           tmpl, pipefd[1]);
+
+  // Build env with TAINT_OPTIONS override.
+  std::vector<char *> envp;
+  for (char **e = environ; e && *e; ++e) {
+    if (strncmp(*e, "TAINT_OPTIONS=", 14) == 0) continue;
+    if (strncmp(*e, "SYMAFL_TRACE_MODE=", 18) == 0) continue;
+    envp.push_back(*e);
+  }
+  char taint_env[560];
+  snprintf(taint_env, sizeof(taint_env), "TAINT_OPTIONS=%s", taint);
+  envp.push_back(taint_env);
+  envp.push_back(nullptr);
+
+  char *argv[] = {data->concolic_target, tmpl, nullptr};
+  posix_spawn_file_actions_t fa;
+  posix_spawn_file_actions_init(&fa);
+  // Child keeps write end; close read end in child.
+  posix_spawn_file_actions_addclose(&fa, pipefd[0]);
+
+  pid_t pid = 0;
+  int sp = posix_spawn(&pid, data->concolic_target, &fa, nullptr, argv,
+                       envp.data());
+  posix_spawn_file_actions_destroy(&fa);
+  close(pipefd[1]);  // parent keeps read end only
+  if (sp != 0) {
+    fprintf(stderr, "[pcbt-reexec] posix_spawn failed: %s\n", strerror(sp));
     close(pipefd[0]);
-    close(pipefd[1]);
     unlink(tmpl);
     return false;
   }
-  if (pid == 0) {
-    // Child: clean full-stream capture, no single-pass control block.
-    close(pipefd[0]);
-    char taint[512];
-    snprintf(taint, sizeof(taint),
-             "taint_file=%s:taint_max_len=65536:pipe_fd=%d:"
-             "exit_on_memerror=false",
-             tmpl, pipefd[1]);
-    setenv("TAINT_OPTIONS", taint, 1);
-    // Drop AFL SHM / forkserver inheritance noise.
-    unsetenv("SYMAFL_TRACE_MODE");
-    char *argv[] = {data->concolic_target, tmpl, nullptr};
-    execv(data->concolic_target, argv);
-    _exit(127);
-  }
 
-  close(pipefd[1]);
   std::vector<u8> wire;
   wire.reserve(1 << 16);
   u8 chunk[4096];
-  // Wall-clock bound (~8s) so a stuck target cannot hang the mutator.
-  const int max_rounds = 800;
+  const int max_rounds = 800;  // ~8s
   for (int r = 0; r < max_rounds; ++r) {
     fd_set rfds;
     FD_ZERO(&rfds);
     FD_SET(pipefd[0], &rfds);
-    struct timeval tv = {0, 10000};  // 10ms
+    struct timeval tv = {0, 10000};
     int sel = select(pipefd[0] + 1, &rfds, nullptr, nullptr, &tv);
     if (sel > 0 && FD_ISSET(pipefd[0], &rfds)) {
       ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
@@ -1276,12 +1293,11 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
         wire.insert(wire.end(), chunk, chunk + n);
         continue;
       }
-      if (n == 0) break;  // EOF
+      if (n == 0) break;
     }
     int st = 0;
     pid_t w = waitpid(pid, &st, WNOHANG);
     if (w == pid) {
-      // Drain remaining bytes after exit.
       for (;;) {
         ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
         if (n > 0) wire.insert(wire.end(), chunk, chunk + n);
@@ -1290,7 +1306,6 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
       break;
     }
   }
-  // Ensure reaped.
   int st = 0;
   if (waitpid(pid, &st, WNOHANG) == 0) {
     kill(pid, SIGKILL);
@@ -1299,8 +1314,19 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
   close(pipefd[0]);
   unlink(tmpl);
 
-  if (wire.empty()) return false;
-  return decode_full_stream(wire.data(), wire.size(), out);
+  if (wire.empty()) {
+    fprintf(stderr, "[pcbt-reexec] empty wire (child rc/signal?)\n");
+    return false;
+  }
+  std::vector<pcbt::Event> decoded;
+  if (!decode_full_stream(wire.data(), wire.size(), &decoded)) {
+    fprintf(stderr, "[pcbt-reexec] decode failed wire=%zu\n", wire.size());
+    return false;
+  }
+  fprintf(stderr, "[pcbt-reexec] wire=%zu events=%zu\n", wire.size(),
+          decoded.size());
+  *out = std::move(decoded);
+  return true;
 }
 
 // The label table belongs to the just-finished child.  On replay failure, dump
@@ -1442,24 +1468,33 @@ static bool replay_check_trace(my_mutator_t *data,
       !WIFSIGNALED(data->afl->fsrv.child_status) &&
       !data->afl->fsrv.last_run_timed_out && data->concolic_target) {
     std::vector<pcbt::Event> re_events;
-    if (reexec_full_stream(data, buf, buf_size, &re_events) &&
-        re_events.size() > events.size()) {
-      auto re_report =
-          data->tree.ReplayFullTrace(re_events, buf, (uint32_t)buf_size);
-      const bool demote =
-          re_report.error == pcbt::Tree::ReplayError::None ||
-          re_report.error == pcbt::Tree::ReplayError::CidMismatch ||
-          re_report.error == pcbt::Tree::ReplayError::DirectionMismatch ||
-          re_report.error == pcbt::Tree::ReplayError::AfterTerminal;
-      if (demote) {
-        data->replay_short_capture_skipped += 1;
+    if (reexec_full_stream(data, buf, buf_size, &re_events)) {
+      if (re_events.size() > events.size()) {
+        auto re_report =
+            data->tree.ReplayFullTrace(re_events, buf, (uint32_t)buf_size);
+        const bool demote =
+            re_report.error == pcbt::Tree::ReplayError::None ||
+            re_report.error == pcbt::Tree::ReplayError::CidMismatch ||
+            re_report.error == pcbt::Tree::ReplayError::DirectionMismatch ||
+            re_report.error == pcbt::Tree::ReplayError::AfterTerminal;
+        if (demote) {
+          data->replay_short_capture_skipped += 1;
+          fprintf(stderr,
+                  "[pcbt-replay] short-capture-skipped: in_afl_events=%zu "
+                  "reexec_events=%zu re_error=%d (not hard truncated)\n",
+                  events.size(), re_events.size(), (int)re_report.error);
+          (void)capture_anomaly_case(data, "short-capture", events, buf,
+                                     buf_size);
+          return true;
+        }
         fprintf(stderr,
-                "[pcbt-replay] short-capture-skipped: in_afl_events=%zu "
-                "reexec_events=%zu re_error=%d (not hard truncated)\n",
-                events.size(), re_events.size(), (int)re_report.error);
-        (void)capture_anomaly_case(data, "short-capture", events, buf,
-                                   buf_size);
-        return true;
+                "[pcbt-replay] reexec still truncated: in_afl=%zu reexec=%zu "
+                "verified=%zu (true pure-prefix hole)\n",
+                events.size(), re_events.size(), re_report.verified_events);
+      } else {
+        fprintf(stderr,
+                "[pcbt-replay] reexec not longer: in_afl=%zu reexec=%zu\n",
+                events.size(), re_events.size());
       }
     }
   }
