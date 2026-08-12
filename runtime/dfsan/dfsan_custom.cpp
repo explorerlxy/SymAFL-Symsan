@@ -61,6 +61,9 @@ using namespace __dfsan;
 // without touching them, so the next access demand-faults zeros. Eager
 // memset of 4x the allocation size made liblzma's 64MB LZMA dictionary cost
 // ~256MB of shadow writes (~68K page faults, ~80ms) on every target child.
+// Forward decl: used by realloc paths; defined after clear_shadow_range.
+static inline void retire_heap_ptr(void *ptr, dfsan_label ptr_label);
+
 static inline void clear_shadow_range(void *ptr, size_t bytes) {
   if (!ptr || !bytes) return;
   // shadow_for() is not page-aligned; MADV_DONTNEED requires a page-aligned
@@ -4064,16 +4067,8 @@ __dfsw_realloc(void *ptr, size_t new_size,
       internal_memcpy(ret, ptr, size);
       internal_memcpy(shadow_for(ret), shadow_for(ptr), sizeof(dfsan_label) * size);
     }
-    if (flags().trace_bounds) {
-      // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
-    } else {
-      free(ptr);
-    }
+    // Retire old block (no freelist return under no_reuse_heap/trace_bounds).
+    retire_heap_ptr(ptr, ptr_label);
   }
 
   if (flags().trace_bounds) {
@@ -4108,16 +4103,8 @@ __dfsw___libc_realloc(void *ptr, size_t new_size,
       internal_memcpy(ret, ptr, size);
       internal_memcpy(shadow_for(ret), shadow_for(ptr), sizeof(dfsan_label) * size);
     }
-    if (flags().trace_bounds) {
-      // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
-    } else {
-      free(ptr);
-    }
+    // Retire old block (no freelist return under no_reuse_heap/trace_bounds).
+    retire_heap_ptr(ptr, ptr_label);
   }
 
   if (flags().trace_bounds) {
@@ -4156,16 +4143,8 @@ void *__dfsw_reallocarray(void *ptr, size_t nmemb, size_t new_size,
       internal_memcpy(ret, ptr, size);
       internal_memcpy(shadow_for(ret), shadow_for(ptr), sizeof(dfsan_label) * size);
     }
-    if (flags().trace_bounds) {
-      // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
-    } else {
-      free(ptr);
-    }
+    // Retire old block (no freelist return under no_reuse_heap/trace_bounds).
+    retire_heap_ptr(ptr, ptr_label);
   }
 
   if (flags().trace_bounds) {
@@ -4203,16 +4182,8 @@ void *__dfsw___libc_reallocarray(void *ptr, size_t nmemb, size_t new_size,
       internal_memcpy(ret, ptr, size);
       internal_memcpy(shadow_for(ret), shadow_for(ptr), sizeof(dfsan_label) * size);
     }
-    if (flags().trace_bounds) {
-      // mark old buffer as freed without truely free it
-      dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-      if (info->op != Alloca) {
-        AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-        // Die();
-      } else info->op = Free;
-    } else {
-      free(ptr);
-    }
+    // Retire old block (no freelist return under no_reuse_heap/trace_bounds).
+    retire_heap_ptr(ptr, ptr_label);
   }
 
   if (flags().trace_bounds) {
@@ -4449,10 +4420,13 @@ void *__dfsw___libc_pvalloc(size_t size, dfsan_label size_label, dfsan_label *re
   return ret;
 }
 
-SANITIZER_INTERFACE_ATTRIBUTE void __dfsw_free(void *ptr, dfsan_label ptr_label) {
-  if (ptr && flags().trace_bounds) {
-    // don't really free, a hacky way to avoid reusing the address
-    // just mark as freed
+// Retire a heap block without returning it to the freelist when no_reuse_heap
+// (default) or trace_bounds is set. Forkserver children run one input then
+// exit, so unreclaimed blocks do not accumulate across candidates.
+static inline void retire_heap_ptr(void *ptr, dfsan_label ptr_label) {
+  if (!ptr) return;
+  if (flags().trace_bounds) {
+    // Bounds-trace path: track Alloca/Free on the pointer label.
     AOUT("addr: %p = %d\n", ptr, ptr_label);
     dfsan_label_info *info = dfsan_get_label_info(ptr_label);
     if (info->op == Alloca) {
@@ -4464,33 +4438,27 @@ SANITIZER_INTERFACE_ATTRIBUTE void __dfsw_free(void *ptr, dfsan_label ptr_label)
     } else {
       AOUT("WARNING: wrong ptr op %d = %d @%p\n", ptr_label, info->op,
            __builtin_return_address(0));
-      // Die();
     }
-  } else {
-    free(ptr);
+    return;
   }
+  if (flags().no_reuse_heap) {
+    // Keep the address permanently retired for this process. Clear shadow so
+    // a stale label cannot outlive the logical object if something still
+    // reads the retired range (should not happen under correct use).
+    size_t size = malloc_usable_size(ptr);
+    if (size) clear_shadow_range(ptr, size);
+    return;
+  }
+  free(ptr);
+}
+
+SANITIZER_INTERFACE_ATTRIBUTE void __dfsw_free(void *ptr, dfsan_label ptr_label) {
+  retire_heap_ptr(ptr, ptr_label);
 }
 
 SANITIZER_INTERFACE_ATTRIBUTE
 void __dfsw___libc_free(void *ptr, dfsan_label ptr_label) {
-  if (ptr && flags().trace_bounds) {
-    // don't really free, a hacky way to avoid reusing the address
-    // just mark as freed
-    AOUT("addr: %p = %d\n", ptr, ptr_label);
-    dfsan_label_info *info = dfsan_get_label_info(ptr_label);
-    if (info->op == Alloca) {
-      info->op = Free;
-    } else if (info->op == Free) {
-      void *addr = __builtin_return_address(0);
-      AOUT("WARNING: double free %p = %d @%p\n", ptr, ptr_label, addr);
-      __taint_trace_memerr(ptr_label, (uptr)ptr, 0, 0, F_MEMERR_FREE, addr);
-    } else {
-      AOUT("WARNING: wrong ptr op %d = %d\n", ptr_label, info->op);
-      // Die();
-    }
-  } else {
-    free(ptr);
-  }
+  retire_heap_ptr(ptr, ptr_label);
 }
 #endif // USE_UCSAN_CUSTOM
 

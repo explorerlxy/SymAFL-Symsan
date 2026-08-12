@@ -54,6 +54,14 @@ DFSAN_FLAG(const char *, pipe_name, "", "communication pipe filename.")
 DFSAN_FLAG(int, control_pipe_fd, -1, "control pipe fd.")
 DFSAN_FLAG(const char *, control_pipe_name, "", "control pipe filename.")
 DFSAN_FLAG(bool, trace_bounds, false, "trace bounds info.")
+// SymAFL/PCBT: never return freed blocks to the libc freelist. Address reuse
+// makes dict/pool/hash-chain layout depend on free order rather than on the
+// input alone, which poisons PCBT event order (libxml2 cid_mismatch class).
+// Default on; set no_reuse_heap=false to restore stock free/realloc. Child
+// processes exit after one run under the forkserver, so arena growth is bounded
+// by a single execution. Compatible with (and weaker than) trace_bounds.
+DFSAN_FLAG(bool, no_reuse_heap, true,
+           "Do not return freed heap blocks to the allocator freelist.")
 DFSAN_FLAG(bool, trace_fsize, false, "trace file size.")
 DFSAN_FLAG(bool, exit_on_memerror, true, "terminate on memory error.")
 DFSAN_FLAG(bool, solve_ub, false, "solve undefined behavior.")
