@@ -70,6 +70,10 @@ struct my_mutator_t {
   explicit my_mutator_t(afl_state_t *afl) : afl(afl) {}
 
   ~my_mutator_t() {
+    if (concolic_target) {
+      ck_free(concolic_target);
+      concolic_target = nullptr;
+    }
     if (progress_log) {
       fclose(progress_log);
       progress_log = nullptr;
@@ -173,6 +177,11 @@ struct my_mutator_t {
   // Non-timeout signal death (e.g. SIGSEGV): incomplete stream by construction,
   // same isolation class as timeout_skipped — not entry_artifact / truncated.
   uint64_t replay_crash_skipped = 0;
+  // TruncatedTrace where a direct re-exec of the same input produces a longer
+  // stream that continues past the in-AFL capture (or diverges). Isolates
+  // incomplete forkserver captures from true decision-omission pure-prefix.
+  uint64_t replay_short_capture_skipped = 0;
+  char *concolic_target = nullptr;
   // Full-stream capture artifacts: empty event list (taint/capture not armed)
   // or first event is not the entry constraint. Counted separately from
   // truncated decision-omission so hard-gate zeroing is not poisoned by
@@ -561,6 +570,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   }
   data->afl->pcbt_mode = 1;
   data->afl->pcbt_concrete_target = ck_strdup((u8 *)concrete);
+  data->concolic_target = (char *)ck_strdup((u8 *)concolic);
 
   if (const char *mode = getenv("SYMAFL_TRACE_MODE")) {
     WARNF("SYMAFL_TRACE_MODE=%s is ignored: PCBT transport is selected "
@@ -946,7 +956,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "[pcbt-replay] checked=%llu cid_mismatch=%llu dir_mismatch=%llu "
           "after_terminal=%llu truncated=%llu frontier_match=%llu "
           "terminal_match=%llu timeout_skipped=%llu "
-          "crash_skipped=%llu entry_artifact=%llu\n",
+          "crash_skipped=%llu entry_artifact=%llu "
+          "short_capture_skipped=%llu\n",
           (unsigned long long)data->replay_checked,
           (unsigned long long)data->replay_cid_mismatch,
           (unsigned long long)data->replay_direction_mismatch,
@@ -956,7 +967,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->replay_terminal_match,
           (unsigned long long)data->replay_timeout_skipped,
           (unsigned long long)data->replay_crash_skipped,
-          (unsigned long long)data->replay_entry_artifact);
+          (unsigned long long)data->replay_entry_artifact,
+          (unsigned long long)data->replay_short_capture_skipped);
   fprintf(stderr,
           "[pcbt-opaque] invalid_root=%llu invalid_label=%llu initializing_label=%llu "
           "invalid_width=%llu depth_limit=%llu bad_load=%llu bad_concat=%llu "
@@ -1075,6 +1087,9 @@ static void arm_full_capture(my_mutator_t *data) {
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
+  // FULL_STREAM does not consult skip_depth for emission, but clear any
+  // leftover suffix skip so diagnostics and pipe-suffix arming stay honest.
+  control->skip_depth = 0;
   __atomic_store_n(&control->mode, SYMAFL_TRACE_FULL_STREAM, __ATOMIC_RELEASE);
   __atomic_store_n(&control->armed, 1, __ATOMIC_RELEASE);
   data->single_pass_armed = true;
@@ -1193,6 +1208,99 @@ static bool decode_pipe_events(my_mutator_t *data,
         fsrv->sym_trace_len);
   data->failed_runs += 1;
   return false;
+}
+
+// Direct re-exec of the concolic target for TruncatedTrace isolation.
+// Returns true when a longer/divergent stream was collected into *out.
+// Bounded: one attempt, short wall timeout, no single-pass SHM.
+static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
+                               size_t buf_size,
+                               std::vector<pcbt::Event> *out) {
+  if (!data->concolic_target || !buf || buf_size == 0 || !out) return false;
+  out->clear();
+
+  char tmpl[] = "/home/hahafish/symafl2-work/pcbt-reexec-XXXXXX";
+  int ifd = mkstemp(tmpl);
+  if (ifd < 0) return false;
+  if (write(ifd, buf, buf_size) != (ssize_t)buf_size) {
+    close(ifd);
+    unlink(tmpl);
+    return false;
+  }
+  close(ifd);
+
+  int pipefd[2];
+  if (pipe(pipefd) != 0) {
+    unlink(tmpl);
+    return false;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    unlink(tmpl);
+    return false;
+  }
+  if (pid == 0) {
+    // Child: clean full-stream capture, no single-pass control block.
+    close(pipefd[0]);
+    char taint[512];
+    snprintf(taint, sizeof(taint),
+             "taint_file=%s:taint_max_len=65536:pipe_fd=%d:"
+             "exit_on_memerror=false",
+             tmpl, pipefd[1]);
+    setenv("TAINT_OPTIONS", taint, 1);
+    // Drop AFL SHM / forkserver inheritance noise.
+    unsetenv("SYMAFL_TRACE_MODE");
+    char *argv[] = {data->concolic_target, tmpl, nullptr};
+    execv(data->concolic_target, argv);
+    _exit(127);
+  }
+
+  close(pipefd[1]);
+  std::vector<u8> wire;
+  wire.reserve(1 << 16);
+  u8 chunk[4096];
+  // Wall-clock bound (~8s) so a stuck target cannot hang the mutator.
+  const int max_rounds = 800;
+  for (int r = 0; r < max_rounds; ++r) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(pipefd[0], &rfds);
+    struct timeval tv = {0, 10000};  // 10ms
+    int sel = select(pipefd[0] + 1, &rfds, nullptr, nullptr, &tv);
+    if (sel > 0 && FD_ISSET(pipefd[0], &rfds)) {
+      ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+      if (n > 0) {
+        wire.insert(wire.end(), chunk, chunk + n);
+        continue;
+      }
+      if (n == 0) break;  // EOF
+    }
+    int st = 0;
+    pid_t w = waitpid(pid, &st, WNOHANG);
+    if (w == pid) {
+      // Drain remaining bytes after exit.
+      for (;;) {
+        ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+        if (n > 0) wire.insert(wire.end(), chunk, chunk + n);
+        else break;
+      }
+      break;
+    }
+  }
+  // Ensure reaped.
+  int st = 0;
+  if (waitpid(pid, &st, WNOHANG) == 0) {
+    kill(pid, SIGKILL);
+    waitpid(pid, &st, 0);
+  }
+  close(pipefd[0]);
+  unlink(tmpl);
+
+  if (wire.empty()) return false;
+  return decode_full_stream(wire.data(), wire.size(), out);
 }
 
 // The label table belongs to the just-finished child.  On replay failure, dump
@@ -1323,6 +1431,39 @@ static bool replay_check_trace(my_mutator_t *data,
     else if (report.reached_frontier) data->replay_frontier_match += 1;
     return true;
   }
+
+  // TruncatedTrace + clean exit: the in-AFL pipe may be an incomplete
+  // capture of a longer stream (observed: same input direct=3122 events,
+  // AFL pipe=1033 pure prefix). Re-exec once without the forkserver SHM
+  // control block; if the full stream continues or diverges, demote to
+  // short_capture_skipped (transport), not hard truncated.
+  if (report.error == pcbt::Tree::ReplayError::TruncatedTrace && buf &&
+      buf_size > 0 && !is_suffix &&
+      !WIFSIGNALED(data->afl->fsrv.child_status) &&
+      !data->afl->fsrv.last_run_timed_out && data->concolic_target) {
+    std::vector<pcbt::Event> re_events;
+    if (reexec_full_stream(data, buf, buf_size, &re_events) &&
+        re_events.size() > events.size()) {
+      auto re_report =
+          data->tree.ReplayFullTrace(re_events, buf, (uint32_t)buf_size);
+      const bool demote =
+          re_report.error == pcbt::Tree::ReplayError::None ||
+          re_report.error == pcbt::Tree::ReplayError::CidMismatch ||
+          re_report.error == pcbt::Tree::ReplayError::DirectionMismatch ||
+          re_report.error == pcbt::Tree::ReplayError::AfterTerminal;
+      if (demote) {
+        data->replay_short_capture_skipped += 1;
+        fprintf(stderr,
+                "[pcbt-replay] short-capture-skipped: in_afl_events=%zu "
+                "reexec_events=%zu re_error=%d (not hard truncated)\n",
+                events.size(), re_events.size(), (int)re_report.error);
+        (void)capture_anomaly_case(data, "short-capture", events, buf,
+                                   buf_size);
+        return true;
+      }
+    }
+  }
+
   // Replay-validation mismatches are trace conflicts too: count them in the
   // tree's conflict census so the `conflicts` metric does not hide replay
   // drift that marks nodes unstable (admit_unstable) behind a zero. A
