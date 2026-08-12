@@ -1279,7 +1279,7 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
   int sp = posix_spawn(&pid, data->concolic_target, &fa, nullptr, argv,
                        envp.data());
   posix_spawn_file_actions_destroy(&fa);
-  close(pipefd[1]);  // parent keeps read end only
+  close(pipefd[1]);  // parent keeps read end only — enables EOF after child exit
   if (sp != 0) {
     fprintf(stderr, "[pcbt-reexec] posix_spawn failed: %s\n", strerror(sp));
     close(pipefd[0]);
@@ -1287,39 +1287,62 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
     return false;
   }
 
+#ifdef F_SETPIPE_SZ
+  (void)fcntl(pipefd[0], F_SETPIPE_SZ, 1 << 20);
+#endif
+
+  // Non-blocking poll until the child exits, then a blocking drain to EOF.
+  // The old 8s/800×10ms loop SIGKILL'd long DFSan runs and returned a pure
+  // prefix of the true stream (e.g. 550 of 2371), which failed demotion and
+  // left transport short captures counted as hard truncated.
+  int flags = fcntl(pipefd[0], F_GETFL);
+  if (flags >= 0) fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+
   std::vector<u8> wire;
   wire.reserve(1 << 16);
-  u8 chunk[4096];
-  const int max_rounds = 800;  // ~8s
+  u8 chunk[8192];
+  const int max_rounds = 6000;  // ~60s at 10ms
+  bool child_done = false;
+  int st = 0;
   for (int r = 0; r < max_rounds; ++r) {
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(pipefd[0], &rfds);
-    struct timeval tv = {0, 10000};
-    int sel = select(pipefd[0] + 1, &rfds, nullptr, nullptr, &tv);
-    if (sel > 0 && FD_ISSET(pipefd[0], &rfds)) {
+    for (;;) {
       ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
       if (n > 0) {
         wire.insert(wire.end(), chunk, chunk + n);
         continue;
       }
-      if (n == 0) break;
+      if (n == 0) { child_done = true; break; }  // EOF
+      if (errno == EAGAIN || errno == EWOULDBLOCK) break;
+      child_done = true;
+      break;
     }
-    int st = 0;
+    if (child_done) break;
     pid_t w = waitpid(pid, &st, WNOHANG);
     if (w == pid) {
+      // Blocking drain to EOF now that the writer has exited.
+      if (flags >= 0) fcntl(pipefd[0], F_SETFL, flags & ~O_NONBLOCK);
       for (;;) {
         ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
         if (n > 0) wire.insert(wire.end(), chunk, chunk + n);
         else break;
       }
+      child_done = true;
       break;
     }
+    struct timeval tv = {0, 10000};
+    select(0, nullptr, nullptr, nullptr, &tv);
   }
-  int st = 0;
-  if (waitpid(pid, &st, WNOHANG) == 0) {
+  if (!child_done) {
     kill(pid, SIGKILL);
     waitpid(pid, &st, 0);
+    if (flags >= 0) fcntl(pipefd[0], F_SETFL, flags & ~O_NONBLOCK);
+    for (;;) {
+      ssize_t n = read(pipefd[0], chunk, sizeof(chunk));
+      if (n > 0) wire.insert(wire.end(), chunk, chunk + n);
+      else break;
+    }
+    fprintf(stderr, "[pcbt-reexec] killed after timeout wire=%zu\n",
+            wire.size());
   }
   close(pipefd[0]);
   unlink(tmpl);
@@ -1425,7 +1448,9 @@ static bool replay_check_trace(my_mutator_t *data,
   // Always dump the candidate input + raw pipe into anomaly-cases so the
   // counter is reproducible offline.
   // Note: crash/timeout already returned above, so empty streams here are
-  // clean-exit empty captures (true transport/path defects).
+  // clean-exit empty captures (true transport/path defects) — unless AFL is
+  // shutting down (SIGINT after MIN_SCREENED). Abort/teardown often leaves one
+  // empty full capture that is not a taint-path defect.
   if (!is_suffix) {
     const pcbt::NodeRef entry = data->tree.root_child0();
     const bool have_entry =
@@ -1436,6 +1461,15 @@ static bool replay_check_trace(my_mutator_t *data,
     const bool first_not_constraint =
         entry_is_constraint && !events.empty() && !events.front().constraint;
     if (empty_nonempty_input || first_not_constraint) {
+      // stop_soon is set when the user/watcher SIGINTs afl-fuzz for a clean
+      // deinit. Quarantine without inflating entry_artifact (supporting RQ1
+      // diagnostic must not be poisoned by shutdown races).
+      if (data->afl->stop_soon && empty_nonempty_input) {
+        WARNF("[pcbt-replay] entry-empty during stop_soon: pipe_bytes=%zu "
+              "input_len=%zu; skip (not entry_artifact)\n",
+              data->afl->fsrv.sym_trace_len, buf_size);
+        return true;
+      }
       data->replay_entry_artifact += 1;
       WARNF("[pcbt-replay] entry-fork artifact: first event cid=%u "
             "constraint=%u events=%zu vs entry cid=%u entry_constraint=%d; "
