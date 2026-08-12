@@ -1847,7 +1847,17 @@ taint_set_file(int dirfd, const char *filename, int fd) {
   }
   if (match) {
     tainted.fd = fd;
-    AOUT("fd:%d created\n", fd);
+    // Forkserver init often sets size=taint_max_len while .cur_input does not
+    // yet exist. freopen/open of the live candidate must refresh the per-run
+    // byte length so freaze, get_label_for bounds, and flen_* short-read
+    // modeling use the actual input size rather than the placeholder.
+    struct stat st;
+    if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_size >= 0) {
+      tainted.size = st.st_size;
+      // Candidate is a regular file on this fd (possibly freopen'd stdin).
+      tainted.is_stdin = 0;
+    }
+    AOUT("fd:%d created size=%lld\n", fd, (long long)tainted.size);
   }
 }
 
@@ -2418,6 +2428,10 @@ static bool label_has_input_leaf(dfsan_label label, int depth) {
 // True when the DAG is (or wraps) an input-length boundary value: flen_*/
 // fsize, possibly under Add/Sub used for `iend = istart + hbSize`. These are
 // streaming buffer-end decisions, not path-local allocator layout.
+// Also peel Extract/Insert/Load/Select wrappers that commonly sit on top of
+// size_t remaining-length values after SSA form (otherwise FSE/zstd
+// `srcSize >= K` / `ip <= iend-K` still look like pure pointer layout and
+// get dropped → pure-prefix TruncatedTrace on short streams).
 static bool label_is_length_boundary_shape(dfsan_label label, int depth) {
   if (label < CONST_OFFSET || label == kInitializingLabel) return false;
   if (depth > kHeapLayoutWalkDepth) return false;
@@ -2426,7 +2440,9 @@ static bool label_is_length_boundary_shape(dfsan_label label, int depth) {
   uint16_t base = info->op & 0xff;
   if (base == ZExt || base == SExt || base == Trunc || base == BitCast ||
       base == Add || base == Sub || base == And || base == Or || base == Mul ||
-      base == Shl || base == LShr || base == AShr) {
+      base == Shl || base == LShr || base == AShr || base == Load ||
+      base == ExtractElement || base == ExtractValue || base == Select ||
+      base == PHI) {
     return (info->l1 >= CONST_OFFSET &&
             label_is_length_boundary_shape(info->l1, depth + 1)) ||
            (info->l2 >= CONST_OFFSET &&

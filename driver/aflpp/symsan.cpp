@@ -1398,13 +1398,20 @@ static bool replay_check_trace(my_mutator_t *data,
     // Always-on truncated forensics: complete stream ended mid-tree-path.
     // The short execution should have diverged earlier or closed a Terminal;
     // dump last events + the next expected node for RCA.
+    // last_kill_signal is sticky across OK runs — only report a kill when
+    // THIS run's child_status is signalled (or a true timeout already
+    // returned above). Sticky SIGKILL from an earlier hang was poisoning
+    // truncated meta and hiding real clean-exit pure-prefix holes.
+    const uint32_t run_kill =
+        WIFSIGNALED(data->afl->fsrv.child_status)
+            ? (uint32_t)WTERMSIG(data->afl->fsrv.child_status)
+            : 0u;
     size_t shown = buf_size < 64 ? buf_size : 64;
     fprintf(stderr,
             "[pcbt-replay] truncated input len=%zu events=%zu "
             "verified=%zu pipe_bytes=%zu kill_sig=%u timeout=%u hex=",
             buf_size, events.size(), report.verified_events,
-            data->afl->fsrv.sym_trace_len,
-            data->afl->fsrv.last_kill_signal,
+            data->afl->fsrv.sym_trace_len, run_kill,
             data->afl->fsrv.last_run_timed_out);
     for (size_t k = 0; k < shown; ++k)
       fprintf(stderr, "%02x", buf[k]);
@@ -1573,7 +1580,15 @@ static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
   const uint32_t first_constraint =
       events.empty() ? 0u : (events.front().constraint ? 1u : 0u);
   const size_t pipe_bytes = data->afl->fsrv.sym_trace_len;
-  const uint32_t kill_sig = data->afl->fsrv.last_kill_signal;
+  // Prefer this-run signal; fall back to sticky last_kill only on timeout
+  // (where AFL sets last_kill_signal = child_kill_signal without always
+  // leaving WIFSIGNALED visible by the time the mutator runs).
+  const uint32_t kill_sig =
+      WIFSIGNALED(data->afl->fsrv.child_status)
+          ? (uint32_t)WTERMSIG(data->afl->fsrv.child_status)
+          : (data->afl->fsrv.last_run_timed_out
+                 ? data->afl->fsrv.last_kill_signal
+                 : 0u);
   const uint32_t timed_out = data->afl->fsrv.last_run_timed_out;
 
   FILE *meta_file = fopen(meta_path.c_str(), "w");
