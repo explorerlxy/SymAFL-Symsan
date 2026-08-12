@@ -165,6 +165,11 @@ void taint_set_str_indexof_label(void *addr, dfsan_label label);
 dfsan_label taint_get_str_indexof_label(const void *addr);
 dfsan_label taint_find_string_op_source(dfsan_label label);
 dfsan_label taint_get_base_input_label(dfsan_label label);
+// True when a branch condition is path-local heap layout (pointer/pointer-diff
+// compares, optionally mixed with input lengths). Such conditions must not
+// enter the PCBT stream: different heap shapes produce different sites at the
+// same logical depth (libxml2 dict.c pool vs hash-chain cid pairs).
+int taint_is_heap_layout_cond(dfsan_label label);
 
 // taint source utmp
 off_t get_utmp_offset(void);

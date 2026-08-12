@@ -2385,6 +2385,148 @@ extern "C" dfsan_label taint_get_base_input_label(dfsan_label label) {
   return 0;
 }
 
+namespace {
+
+// Bounded DAG walk used by heap-layout classification. Depth caps prevent
+// pathological labels from dominating the hot path.
+static constexpr int kHeapLayoutWalkDepth = 48;
+
+static bool label_is_input_len_op(uint16_t op) {
+  uint16_t base = op & 0xff;
+  return base == fsize || base == flen_eof || base == flen_count ||
+         base == flen_count_neg1 || base == flen_count_elems;
+}
+
+static bool label_has_input_leaf(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return false;
+  if (depth > kHeapLayoutWalkDepth) return false;
+  const dfsan_label_info *info = dfsan_get_label_info(label);
+  uint16_t base = info->op & 0xff;
+  if (info->op == 0) return true;  // input byte leaf
+  if (label_is_input_len_op(info->op)) return true;
+  if (base == fmemcmp || base == fstrcmp || base == fstrlen ||
+      base == fstrchr || base == fstrrchr || base == fstrstr ||
+      base == fprefixof || base == fsuffixof)
+    return true;
+  if (info->l1 >= CONST_OFFSET && label_has_input_leaf(info->l1, depth + 1))
+    return true;
+  if (info->l2 >= CONST_OFFSET && label_has_input_leaf(info->l2, depth + 1))
+    return true;
+  return false;
+}
+
+static bool label_is_pointer_value(dfsan_label label, int depth);
+
+// True when label is Sub of two pointer-shaped values (pool->end - pool->free).
+static bool label_is_pointer_diff(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return false;
+  if (depth > kHeapLayoutWalkDepth) return false;
+  const dfsan_label_info *info = dfsan_get_label_info(label);
+  uint16_t base = info->op & 0xff;
+  // Peel width casts that often wrap pointer diffs.
+  if (base == ZExt || base == SExt || base == Trunc || base == BitCast) {
+    return info->l1 >= CONST_OFFSET &&
+           label_is_pointer_diff(info->l1, depth + 1);
+  }
+  if (base != Sub) return false;
+  return info->l1 >= CONST_OFFSET && info->l2 >= CONST_OFFSET &&
+         label_is_pointer_value(info->l1, depth + 1) &&
+         label_is_pointer_value(info->l2, depth + 1);
+}
+
+static bool label_is_pointer_value(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return false;
+  if (depth > kHeapLayoutWalkDepth) return false;
+  const dfsan_label_info *info = dfsan_get_label_info(label);
+  uint16_t base = info->op & 0xff;
+  if (base == PtrToInt || base == Alloca) return true;
+  if (base == ZExt || base == SExt || base == Trunc || base == BitCast) {
+    return info->l1 >= CONST_OFFSET &&
+           label_is_pointer_value(info->l1, depth + 1);
+  }
+  // GEP-style Add/Sub involving a pointer base.
+  if (base == Add || base == Sub) {
+    bool a = info->l1 >= CONST_OFFSET &&
+             label_is_pointer_value(info->l1, depth + 1);
+    bool b = info->l2 >= CONST_OFFSET &&
+             label_is_pointer_value(info->l2, depth + 1);
+    return a || b;
+  }
+  if (label_is_pointer_diff(label, depth)) return true;
+  return false;
+}
+
+static bool label_has_pointer_shape(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return false;
+  if (depth > kHeapLayoutWalkDepth) return false;
+  if (label_is_pointer_value(label, depth) ||
+      label_is_pointer_diff(label, depth))
+    return true;
+  const dfsan_label_info *info = dfsan_get_label_info(label);
+  if (info->l1 >= CONST_OFFSET && label_has_pointer_shape(info->l1, depth + 1))
+    return true;
+  if (info->l2 >= CONST_OFFSET && label_has_pointer_shape(info->l2, depth + 1))
+    return true;
+  return false;
+}
+
+// ICmp (or And/Or of them) that mixes heap pointer/pointer-diff with input,
+// or is pure heap. These are path-local under allocator layout.
+static bool icmp_is_heap_layout(dfsan_label label, int depth) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return false;
+  if (depth > kHeapLayoutWalkDepth) return false;
+  const dfsan_label_info *info = dfsan_get_label_info(label);
+  uint16_t base = info->op & 0xff;
+  if (base == And || base == Or || base == Xor) {
+    // Compound branch: suppress only when every present arm is heap-layout
+    // (e.g. pure pointer null checks And'd together). Mixed input arms keep
+    // the whole condition so (okey==okey)&&(len==l) still enters the PCBT.
+    bool a_h = info->l1 == 0 ||
+               (info->l1 >= CONST_OFFSET &&
+                icmp_is_heap_layout(info->l1, depth + 1));
+    bool b_h = info->l2 == 0 ||
+               (info->l2 >= CONST_OFFSET &&
+                icmp_is_heap_layout(info->l2, depth + 1));
+    return a_h && b_h && (info->l1 >= CONST_OFFSET || info->l2 >= CONST_OFFSET);
+  }
+  if (base == ZExt || base == SExt || base == Trunc || base == BitCast ||
+      base == Not) {
+    return info->l1 >= CONST_OFFSET && icmp_is_heap_layout(info->l1, depth + 1);
+  }
+  if (base != ICmp) {
+    // Non-icmp condition (e.g. trunc of value): treat as heap-layout only
+    // when pure pointer shape with no input.
+    return label_has_pointer_shape(label, 0) &&
+           !label_has_input_leaf(label, 0);
+  }
+  // Relational/equality ICmp: inspect operands.
+  bool l1_ptr = info->l1 >= CONST_OFFSET &&
+                (label_is_pointer_value(info->l1, 0) ||
+                 label_is_pointer_diff(info->l1, 0) ||
+                 label_has_pointer_shape(info->l1, 0));
+  bool l2_ptr = info->l2 >= CONST_OFFSET &&
+                (label_is_pointer_value(info->l2, 0) ||
+                 label_is_pointer_diff(info->l2, 0) ||
+                 label_has_pointer_shape(info->l2, 0));
+  bool l1_inp = info->l1 >= CONST_OFFSET && label_has_input_leaf(info->l1, 0);
+  bool l2_inp = info->l2 >= CONST_OFFSET && label_has_input_leaf(info->l2, 0);
+  // Pure heap pointer/pointer-diff comparison.
+  if ((l1_ptr || l2_ptr) && !l1_inp && !l2_inp) return true;
+  // Pointer-diff or pointer vs input (dict pool free space vs namelen).
+  if (l1_ptr && l2_inp && !l1_inp) return true;
+  if (l2_ptr && l1_inp && !l2_inp) return true;
+  // Both operands pointer-shaped (hash-chain pointer walks).
+  if (l1_ptr && l2_ptr) return true;
+  return false;
+}
+
+}  // namespace
+
+extern "C" int taint_is_heap_layout_cond(dfsan_label label) {
+  if (label < CONST_OFFSET || label == kInitializingLabel) return 0;
+  return icmp_is_heap_layout(label, 0) ? 1 : 0;
+}
+
 // information is passed implicitly through flags()
 extern "C" void InitializeSymSanSolver();
 

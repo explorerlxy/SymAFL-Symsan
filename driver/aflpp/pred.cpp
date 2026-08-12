@@ -608,10 +608,9 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
   // canonical -1/0/+1 result is lowered at the consuming comparison so a
   // wide operand is never truncated to the first machine word.
   if (is_fmemcmp(static_cast<uint16_t>(op))) {
-    // Fail-closed: reject memcmp wider than the 64-bit evaluator supports.
-    // Previously accepted <=16 bytes but evaluation rejected >8, causing
-    // fail-open Opaque admission. Align conversion limit with eval limit.
-    if (info->size == 0 || info->size > 8) {
+    // Byte-wise lowering supports up to the 32-byte capture window
+    // (op1/op2 + _hi/_h2/_h3). Wider memcmp stays fail-closed opaque.
+    if (info->size == 0 || info->size > kFstrcmpCaptureBytes) {
       fail(PredError::InvalidWidth);
       return kInvalidNode;
     }
@@ -1608,7 +1607,8 @@ uint32_t RunConverter::convert_fmemcmp_cmp(
     const dfsan_label_info *info, uint32_t op,
     const dfsan_label_info &memcmp_info) {
   const uint32_t n = memcmp_info.size;
-  if (n == 0 || n > 16) {
+  // Match the 32-byte capture window used by the runtime fmemcmp wrappers.
+  if (n == 0 || n > kFstrcmpCaptureBytes) {
     fail(PredError::InvalidWidth, static_cast<uint16_t>(memcmp_info.op));
     return kInvalidNode;
   }
@@ -1618,10 +1618,15 @@ uint32_t RunConverter::convert_fmemcmp_cmp(
       fail(PredError::UncapturedMemcmpOperand, memcmp_info.op);
       return false;
     }
-    uint64_t low = operand2 ? memcmp_info.op2.i : memcmp_info.op1.i;
-    uint64_t high = operand2 ? memcmp_info.op2_hi : memcmp_info.op1_hi;
+    // Bytes 0..7 in op1/op2, 8..15 in *_hi, 16..23 in *_h2, 24..31 in *_h3.
+    const uint64_t words[4] = {
+        operand2 ? memcmp_info.op2.i : memcmp_info.op1.i,
+        operand2 ? memcmp_info.op2_hi : memcmp_info.op1_hi,
+        operand2 ? memcmp_info.op2_h2 : memcmp_info.op1_h2,
+        operand2 ? memcmp_info.op2_h3 : memcmp_info.op1_h3,
+    };
     for (uint32_t i = 0; i < n; ++i) {
-      uint64_t word = i < 8 ? low : high;
+      uint64_t word = words[i / 8];
       uint32_t byte = static_cast<uint32_t>((word >> (8 * (i % 8))) & 0xff);
       out.push_back({add_const(byte, 8), 0});
     }

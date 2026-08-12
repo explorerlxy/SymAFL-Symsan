@@ -327,6 +327,13 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
   // this guard at the transport boundary as well as in fastgen.cpp because
   // runtime custom hooks also call __taint_send_cond directly.
   if (label == 0 || label == kInitializingLabel) return;
+  // Heap-layout conditions (pointer/pointer-diff compares, including
+  // pool-freespace vs namelen) are path-local under allocator state. Emitting
+  // them as PCBT events creates site-dependent cid pairs at the same depth
+  // (libxml2 dict.c:233 AddString pool walk vs dict.c:865 hash lookup).
+  // ConstraintFlag events (fread length) always pass.
+  if (!(loop_flag & ConstraintFlag) && taint_is_heap_layout_cond(label))
+    return;
 
   // AFL's SymAFL extension selects one of four per-child modes through the
   // shared control block. FULL_STREAM writes bootstrap events to the pipe;
