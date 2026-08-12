@@ -144,6 +144,10 @@ class Tree {
     bool eval_failure = false;
     bool reached_terminal = false;
     bool reached_frontier = false;
+    // Stream is a consistent prefix of a longer learned path: every event
+    // matched, then the tree continues deeper. InsertTrace accepts this
+    // without conflict; replay must not hard-fail it as TruncatedTrace.
+    bool reached_prefix_end = false;
     NodeRef frontier_node = kUnexplored;
     uint8_t frontier_dir = 0;
     NodeRef mismatch_node = kUnexplored;

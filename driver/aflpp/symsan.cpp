@@ -37,6 +37,7 @@ extern "C" {
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <fcntl.h>
 
 using namespace __dfsan;
@@ -169,6 +170,9 @@ struct my_mutator_t {
   uint64_t replay_after_terminal = 0;
   uint64_t replay_truncated = 0;
   uint64_t replay_timeout_skipped = 0;
+  // Non-timeout signal death (e.g. SIGSEGV): incomplete stream by construction,
+  // same isolation class as timeout_skipped — not entry_artifact / truncated.
+  uint64_t replay_crash_skipped = 0;
   // Full-stream capture artifacts: empty event list (taint/capture not armed)
   // or first event is not the entry constraint. Counted separately from
   // truncated decision-omission so hard-gate zeroing is not poisoned by
@@ -176,6 +180,8 @@ struct my_mutator_t {
   uint64_t replay_entry_artifact = 0;
   uint64_t replay_frontier_match = 0;
   uint64_t replay_terminal_match = 0;
+  // Consistent prefix of a longer learned path (see ReplayReport::reached_prefix_end).
+  uint64_t replay_prefix_end = 0;
 
   // segmented profiling (SYMAFL_PROFILE=1), default off
   bool profile_enabled = false;
@@ -941,7 +947,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   fprintf(stderr,
           "[pcbt-replay] checked=%llu cid_mismatch=%llu dir_mismatch=%llu "
           "after_terminal=%llu truncated=%llu frontier_match=%llu "
-          "terminal_match=%llu timeout_skipped=%llu entry_artifact=%llu\n",
+          "terminal_match=%llu prefix_end=%llu timeout_skipped=%llu "
+          "crash_skipped=%llu entry_artifact=%llu\n",
           (unsigned long long)data->replay_checked,
           (unsigned long long)data->replay_cid_mismatch,
           (unsigned long long)data->replay_direction_mismatch,
@@ -949,7 +956,9 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->replay_truncated,
           (unsigned long long)data->replay_frontier_match,
           (unsigned long long)data->replay_terminal_match,
+          (unsigned long long)data->replay_prefix_end,
           (unsigned long long)data->replay_timeout_skipped,
+          (unsigned long long)data->replay_crash_skipped,
           (unsigned long long)data->replay_entry_artifact);
   fprintf(stderr,
           "[pcbt-opaque] invalid_root=%llu invalid_label=%llu initializing_label=%llu "
@@ -1245,6 +1254,20 @@ static bool replay_check_trace(my_mutator_t *data,
     data->replay_timeout_skipped += 1;
     return true;
   }
+  // Crash / signal death on THIS run (e.g. SIGSEGV). Use WIFSIGNALED on the
+  // current child_status — fsrv.last_kill_signal is sticky (not cleared on
+  // FSRV_RUN_OK) and would false-positive every later run after one crash.
+  // Incomplete stream by construction, not entry_artifact / truncated.
+  // Timeouts already returned above (also WIFSIGNALED with SIGKILL).
+  if (WIFSIGNALED(data->afl->fsrv.child_status)) {
+    data->replay_crash_skipped += 1;
+    WARNF("[pcbt-replay] crash-skipped: kill_sig=%u events=%zu "
+          "pipe_bytes=%zu input_len=%zu; skip\n",
+          (unsigned)WTERMSIG(data->afl->fsrv.child_status), events.size(),
+          data->afl->fsrv.sym_trace_len, buf_size);
+    (void)capture_anomaly_case(data, "crash-skipped", events, buf, buf_size);
+    return true;
+  }
   // post_run already replayed this run's full stream (SYMAFL_REPLAY_ALL);
   // queue_new_entry's insert must not count it a second time.
   if (data->replay_run_done) {
@@ -1259,6 +1282,8 @@ static bool replay_check_trace(my_mutator_t *data,
   //       the learned tree entry is a constraint (stale/partial pipe).
   // Always dump the candidate input + raw pipe into anomaly-cases so the
   // counter is reproducible offline.
+  // Note: crash/timeout already returned above, so empty streams here are
+  // clean-exit empty captures (true transport/path defects).
   if (!is_suffix) {
     const pcbt::NodeRef entry = data->tree.root_child0();
     const bool have_entry =
@@ -1298,6 +1323,7 @@ static bool replay_check_trace(my_mutator_t *data,
   if (report.error == pcbt::Tree::ReplayError::None) {
     if (report.reached_terminal) data->replay_terminal_match += 1;
     else if (report.reached_frontier) data->replay_frontier_match += 1;
+    else if (report.reached_prefix_end) data->replay_prefix_end += 1;
     return true;
   }
   // Replay-validation mismatches are trace conflicts too: count them in the

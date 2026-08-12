@@ -1156,14 +1156,27 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     }
   }
   if (!stopped) {
-    // All events consumed without hitting terminal or frontier: the tree
-    // expects more conditions.  This can happen after the last event if
-    // cur.child[dir] points to another node (not kTerminal/Unexplored).
+    // All events consumed without hitting terminal or frontier.
+    // Empty stream against a non-empty tree is still incomplete capture /
+    // entry-fork territory (TruncatedTrace); the mutator usually quarantines
+    // it earlier as entry_artifact.
+    //
+    // Non-empty complete streams that end while the tree continues deeper
+    // are consistent prefixes of a longer learned path. InsertTrace already
+    // accepts that case without conflict (see InsertTrace when i==size and
+    // child[dir] is already a deeper node). Replay must match: counting it
+    // as TruncatedTrace hard-fails legitimate early-exit executions under
+    // REPLAY_ALL and poisons the hard gate / quality census.
     r.verified_events = logic;
-    r.mismatch_node = cur;
     r.event_index = i;
-    r.error = ReplayError::TruncatedTrace;
-    if (debug_) DebugPredicate(cur, input, len);
+    if (logic == 0) {
+      r.mismatch_node = cur;
+      r.error = ReplayError::TruncatedTrace;
+      if (debug_) DebugPredicate(cur, input, len);
+    } else {
+      r.reached_prefix_end = true;
+      // error stays None
+    }
   }
   return r;
 }
