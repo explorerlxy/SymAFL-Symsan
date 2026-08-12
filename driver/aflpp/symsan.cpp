@@ -753,10 +753,10 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   const pcbt::Tree &t = data->tree;
   fprintf(stderr,
           "[pcbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
-          "opaque=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
+          "opaque=%llu tautology=%llu failed=%llu timeouts=%llu memerr=%llu screened=%llu "
           "admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
           "single_pass=%llu single_pass_overflow=%llu "
-          "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
+          "admit_empty=%llu admit_opaque=%llu follow_tautology=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu probe_admitted=%llu probe_gained=%llu "
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
@@ -767,6 +767,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)t.max_depth,
           (unsigned long long)t.num_conflicts,
           (unsigned long long)t.num_opaque,
+          (unsigned long long)t.num_tautology,
           (unsigned long long)data->failed_runs,
           (unsigned long long)data->trace_timeouts,
           (unsigned long long)data->memerr_events,
@@ -779,6 +780,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->single_pass_overflows,
           (unsigned long long)t.check_admit_empty,
           (unsigned long long)t.check_admit_opaque,
+          (unsigned long long)t.check_follow_tautology,
           (unsigned long long)t.check_admit_eval_failure,
           (unsigned long long)t.check_admit_frontier,
           (unsigned long long)t.check_admit_unstable,
@@ -2426,10 +2428,10 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
   const pcbt::Tree &t = data->tree;
   snprintf(buf, sizeof(buf),
            "traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu opaque=%llu "
-           "failed=%llu timeouts=%llu memerr=%llu "
+           "tautology=%llu failed=%llu timeouts=%llu memerr=%llu "
            "screened=%llu admitted=%llu vetoed=%llu traced_entries=%llu saturated=%llu "
            "single_pass=%llu single_pass_overflow=%llu "
-           "admit_empty=%llu admit_opaque=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
+           "admit_empty=%llu admit_opaque=%llu follow_tautology=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
            "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu probe_admitted=%llu probe_gained=%llu "
            "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
            "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
@@ -2439,6 +2441,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)t.max_depth,
            (unsigned long long)t.num_conflicts,
            (unsigned long long)t.num_opaque,
+           (unsigned long long)t.num_tautology,
            (unsigned long long)data->failed_runs,
            (unsigned long long)data->trace_timeouts,
            (unsigned long long)data->memerr_events,
@@ -2451,6 +2454,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)data->single_pass_overflows,
            (unsigned long long)t.check_admit_empty,
            (unsigned long long)t.check_admit_opaque,
+           (unsigned long long)t.check_follow_tautology,
            (unsigned long long)t.check_admit_eval_failure,
            (unsigned long long)t.check_admit_frontier,
            (unsigned long long)t.check_admit_unstable,

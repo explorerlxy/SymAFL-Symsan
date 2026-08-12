@@ -98,7 +98,16 @@ struct StringByte {
 
 struct Predicate {
   uint32_t root = 0;
+  // True conversion failure / unsupported grammar (telemetry). Prefer
+  // tautology for event-alignment nodes that have a unique fixed direction.
   bool opaque = false;
+  // Runtime emitted a symbolic event (label != 0) but insert proved the
+  // decision does not depend on the candidate (constant-true/false after
+  // conversion, e.g. extract of the constant half of a 128-bit concat).
+  // CheckInput follows fixed_dir and continues; it must not admit the whole
+  // candidate. fixed_dir is 0 or 1 (the unique branch).
+  bool tautology = false;
+  uint8_t fixed_dir = 0;
   PredError error = PredError::None;
   uint16_t error_op = 0;
   // input-read set of this predicate: sorted unique (offset, nbytes) pairs

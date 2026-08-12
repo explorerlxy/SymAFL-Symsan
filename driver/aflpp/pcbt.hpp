@@ -222,10 +222,12 @@ class Tree {
   uint64_t num_traces = 0;
   uint64_t num_events = 0;
   uint64_t num_conflicts = 0;
-  uint64_t num_opaque = 0;
+  uint64_t num_opaque = 0;     // legacy converter-fail telemetry (prefer tautology)
+  uint64_t num_tautology = 0;  // fixed-direction constant decisions
   uint64_t max_depth = 0;
   uint64_t check_admit_empty = 0;
-  uint64_t check_admit_opaque = 0;
+  uint64_t check_admit_opaque = 0;  // DEPRECATED: opaque no longer whole-admits
+  uint64_t check_follow_tautology = 0;  // walked through a tautology node
   uint64_t check_admit_eval_failure = 0;
   uint64_t check_admit_frontier = 0;
   uint64_t check_admit_len_veto = 0;  // terminal veto downgraded to admit

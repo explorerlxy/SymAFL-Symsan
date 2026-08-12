@@ -92,9 +92,11 @@ void Tree::DebugPredicate(NodeRef ref, const uint8_t *input,
                           uint32_t len) const {
   if (ref == kUnexplored || ref == kTerminal || ref == kRoot) return;
   const Node &n = node(ref);
-  fprintf(stderr, "[pcbt-dbg] node=%u cid=%u depth=%u opaque=%d\n",
-          ref, n.cid, n.depth, n.pred.opaque ? 1 : 0);
-  if (n.pred.opaque) return;
+  fprintf(stderr,
+          "[pcbt-dbg] node=%u cid=%u depth=%u opaque=%d tautology=%d fixed_dir=%u\n",
+          ref, n.cid, n.depth, n.pred.opaque ? 1 : 0, n.pred.tautology ? 1 : 0,
+          n.pred.fixed_dir);
+  if (n.pred.opaque || n.pred.tautology) return;
   fprintf(stderr, "[pcbt-dbg] reads:");
   for (const auto &r : n.pred.reads) {
     fprintf(stderr, " %u+%u=[", r.first, r.second);
@@ -182,60 +184,45 @@ static inline uint32_t child_skip_cnt(const Node &parent, uint8_t parent_dir,
 }
 
 // True when the DAG freezes a large absolute constant that is neither a
-// small bit-mask nor a small negative. Incomplete taint of pointer
-// arithmetic (FSE sequence lengths into iLitEnd/oMatchEnd bounds checks)
-// freezes stack/heap bases from the training run; those bases are not
-// candidate-invariant when earlier omitted decisions change layout.
-static bool pred_has_abs_addr_const(const PredArena &arena,
-                                    const Predicate &pred) {
-  if (pred.opaque || pred.root >= arena.nodes.size()) return false;
-  std::vector<uint32_t> stack = {pred.root};
-  std::vector<uint8_t> seen(arena.nodes.size(), 0);
-  while (!stack.empty()) {
-    uint32_t idx = stack.back();
-    stack.pop_back();
-    if (idx >= arena.nodes.size() || seen[idx]) continue;
-    seen[idx] = 1;
-    const PNode &nd = arena.nodes[idx];
-    if (nd.kind == PKind::Const && nd.bits >= 48) {
-      const uint64_t v = nd.value;
-      // 48/64-bit constants above the 32-bit space are almost always
-      // frozen stack/heap bases. Keep 32-bit magic numbers (zstd frame
-      // magic 0xfd2fb528), small bit-masks, and small negatives
-      // (EOF/-1, WILDCOPY_OVERLENGTH as -32) modellable.
-      if (v > 0xFFFFFFFFULL && v < (~uint64_t{0} - 0xFFFFULL)) return true;
-    }
-    if (nd.a != UINT32_MAX) stack.push_back(nd.a);
-    if (nd.b != UINT32_MAX) stack.push_back(nd.b);
-  }
-  return false;
-}
+// Classify an inserted predicate (D1 tautology / D2-A no abs-addr flood):
+// - Converter-opaque, train-eval mismatch, or input-free constant decisions
+//   become tautology nodes: unique fixed_dir; CheckInput continues walk.
+// - Absolute-address + input is NOT fail-closed: leave evaluable so screening
+//   stays active (P2 must complete taint for those models).
+static Predicate classify_inserted_predicate(const PredArena &arena,
+                                             Predicate pred,
+                                             const uint8_t *input,
+                                             uint32_t len,
+                                             uint8_t expected_result) {
+  const uint8_t fixed = expected_result ? 1 : 0;
+  auto as_tautology = [&](Predicate p) {
+    p.tautology = true;
+    p.fixed_dir = fixed;
+    p.opaque = false;  // screening uses tautology, not whole-admit opaque
+    return p;
+  };
 
-// Fail-closed insertion guard for incomplete predicate models:
-// 1) Self-check: must reproduce the training run's observed direction.
-// 2) Absolute-address + input mix: a partially tainted pointer comparison
-//    freezes training-run bases while sampling input bits; it agrees on
-//    the training candidate but disagrees on later ones (zstd cid
-//    595640479 residual dir_mismatch). Pure constants (no reads) are
-//    allowed after ICmp pinning; they evaluate the same for every
-//    candidate.
-// Mark opaque so CheckInput admits conservatively.
-static Predicate selfcheck_predicate(const PredArena &arena, Predicate pred,
-                                     const uint8_t *input, uint32_t len,
-                                     uint8_t expected_result) {
-  if (pred.opaque) return pred;
-  if (!pred.reads.empty() && pred_has_abs_addr_const(arena, pred)) {
-    pred.opaque = true;
-    pred.error = PredError::UnsupportedOp;
+  if (pred.opaque) return as_tautology(pred);
+
+  if (input == nullptr) {
+    if (pred.reads.empty() && !pred_has_len_kind(arena, pred))
+      return as_tautology(pred);
     return pred;
   }
-  if (input == nullptr) return pred;
+
   uint64_t v = 0;
-  if (!eval_predicate(arena, pred, input, len, &v) ||
-      ((v != 0) ? 1 : 0) != (expected_result ? 1 : 0)) {
-    pred.opaque = true;
-    pred.error = PredError::UnsupportedOp;
+  const bool ok = eval_predicate(arena, pred, input, len, &v);
+  const uint8_t edir = (ok && v != 0) ? 1 : 0;
+  if (!ok || edir != fixed) {
+    if (!ok) pred.error = PredError::UnsupportedOp;
+    return as_tautology(pred);
   }
+
+  // Candidate-independent decision: no input-byte reads and no length/count
+  // leaves (EofRead/Count* still candidate-dependent via input length).
+  if (pred.reads.empty() && !pred_has_len_kind(arena, pred))
+    return as_tautology(pred);
+
   return pred;
 }
 
@@ -281,7 +268,9 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     uint64_t v = 0;
     bool evaluated = false;
     uint8_t edir;
-    if (cn.pred.opaque || input == nullptr) {
+    if (cn.pred.tautology) {
+      edir = cn.pred.fixed_dir;
+    } else if (cn.pred.opaque || input == nullptr) {
       edir = ev.result ? 1 : 0;  // follow the recorded direction
     } else {
       evaluated = eval_predicate(pred_arena_, cn.pred, input, len, &v, &eval);
@@ -369,7 +358,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     k = 0;
     for (const Predicate &raw_pred : preds) {
       Predicate pred =
-          selfcheck_predicate(pred_arena_, raw_pred, input, len, ev.result);
+          classify_inserted_predicate(pred_arena_, raw_pred, input, len, ev.result);
       Node new_node;
       new_node.cid = ev.cid;
       new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
@@ -379,7 +368,13 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.pred = pred;
       new_node.constraint = ev.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
-      if (pred.opaque) {
+      if (pred.tautology) {
+        num_tautology += 1;
+        if (pred.error != PredError::None) {
+          opaque_by_error[static_cast<size_t>(pred.error)] += 1;
+          if (pred.error_op) opaque_by_op[pred.error_op] += 1;
+        }
+      } else if (pred.opaque) {
         num_opaque += 1;
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
         if (pred.error_op) opaque_by_op[pred.error_op] += 1;
@@ -389,7 +384,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       if (next == kUnexplored) return created;
       node(parent).child[dir] = next;
       parent = next;
-      dir = ev.result ? 1 : 0;
+      dir = pred.tautology ? pred.fixed_dir : (ev.result ? 1 : 0);
       created += 1;
       trace_depth += 1;
     }
@@ -478,7 +473,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       preds.push_back(conv.conv(event.label));
     }
     for (const Predicate &raw_pred : preds) {
-      Predicate pred = selfcheck_predicate(pred_arena_, raw_pred, input, len,
+      Predicate pred = classify_inserted_predicate(pred_arena_, raw_pred, input, len,
                                            event.result);
       total_events_seen++;
 
@@ -529,7 +524,13 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.pred = pred;
       new_node.constraint = event.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
-      if (pred.opaque) {
+      if (pred.tautology) {
+        num_tautology += 1;
+        if (pred.error != PredError::None) {
+          opaque_by_error[static_cast<size_t>(pred.error)] += 1;
+          if (pred.error_op) opaque_by_op[pred.error_op] += 1;
+        }
+      } else if (pred.opaque) {
         num_opaque += 1;
         opaque_by_error[static_cast<size_t>(pred.error)] += 1;
         if (pred.error_op) opaque_by_op[pred.error_op] += 1;
@@ -539,7 +540,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       if (next == kUnexplored) return created;
       node(cur).child[dir] = next;
       cur = next;
-      dir = event.result ? 1 : 0;
+      dir = pred.tautology ? pred.fixed_dir : (event.result ? 1 : 0);
       created += 1;
     }
   }
@@ -625,15 +626,46 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       finish_profile(3, walked);
       return false;
     }
-    if (current.pred.opaque) {
-      // An opaque predicate has no sound candidate-dependent direction.
-      // Never infer one from child topology: doing so turns an unsupported
-      // expression such as idx_merge into a fabricated terminal proof.
-      *out_node = kUnexplored;
-      *out_dir = 0;
-      check_admit_opaque += 1;
-      finish_profile(1, walked);
-      return true;
+    // Tautology: unique fixed direction (constant decision). Continue walk;
+    // never whole-candidate admit. Legacy opaque is treated the same when
+    // fixed_dir was recorded (should not remain after classify_inserted).
+    if (current.pred.tautology || current.pred.opaque) {
+      uint8_t dir = current.pred.tautology ? current.pred.fixed_dir : 0;
+      if (current.pred.tautology) check_follow_tautology += 1;
+      else check_admit_opaque += 1;  // legacy residual path (should be ~0)
+      NodeRef next = current.child[dir];
+      if (next == kTerminal) {
+        *out_node = kUnexplored;
+        *out_dir = 0;
+        if (out_veto_depth) *out_veto_depth = current.depth;
+        if (out_veto_node) *out_veto_node = cur;
+        if (out_veto_dir) *out_veto_dir = dir;
+        if (out_veto_kind) *out_veto_kind = 0;
+        check_veto_terminal += 1;
+        finish_profile(4, walked);
+        return false;
+      }
+      if (next == kUnexplored) {
+        *out_node = cur;
+        *out_dir = dir;
+        const uint8_t edge_rlimit = current.constraint && current.len_related
+                                         ? len_rlimit
+                                         : rlimit;
+        if (rlimit_unlimited_ || current.rCnt[dir] < edge_rlimit) {
+          check_admit_frontier += 1;
+          finish_profile(3, walked);
+          return true;
+        }
+        if (out_veto_depth) *out_veto_depth = current.depth;
+        if (out_veto_node) *out_veto_node = cur;
+        if (out_veto_dir) *out_veto_dir = dir;
+        if (out_veto_kind) *out_veto_kind = 1;
+        check_veto_rlimit += 1;
+        finish_profile(5, walked);
+        return false;
+      }
+      cur = next;
+      continue;
     }
     uint64_t v = 0;
     if (!eval_predicate(pred_arena_, current.pred, input, len, &v, &eval,
@@ -718,6 +750,13 @@ bool Tree::IsSaturated(uint8_t rlimit, uint8_t len_rlimit) const {
 bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const {
   const Node &current = node(ref);
   if (current.unstable) return false;
+  // Tautology has a single meaningful direction; the other edge is ignored.
+  if (current.pred.tautology) {
+    NodeRef next = current.child[current.pred.fixed_dir];
+    if (next == kTerminal) return true;
+    if (next == kUnexplored) return false;
+    return IsSaturated(next, rlimit, len_rlimit);
+  }
   if (current.pred.opaque) return false;
   for (uint8_t direction = 0; direction != 2; ++direction) {
     NodeRef next = current.child[direction];
@@ -775,9 +814,11 @@ Tree::ReplayReport Tree::ReplayFullTrace(
         const Node &constraint = node(cur);
         uint64_t v = 0;
         uint8_t dir = ev.result ? 1 : 0;
-        if (!constraint.pred.opaque &&
-            eval_predicate(pred_arena_, constraint.pred, input, len, &v,
-                           &eval)) {
+        if (constraint.pred.tautology) {
+          dir = constraint.pred.fixed_dir;
+        } else if (!constraint.pred.opaque &&
+                   eval_predicate(pred_arena_, constraint.pred, input, len, &v,
+                                  &eval)) {
           dir = v ? 1 : 0;
         }
         if (constraint.cid != ev.cid) {
@@ -831,9 +872,59 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     // frontier is accepted as the start of the suffix.  A CID mismatch at an
     // existing node is always a trace conflict, including when its evaluated
     // child is unexplored: the event stream has already drifted at this node.
+    // Tautology: follow fixed_dir (must match the stream event for a
+    // consistent tree). Continue into the child like an ordinary step.
+    if (current.pred.tautology) {
+      uint8_t dir = current.pred.fixed_dir;
+      if (current.cid != ev.cid) {
+        r.mismatch_node = cur;
+        r.error = ReplayError::CidMismatch;
+        r.event_index = i;
+        r.expected_cid = current.cid;
+        r.observed_cid = ev.cid;
+        return false;
+      }
+      if ((ev.result ? 1 : 0) != dir) {
+        r.mismatch_node = cur;
+        r.error = ReplayError::DirectionMismatch;
+        r.event_index = i;
+        r.expected_cid = current.cid;
+        r.observed_cid = ev.cid;
+        r.evaluated_dir = dir;
+        r.observed_dir = ev.result ? 1 : 0;
+        r.direction_checked = true;
+        return false;
+      }
+      NodeRef next = current.child[dir];
+      if (next == kTerminal) {
+        if (logic < trace_total) {
+          r.mismatch_node = cur;
+          r.error = ReplayError::AfterTerminal;
+          r.event_index = i;
+          r.verified_events = logic;
+          return false;
+        }
+        r.event_index = i;
+        r.verified_events = logic;
+        r.reached_terminal = true;
+        return false;
+      }
+      if (next == kUnexplored) {
+        r.event_index = i;
+        r.verified_events = logic;
+        r.reached_frontier = true;
+        r.frontier_node = cur;
+        r.frontier_dir = dir;
+        r.suffix_begin = logic;
+        return false;
+      }
+      cur = next;
+      return true;
+    }
     if (current.pred.opaque) {
+      // Legacy residual: treat like tautology using stream direction.
       r.event_index = i;
-      r.verified_events = logic - 1;  // events before this opaque one
+      r.verified_events = logic - 1;
       r.reached_frontier = true;
       r.frontier_node = cur;
       r.frontier_dir = ev.result;
