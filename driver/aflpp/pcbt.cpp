@@ -401,12 +401,31 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   }
 
   if (i == events.size() && k == 0) {
-    if (node(parent).child[dir] == kUnexplored) {
+    NodeRef ch = node(parent).child[dir];
+    if (ch == kUnexplored) {
       // The trace ends exactly at this edge: the decision (or the pinned
       // constraint value) produced no further symbolic decisions, so the
       // branch terminates here.
       node(parent).child[dir] = kTerminal;
+    } else if (ch != kTerminal && ch >= kRoot && ch < nodes_.size()) {
+      // Complete stream ends on an edge already extended by a longer path.
+      // A finished short execution must own a Terminal here (or must have
+      // diverged earlier via a symbolic branch). Silent "prefix accept" hides
+      // a collection/model hole and makes REPLAY_ALL TruncatedTrace the only
+      // exposure. Mirror AfterTerminal: conflict + mark unstable, no insert.
+      node(parent).unstable = true;
+      num_conflicts += 1;
+      if (diag_conflicts_)
+        fprintf(stderr,
+                "[pcbt-conflict] InsertTrace early-end marks parent=%u "
+                "cid=%u depth=%u unstable (child=%u already extended; "
+                "complete short stream has no Terminal edge)\n",
+                parent, node(parent).cid, node(parent).depth, ch);
+      if (out_tail_node) *out_tail_node = parent;
+      if (out_tail_dir) *out_tail_dir = dir;
+      return 0;
     }
+    // ch == kTerminal: already closed, consistent.
     if (out_tail_node) *out_tail_node = parent;
     if (out_tail_dir) *out_tail_dir = dir;
     return 0;
@@ -1156,27 +1175,16 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     }
   }
   if (!stopped) {
-    // All events consumed without hitting terminal or frontier.
-    // Empty stream against a non-empty tree is still incomplete capture /
-    // entry-fork territory (TruncatedTrace); the mutator usually quarantines
-    // it earlier as entry_artifact.
-    //
-    // Non-empty complete streams that end while the tree continues deeper
-    // are consistent prefixes of a longer learned path. InsertTrace already
-    // accepts that case without conflict (see InsertTrace when i==size and
-    // child[dir] is already a deeper node). Replay must match: counting it
-    // as TruncatedTrace hard-fails legitimate early-exit executions under
-    // REPLAY_ALL and poisons the hard gate / quality census.
+    // All events consumed without hitting terminal or frontier: the tree
+    // still expects more conditions on this walk. A complete short execution
+    // must have its own Terminal edge; sharing a pure event-prefix with a
+    // longer learned path without an earlier symbolic divergence is a
+    // collection/insert defect (not a soft success). Surface as TruncatedTrace.
     r.verified_events = logic;
+    r.mismatch_node = cur;
     r.event_index = i;
-    if (logic == 0) {
-      r.mismatch_node = cur;
-      r.error = ReplayError::TruncatedTrace;
-      if (debug_) DebugPredicate(cur, input, len);
-    } else {
-      r.reached_prefix_end = true;
-      // error stays None
-    }
+    r.error = ReplayError::TruncatedTrace;
+    if (debug_) DebugPredicate(cur, input, len);
   }
   return r;
 }

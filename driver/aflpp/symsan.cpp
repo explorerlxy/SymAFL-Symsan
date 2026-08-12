@@ -180,8 +180,6 @@ struct my_mutator_t {
   uint64_t replay_entry_artifact = 0;
   uint64_t replay_frontier_match = 0;
   uint64_t replay_terminal_match = 0;
-  // Consistent prefix of a longer learned path (see ReplayReport::reached_prefix_end).
-  uint64_t replay_prefix_end = 0;
 
   // segmented profiling (SYMAFL_PROFILE=1), default off
   bool profile_enabled = false;
@@ -947,7 +945,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
   fprintf(stderr,
           "[pcbt-replay] checked=%llu cid_mismatch=%llu dir_mismatch=%llu "
           "after_terminal=%llu truncated=%llu frontier_match=%llu "
-          "terminal_match=%llu prefix_end=%llu timeout_skipped=%llu "
+          "terminal_match=%llu timeout_skipped=%llu "
           "crash_skipped=%llu entry_artifact=%llu\n",
           (unsigned long long)data->replay_checked,
           (unsigned long long)data->replay_cid_mismatch,
@@ -956,7 +954,6 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->replay_truncated,
           (unsigned long long)data->replay_frontier_match,
           (unsigned long long)data->replay_terminal_match,
-          (unsigned long long)data->replay_prefix_end,
           (unsigned long long)data->replay_timeout_skipped,
           (unsigned long long)data->replay_crash_skipped,
           (unsigned long long)data->replay_entry_artifact);
@@ -1323,7 +1320,6 @@ static bool replay_check_trace(my_mutator_t *data,
   if (report.error == pcbt::Tree::ReplayError::None) {
     if (report.reached_terminal) data->replay_terminal_match += 1;
     else if (report.reached_frontier) data->replay_frontier_match += 1;
-    else if (report.reached_prefix_end) data->replay_prefix_end += 1;
     return true;
   }
   // Replay-validation mismatches are trace conflicts too: count them in the
@@ -1397,13 +1393,11 @@ static bool replay_check_trace(my_mutator_t *data,
     // be identified (which bytes it reads, what comparison it performs).
     data->tree.DebugPredicate(report.mismatch_node, buf, (uint32_t)buf_size);
   }
-  if (data->tree.conflict_diag() &&
-      report.error == pcbt::Tree::ReplayError::TruncatedTrace && buf &&
+  if (report.error == pcbt::Tree::ReplayError::TruncatedTrace && buf &&
       buf_size > 0) {
-    // Truncated-trace forensics: the candidate's stream ended mid-tree-path.
-    // Print the input head so the entry/decision gap can be diagnosed
-    // (empty/short inputs often skip the fread length constraint or an
-    // entry fork the tree assumes every candidate passes).
+    // Always-on truncated forensics: complete stream ended mid-tree-path.
+    // The short execution should have diverged earlier or closed a Terminal;
+    // dump last events + the next expected node for RCA.
     size_t shown = buf_size < 64 ? buf_size : 64;
     fprintf(stderr,
             "[pcbt-replay] truncated input len=%zu events=%zu "
@@ -1415,15 +1409,27 @@ static bool replay_check_trace(my_mutator_t *data,
     for (size_t k = 0; k < shown; ++k)
       fprintf(stderr, "%02x", buf[k]);
     fprintf(stderr, "%s\n", shown < buf_size ? " TRUNC" : "");
+    if (!events.empty()) {
+      size_t n = events.size() < 5 ? events.size() : 5;
+      fprintf(stderr, "[pcbt-replay] truncated last_events:");
+      for (size_t k = events.size() - n; k < events.size(); ++k) {
+        const pcbt::Event &ev = events[k];
+        fprintf(stderr, " [%zu cid=%u res=%u c=%u n=%u]", k, ev.cid, ev.result,
+                ev.constraint, ev.count);
+      }
+      fprintf(stderr, "\n");
+    }
     if (report.mismatch_node != pcbt::kUnexplored) {
       fprintf(stderr,
               "[pcbt-replay] truncated at tree node=%u cid=%u depth=%u "
-              "constraint=%d len_related=%d\n",
+              "constraint=%d len_related=%d (next expected after full short "
+              "stream; short should have Terminal or earlier diverge)\n",
               report.mismatch_node,
               data->tree.cid_of(report.mismatch_node),
               data->tree.depth(report.mismatch_node),
               data->tree.is_constraint(report.mismatch_node) ? 1 : 0,
               data->tree.is_len_related(report.mismatch_node) ? 1 : 0);
+      data->tree.DebugPredicate(report.mismatch_node, buf, (uint32_t)buf_size);
     }
   }
   if (data->tree.debug() && report.event_index < events.size()) {
