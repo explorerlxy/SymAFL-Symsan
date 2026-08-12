@@ -111,8 +111,9 @@ class Tree {
   // path and created the terminal edge). *out_veto_kind classifies the veto:
   // 0 = terminal-class (the tree claims the decision trace terminates here -
   //   a probe-gained candidate here is evidence of a missed symbolic
-  //   decision), 1 = rlimit (retry budget exhausted on an unexplored edge -
-  //   the designed trade-off).
+  //   decision / TVBG), 1 = rlimit (retry budget exhausted on an unexplored
+  //   edge - the designed trade-off), 2 = unstable prefix (tree is not a
+  //   safe terminal proof; probe gain is not TVBG).
   bool CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                   uint8_t *out_dir, uint8_t rlimit,
                   uint32_t *out_veto_depth = nullptr,

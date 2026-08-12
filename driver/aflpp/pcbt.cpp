@@ -763,7 +763,9 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       if (out_veto_node) *out_veto_node = cur;
       if (out_veto_dir) *out_veto_dir = 0;
       if (out_veto_depth) *out_veto_depth = current.depth;
-      if (out_veto_kind) *out_veto_kind = 0; // not a real terminal
+      // Distinct from terminal (0): unstable veto must not inflate TVBG when
+      // a probe gains coverage (libxml2 RQ1 false-positive at node 405844).
+      if (out_veto_kind) *out_veto_kind = 2;
       *out_node = cur;
       *out_dir = 0;
       check_veto_unstable += 1;

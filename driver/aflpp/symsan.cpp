@@ -169,6 +169,11 @@ struct my_mutator_t {
   // SYMAFL_REPLAY_ALL=1: replay EVERY admitted run's full stream against the
   // tree (including non-gaining runs), not only coverage-gaining runs.
   bool replay_all = false;
+  // Quality contract: on first hard residual counter bump, stop_soon + marker
+  // so the instance keeps forensics and exits into RCA (no further testing).
+  // Default on with REPLAY_ALL; override with SYMAFL_ABORT_ON_RESIDUAL=0/1.
+  bool abort_on_residual = false;
+  bool residual_abort_fired = false;
   // Set by post_run after it replayed the current run; consumed by
   // queue_new_entry's insert so a gaining run is not replayed twice.
   bool replay_run_done = false;
@@ -255,7 +260,7 @@ struct my_mutator_t {
   uint64_t diag_veto_depth[17] = {};
   uint32_t last_veto_depth = 0;
   pcbt::NodeRef last_veto_node = pcbt::kUnexplored;
-  uint8_t last_veto_kind = 0;         // 0 = terminal-class, 1 = rlimit
+  uint8_t last_veto_kind = 0;         // 0=terminal, 1=rlimit, 2=unstable
   uint8_t last_probe_veto_kind = 0;   // veto kind of the last probe candidate
   uint8_t last_probe_input[64] = {};
   uint32_t last_probe_input_len = 0;
@@ -662,6 +667,24 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     fprintf(stderr, "[pcbt] replay-all enabled: EVERY admitted run (gaining "
             "and non-gaining) is full-pipe captured and replayed against "
             "the tree; mismatches mark nodes unstable and are counted\n");
+  }
+  // Abort-on-residual: default ON when REPLAY_ALL (quality/RQ1). First hard
+  // residual stops the instance immediately so logs/forensics are retained and
+  // the agent enters RCA instead of burning the rest of MIN_SCREENED/1e6.
+  {
+    const char *aor = getenv("SYMAFL_ABORT_ON_RESIDUAL");
+    if (aor && aor[0] == '0' && aor[1] == '\0') {
+      data->abort_on_residual = false;
+    } else if (aor && aor[0] == '1' && aor[1] == '\0') {
+      data->abort_on_residual = true;
+    } else {
+      data->abort_on_residual = data->replay_all || data->replay_check;
+    }
+    if (data->abort_on_residual) {
+      fprintf(stderr,
+              "[pcbt] abort-on-residual: first hard residual sets stop_soon "
+              "and writes ABORT_RESIDUAL (quality contract)\n");
+    }
   }
   // rlimit-unlimited quality mode: bypass the rCnt/rlimit budget so every
   // candidate that reaches an unexplored edge is admitted. Setting rlimit to
@@ -1224,6 +1247,39 @@ static bool decode_pipe_events(my_mutator_t *data,
   return false;
 }
 
+// Quality contract: first hard residual aborts the instance (keep forensics).
+// Does not fire for transport demotions (short_capture_skipped) or stop_soon
+// empty captures. Marker files let lean-pcbt-run / hunt-residuals stop the
+// outer campaign without waiting for MIN_SCREENED.
+static void request_residual_abort(my_mutator_t *data, const char *reason) {
+  if (!data || !data->abort_on_residual || data->residual_abort_fired) return;
+  data->residual_abort_fired = true;
+  data->afl->stop_soon = 1;
+  fprintf(stderr,
+          "[pcbt-abort] residual=%s — stop_soon=1; keep forensics; "
+          "do not continue testing until RCA/fix\n",
+          reason ? reason : "unknown");
+  // Prefer forensics parent (EVID/) then forensics_dir itself.
+  auto write_marker = [](const char *path, const char *reason) {
+    if (!path || !*path) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fprintf(f, "residual=%s\n", reason ? reason : "unknown");
+    fprintf(f, "action=retain_logs_and_exit\n");
+    fprintf(f, "next=RCA_then_fix_then_retest\n");
+    fclose(f);
+  };
+  if (data->forensics_dir) {
+    char marker[PATH_MAX];
+    // $EVID/forensics -> $EVID/ABORT_RESIDUAL
+    snprintf(marker, sizeof(marker), "%s/../ABORT_RESIDUAL",
+             data->forensics_dir);
+    write_marker(marker, reason);
+    snprintf(marker, sizeof(marker), "%s/ABORT_RESIDUAL", data->forensics_dir);
+    write_marker(marker, reason);
+  }
+}
+
 // Direct re-exec of the concolic target for TruncatedTrace isolation.
 // Uses posix_spawn (AFL is multi-threaded; plain fork is unsafe).
 // Returns true when a stream was collected into *out.
@@ -1483,6 +1539,7 @@ static bool replay_check_trace(my_mutator_t *data,
             data->afl->fsrv.last_run_timed_out);
       (void)capture_anomaly_case(data, "entry-artifact", events, buf,
                                  buf_size);
+      request_residual_abort(data, "entry_artifact");
       return true;
     }
   }
@@ -1580,6 +1637,8 @@ static bool replay_check_trace(my_mutator_t *data,
       break;
     default: break;
   }
+  // Hard residual (not short_capture demotion): abort quality instance now.
+  request_residual_abort(data, err_name);
   if (report.mismatch_node != pcbt::kUnexplored) {
     // A truncated trace (stream ends mid-path) is a structural disagreement
     // like any other: the tree claims a decision here that the candidate's
@@ -2612,6 +2671,7 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
     if (data->last_probe_veto_kind == 0) {
       data->probe_gained_terminal += 1;
       WARNF("terminal-veto-but-gain detected; stopping quality run\n");
+      request_residual_abort(data, "terminal_veto_but_gain");
       data->afl->stop_soon = 1;
       if (data->forensics_dir) {
         std::vector<pcbt::Event> events;
@@ -2641,6 +2701,15 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
                                   __dfsan_label_info, MAX_LABEL, buf, buf_size,
                                   meta);
       }
+    } else if (data->last_probe_veto_kind == 2) {
+      // Unstable-prefix veto with probe coverage gain is NOT TVBG: the tree
+      // already marked the prefix unsafe. Do not stop the quality run as a
+      // terminal residual (kind 0). Log for supporting diagnostics only.
+      fprintf(stderr,
+              "[pcbt] unstable-veto-probe-gain node=%u dir=%u depth=%u "
+              "new_bits=%u (not TVBG)\n",
+              data->last_veto_node, data->last_veto_dir, data->last_veto_depth,
+              new_bits);
     } else {
       data->probe_gained_rlimit += 1;
       // Probe learn: a vetoed candidate that gains coverage proves the
@@ -2919,6 +2988,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
 
   data->vetoed += 1;
   ++data->vetoes_since_admit;
+  // kind 0=terminal (TVBG class), 1=rlimit, 2=unstable (not TVBG).
   data->afl->pcbt_candidate_kind =
       data->last_veto_kind == 0 ? PCBT_CANDIDATE_VETO_TERMINAL
                                 : PCBT_CANDIDATE_VETO_RLIMIT;
