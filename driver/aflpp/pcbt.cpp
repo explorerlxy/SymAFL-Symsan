@@ -202,11 +202,10 @@ static bool is_struct_fault(InsertPredClass cls) {
          cls == InsertPredClass::StructTrainMismatch;
 }
 
-static InsertPredClass classify_inserted_predicate(const PredArena &arena,
-                                                   Predicate *pred,
-                                                   const uint8_t *input,
-                                                   uint32_t len,
-                                                   uint8_t expected_result) {
+static InsertPredClass classify_inserted_predicate(
+    PredArena &arena, Predicate *pred, const uint8_t *input, uint32_t len,
+    uint8_t expected_result, uint64_t concrete_op1, uint64_t concrete_op2,
+    const dfsan_label_info *table, size_t table_labels, uint32_t source_label) {
   if (pred == nullptr) return InsertPredClass::StructConvertFail;
   const uint8_t fixed = expected_result ? 1 : 0;
 
@@ -230,12 +229,24 @@ static InsertPredClass classify_inserted_predicate(const PredArena &arena,
   }
 
   uint64_t v = 0;
-  const bool ok = eval_predicate(arena, *pred, input, len, &v);
-  const uint8_t edir = (ok && v != 0) ? 1 : 0;
+  bool ok = eval_predicate(arena, *pred, input, len, &v);
+  uint8_t edir = (ok && v != 0) ? 1 : 0;
   if (!ok || edir != fixed) {
-    // Model disagrees with the same input that produced the event: structural
-    // defect. Do not freeze a lying or un-evaluable node into the tree.
-    return InsertPredClass::StructTrainMismatch;
+    // Incomplete pointer-diff / FSE size models often leave a path-local
+    // constant bias (untainted ip advances) so train eval disagrees even
+    // though the residual is input-dependent. Align both sides to the
+    // ICmp's captured concrete operands; if still wrong, fail closed.
+    if (calibrate_pointer_train_pred(arena, pred, input, len, fixed,
+                                     concrete_op1, concrete_op2, table,
+                                     table_labels, source_label)) {
+      ok = eval_predicate(arena, *pred, input, len, &v);
+      edir = (ok && v != 0) ? 1 : 0;
+    }
+    if (!ok || edir != fixed) {
+      // Model disagrees with the same input that produced the event: structural
+      // defect. Do not freeze a lying or un-evaluable node into the tree.
+      return InsertPredClass::StructTrainMismatch;
+    }
   }
 
   // Candidate-independent decision → tautology with unique direction.
@@ -381,8 +392,14 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     }
     k = 0;
     for (Predicate pred : preds) {
+      uint64_t cop1 = 0, cop2 = 0;
+      if (table && ev.label > 0 && ev.label < table_labels) {
+        cop1 = table[ev.label].op1.i;
+        cop2 = table[ev.label].op2.i;
+      }
       const InsertPredClass cls = classify_inserted_predicate(
-          pred_arena_, &pred, input, len, ev.result);
+          pred_arena_, &pred, input, len, ev.result, cop1, cop2, table,
+          table_labels, ev.label);
       if (is_struct_fault(cls)) {
         // Policy A: do not write a node; leave the frontier edge unexplored.
         insert_structural_error += 1;
@@ -522,8 +539,14 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     }
     for (Predicate pred : preds) {
       total_events_seen++;
+      uint64_t cop1 = 0, cop2 = 0;
+      if (table && event.label > 0 && event.label < table_labels) {
+        cop1 = table[event.label].op1.i;
+        cop2 = table[event.label].op2.i;
+      }
       const InsertPredClass cls = classify_inserted_predicate(
-          pred_arena_, &pred, input, len, event.result);
+          pred_arena_, &pred, input, len, event.result, cop1, cop2, table,
+          table_labels, event.label);
 
       if (!diagnostics_banner_printed) {
         if (label_pollution_diagnostics) {

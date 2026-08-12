@@ -967,28 +967,108 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
       if (b == kInvalidNode) return kInvalidNode;
     }
     // Cancel a shared frozen absolute base from both sides of a pointer
-    // comparison: ugt(base+x, base+y-32) -> ugt(x, y+(-32)). Keeps the
-    // input-dependent offset model while dropping training-run stack/heap
-    // bases that otherwise poison screening of later candidates.
+    // comparison: ugt(base+x, base+y-32) -> ugt(x, y+(-32)). Nested
+    // Add chains (zstd iLitEnd/litLimit = base+const+bits) are flattened
+    // first so the shared base is visible.
     {
-      uint64_t base_a = 0, base_b = 0;
-      uint32_t ir_a = kNoChild, ir_b = kNoChild;
-      uint32_t wrap_a = kNoChild, wrap_b = kNoChild;
-      if (peel_abs_base(*arena_, a, &base_a, &ir_a, &wrap_a) &&
-          peel_abs_base(*arena_, b, &base_b, &ir_b, &wrap_b) &&
-          base_a == base_b) {
-        auto rebuild = [&](uint32_t ir, uint32_t wrap) -> uint32_t {
-          uint32_t body = ir;
-          if (body == kNoChild) {
-            body = add_const(0, size);
-            if (body == kInvalidNode) return kInvalidNode;
+      // Copy PNode fields before any add() — residual rebuilds reallocate the
+      // arena vector and would invalidate a reference into nodes[].
+      auto flatten = [&](uint32_t node, uint64_t *base_sum, uint32_t *residual,
+                         int depth, auto &self) -> bool {
+        if (depth > 24 || node == kNoChild || node == kInvalidNode ||
+            node >= arena_->nodes.size())
+          return false;
+        const PNode nd = arena_->nodes[node];
+        if (is_abs_addr_const(nd)) {
+          *base_sum += nd.value;
+          *residual = kNoChild;
+          return true;
+        }
+        if (nd.kind == PKind::Const) {
+          *residual = node;
+          return true;
+        }
+        if (nd.kind == PKind::Add) {
+          uint64_t b1 = 0, b2 = 0;
+          uint32_t r1 = kNoChild, r2 = kNoChild;
+          if (nd.a != kNoChild && !self(nd.a, &b1, &r1, depth + 1, self))
+            return false;
+          if (nd.b != kNoChild && !self(nd.b, &b2, &r2, depth + 1, self))
+            return false;
+          *base_sum += b1 + b2;
+          if (r1 == kNoChild)
+            *residual = r2;
+          else if (r2 == kNoChild)
+            *residual = r1;
+          else {
+            *residual = add(PKind::Add, size, r1, r2);
+            if (*residual == kInvalidNode) return false;
           }
-          if (wrap == kNoChild) return body;
-          return add(PKind::Add, size, body, wrap);
+          return true;
+        }
+        if (nd.kind == PKind::Sub) {
+          uint64_t b1 = 0, b2 = 0;
+          uint32_t r1 = kNoChild, r2 = kNoChild;
+          if (nd.a != kNoChild && !self(nd.a, &b1, &r1, depth + 1, self))
+            return false;
+          if (nd.b != kNoChild && !self(nd.b, &b2, &r2, depth + 1, self))
+            return false;
+          *base_sum += b1 - b2;
+          if (r1 == kNoChild && r2 == kNoChild)
+            *residual = kNoChild;
+          else if (r2 == kNoChild)
+            *residual = r1;
+          else if (r1 == kNoChild) {
+            uint32_t z = add_const(0, size);
+            if (z == kInvalidNode) return false;
+            *residual = add(PKind::Sub, size, z, r2);
+            if (*residual == kInvalidNode) return false;
+          } else {
+            *residual = add(PKind::Sub, size, r1, r2);
+            if (*residual == kInvalidNode) return false;
+          }
+          return true;
+        }
+        if ((nd.kind == PKind::ZExt || nd.kind == PKind::SExt) &&
+            nd.a != kNoChild && nd.a < arena_->nodes.size() &&
+            arena_->nodes[nd.a].bits == nd.bits)
+          return self(nd.a, base_sum, residual, depth + 1, self);
+        *residual = node;
+        return true;
+      };
+      uint64_t base_a = 0, base_b = 0;
+      uint32_t res_a = kNoChild, res_b = kNoChild;
+      if (flatten(a, &base_a, &res_a, 0, flatten) &&
+          flatten(b, &base_b, &res_b, 0, flatten) && base_a != 0 &&
+          base_a == base_b) {
+        auto as_body = [&](uint32_t res) -> uint32_t {
+          if (res == kNoChild) return add_const(0, size);
+          return res;
         };
-        a = rebuild(ir_a, wrap_a);
-        b = rebuild(ir_b, wrap_b);
+        a = as_body(res_a);
+        b = as_body(res_b);
         if (a == kInvalidNode || b == kInvalidNode) return kInvalidNode;
+      } else {
+        // Shallow peel fallback (wrap-const around single base Add).
+        uint64_t ba = 0, bb = 0;
+        uint32_t ir_a = kNoChild, ir_b = kNoChild;
+        uint32_t wrap_a = kNoChild, wrap_b = kNoChild;
+        if (peel_abs_base(*arena_, a, &ba, &ir_a, &wrap_a) &&
+            peel_abs_base(*arena_, b, &bb, &ir_b, &wrap_b) &&
+            ba == bb) {
+          auto rebuild = [&](uint32_t ir, uint32_t wrap) -> uint32_t {
+            uint32_t body = ir;
+            if (body == kNoChild) {
+              body = add_const(0, size);
+              if (body == kInvalidNode) return kInvalidNode;
+            }
+            if (wrap == kNoChild) return body;
+            return add(PKind::Add, size, body, wrap);
+          };
+          a = rebuild(ir_a, wrap_a);
+          b = rebuild(ir_b, wrap_b);
+          if (a == kInvalidNode || b == kInvalidNode) return kInvalidNode;
+        }
       }
     }
     return add(kind, size, a, b);
@@ -1024,8 +1104,81 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
   if (binary) {
     uint32_t a = conv_child(info->l1, info->op1.i, size);
     uint32_t b = conv_child(info->l2, info->op2.i, size);
-    return a == kInvalidNode || b == kInvalidNode
-               ? kInvalidNode : add(kind, size, a, b);
+    if (a == kInvalidNode || b == kInvalidNode) return kInvalidNode;
+    // Pointer difference: (base+x) - (base+y) -> x - y, including nested
+    // Add chains from GEP-index advances (FSE/zstd `return ip - istart`).
+    if (kind == PKind::Sub) {
+      auto flatten = [&](uint32_t node, uint64_t *base_sum, uint32_t *residual,
+                         int depth, auto &self) -> bool {
+        if (depth > 24 || node == kNoChild || node == kInvalidNode ||
+            node >= arena_->nodes.size())
+          return false;
+        // By-value: add() below may reallocate arena_->nodes.
+        const PNode nd = arena_->nodes[node];
+        if (is_abs_addr_const(nd)) {
+          *base_sum += nd.value;
+          *residual = kNoChild;
+          return true;
+        }
+        if (nd.kind == PKind::Const) {
+          *residual = node;
+          return true;
+        }
+        if (nd.kind == PKind::Add) {
+          uint64_t b1 = 0, b2 = 0;
+          uint32_t r1 = kNoChild, r2 = kNoChild;
+          if (nd.a != kNoChild && !self(nd.a, &b1, &r1, depth + 1, self))
+            return false;
+          if (nd.b != kNoChild && !self(nd.b, &b2, &r2, depth + 1, self))
+            return false;
+          *base_sum += b1 + b2;
+          if (r1 == kNoChild)
+            *residual = r2;
+          else if (r2 == kNoChild)
+            *residual = r1;
+          else {
+            *residual = add(PKind::Add, size, r1, r2);
+            if (*residual == kInvalidNode) return false;
+          }
+          return true;
+        }
+        *residual = node;
+        return true;
+      };
+      uint64_t base_a = 0, base_b = 0;
+      uint32_t res_a = kNoChild, res_b = kNoChild;
+      if (flatten(a, &base_a, &res_a, 0, flatten) &&
+          flatten(b, &base_b, &res_b, 0, flatten) && base_a != 0 &&
+          base_a == base_b) {
+        auto as_body = [&](uint32_t res) -> uint32_t {
+          if (res == kNoChild) return add_const(0, size);
+          return res;
+        };
+        a = as_body(res_a);
+        b = as_body(res_b);
+        if (a == kInvalidNode || b == kInvalidNode) return kInvalidNode;
+      } else {
+        uint64_t ba = 0, bb = 0;
+        uint32_t ir_a = kNoChild, ir_b = kNoChild;
+        uint32_t wrap_a = kNoChild, wrap_b = kNoChild;
+        if (peel_abs_base(*arena_, a, &ba, &ir_a, &wrap_a) &&
+            peel_abs_base(*arena_, b, &bb, &ir_b, &wrap_b) && ba == bb) {
+          auto rebuild = [&](uint32_t ir, uint32_t wrap) -> uint32_t {
+            uint32_t body = ir;
+            if (body == kNoChild) {
+              body = add_const(0, size);
+              if (body == kInvalidNode) return kInvalidNode;
+            }
+            if (wrap == kNoChild) return body;
+            return add(PKind::Add, size, body, wrap);
+          };
+          a = rebuild(ir_a, wrap_a);
+          b = rebuild(ir_b, wrap_b);
+          if (a == kInvalidNode || b == kInvalidNode) return kInvalidNode;
+        }
+      }
+    }
+    return add(kind, size, a, b);
   }
 
   // Input-length boundary ops (flen_* / fsize): length-aware leaf nodes.
@@ -2083,7 +2236,150 @@ static bool eval_fp_binary(PKind kind, uint16_t bits, uint64_t a, uint64_t b,
   }
   return true;
 }
+// True when the arena subtree contains a frozen 48/64-bit absolute address
+// constant (training-run stack/heap base). Used by train calibration to
+// recognize incomplete pointer-diff models.
+static bool subtree_has_abs_addr(const PredArena &arena, uint32_t root) {
+  if (root == kNoChild || root == kInvalidNode || root >= arena.nodes.size())
+    return false;
+  std::vector<uint32_t> stack = {root};
+  std::unordered_set<uint32_t> seen;
+  while (!stack.empty()) {
+    uint32_t idx = stack.back();
+    stack.pop_back();
+    if (idx == kNoChild || idx >= arena.nodes.size() ||
+        !seen.insert(idx).second)
+      continue;
+    const PNode &nd = arena.nodes[idx];
+    if (is_abs_addr_const(nd)) return true;
+    if (nd.a != kNoChild) stack.push_back(nd.a);
+    if (nd.b != kNoChild) stack.push_back(nd.b);
+  }
+  return false;
+}
+
 }  // namespace
+
+static bool label_dag_has_abs_addr(const dfsan_label_info *table, size_t n,
+                                   uint32_t root_label) {
+  if (table == nullptr || root_label == 0 || root_label >= n) return false;
+  std::vector<uint32_t> stack = {root_label};
+  std::unordered_set<uint32_t> seen;
+  while (!stack.empty()) {
+    uint32_t lab = stack.back();
+    stack.pop_back();
+    if (lab == 0 || lab >= n || !seen.insert(lab).second) continue;
+    const dfsan_label_info &info = table[lab];
+    auto is_abs = [](uint64_t v) {
+      return v > 0xFFFFFFFFULL && v < (~uint64_t{0} - 0xFFFFULL);
+    };
+    // Frozen stack/heap bases appear as concrete op values on Add/Sub/PtrToInt.
+    const uint16_t op_lo = info.op & 0xff;
+    if ((op_lo == Add || op_lo == Sub || op_lo == PtrToInt ||
+         op_lo == IntToPtr) &&
+        (is_abs(info.op1.i) || is_abs(info.op2.i)))
+      return true;
+    if (info.l1) stack.push_back(info.l1);
+    if (info.l2) stack.push_back(info.l2);
+  }
+  return false;
+}
+
+bool calibrate_pointer_train_pred(PredArena &arena, Predicate *pred,
+                                  const uint8_t *input, uint32_t len,
+                                  uint8_t expected_result,
+                                  uint64_t concrete_op1, uint64_t concrete_op2,
+                                  const dfsan_label_info *table,
+                                  size_t table_labels, uint32_t source_label) {
+  if (pred == nullptr || pred->opaque || input == nullptr) return false;
+  if (pred->root == kNoChild || pred->root == kInvalidNode ||
+      pred->root >= arena.nodes.size())
+    return false;
+  const PNode root = arena.nodes[pred->root];
+  // Relational comparisons only (not Memcmp/FP).
+  const bool is_rel =
+      root.kind == PKind::Equal || root.kind == PKind::Distinct ||
+      root.kind == PKind::Ult || root.kind == PKind::Ule ||
+      root.kind == PKind::Ugt || root.kind == PKind::Uge ||
+      root.kind == PKind::Slt || root.kind == PKind::Sle ||
+      root.kind == PKind::Sgt || root.kind == PKind::Sge;
+  if (!is_rel) return false;
+  if (root.a == kNoChild || root.b == kNoChild ||
+      root.a >= arena.nodes.size() || root.b >= arena.nodes.size())
+    return false;
+  // Only calibrate incomplete pointer models. Abs may already have been
+  // cancelled from the converted arena; the source label DAG still shows it.
+  const bool arena_abs = subtree_has_abs_addr(arena, root.a) ||
+                         subtree_has_abs_addr(arena, root.b);
+  const bool source_abs =
+      label_dag_has_abs_addr(table, table_labels, source_label);
+  if (!arena_abs && !source_abs) return false;
+
+  auto eval_side = [&](uint32_t node, uint64_t *out) -> bool {
+    Predicate side;
+    side.root = node;
+    return eval_predicate(arena, side, input, len, out);
+  };
+  uint64_t va = 0, vb = 0;
+  if (!eval_side(root.a, &va) || !eval_side(root.b, &vb)) return false;
+
+  const uint16_t bits = root.bits ? root.bits : 64;
+  if (bits == 0 || bits > 64) return false;
+  const uint64_t mask =
+      bits == 64 ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+  const uint64_t da = (concrete_op1 - va) & mask;
+  const uint64_t db = (concrete_op2 - vb) & mask;
+  if (da == 0 && db == 0) return false;  // already concrete-aligned
+
+  // Append Const/Add for each side that needs a delta, then a new comparison
+  // root (post-order: children before parent).
+  if (arena.nodes.size() + 5 > kMaxPredicateNodes) return false;
+  const size_t ck = arena.nodes.size();
+  auto append_const = [&](uint64_t value) -> uint32_t {
+    PNode n{};
+    n.kind = PKind::Const;
+    n.bits = static_cast<uint8_t>(bits);
+    n.a = kNoChild;
+    n.b = kNoChild;
+    n.value = value & mask;
+    arena.nodes.push_back(n);
+    return static_cast<uint32_t>(arena.nodes.size() - 1);
+  };
+  auto append_add = [&](uint32_t x, uint32_t y) -> uint32_t {
+    PNode n{};
+    n.kind = PKind::Add;
+    n.bits = static_cast<uint8_t>(bits);
+    n.a = x;
+    n.b = y;
+    n.value = 0;
+    arena.nodes.push_back(n);
+    return static_cast<uint32_t>(arena.nodes.size() - 1);
+  };
+
+  uint32_t left = root.a;
+  uint32_t right = root.b;
+  if (da != 0) left = append_add(left, append_const(da));
+  if (db != 0) right = append_add(right, append_const(db));
+
+  PNode enode = root;
+  enode.a = left;
+  enode.b = right;
+  enode.value = 0;
+  const uint32_t eidx = static_cast<uint32_t>(arena.nodes.size());
+  arena.nodes.push_back(enode);
+  const uint32_t old_root = pred->root;
+  pred->root = eidx;
+
+  uint64_t out = 0;
+  const bool ok = eval_predicate(arena, *pred, input, len, &out);
+  const uint8_t edir = (ok && out != 0) ? 1 : 0;
+  if (!ok || edir != expected_result) {
+    pred->root = old_root;
+    arena.nodes.resize(ck);
+    return false;
+  }
+  return true;
+}
 
 bool eval_predicate(const PredArena &arena, const Predicate &pred,
                     const uint8_t *input, uint32_t len, uint64_t *out,

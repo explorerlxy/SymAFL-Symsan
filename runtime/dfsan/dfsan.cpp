@@ -559,6 +559,87 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
         return l1;
       }
     }
+    // Pointer-diff residual: Sub(Add(const_base, offset_label), const_base')
+    // from `return ip - istart` after GEP-index advances. When the concrete
+    // bases match (or differ by a compile-time constant already folded into
+    // orig_op1-orig_op2), drop the frozen base and keep the offset residual
+    // so FSE sequence-header sizes stay pure input-dependent bit-vectors.
+    if (size == 64 && l1_info->op == __dfsan::Add && l1_info->l1 == 0 &&
+        l1_info->l2 >= CONST_OFFSET) {
+      uint64_t base = l1_info->op1.i;
+      // Absolute-looking base (stack/heap) cancelled against the concrete
+      // subtrahend; residual is the GEP-index offset chain.
+      if (base > 0xFFFFFFFFULL && base < (~0ULL - 0xFFFFULL)) {
+        int64_t abs_delta = (int64_t)(base - op2);
+        dfsan_label residual = l1_info->l2;
+        if (abs_delta == 0) {
+          AOUT("simplify ptr-sub base-cancel: %u -> residual %u\n", l1,
+               residual);
+          return residual;
+        }
+        // Non-zero path-local constant (untainted ip advances before the
+        // first tainted GEP). Fold it into the residual so the size equals
+        // the concrete difference.
+        dfsan_label adj =
+            do_taint_union(residual, 0, __dfsan::Add, 64, 0, (uint64_t)abs_delta);
+        AOUT("simplify ptr-sub base-cancel+delta: %u -> %u (delta=%lld)\n", l1,
+             adj, (long long)abs_delta);
+        return adj;
+      }
+    }
+    // Same for PtrToInt(Add(const_base, offset)).
+    if (size == 64 && l1_info->op == __dfsan::PtrToInt &&
+        l1_info->l1 >= CONST_OFFSET) {
+      dfsan_label_info *add_info = get_label_info(l1_info->l1);
+      if (add_info->op == __dfsan::Add && add_info->l1 == 0 &&
+          add_info->l2 >= CONST_OFFSET) {
+        uint64_t base = add_info->op1.i;
+        if (base > 0xFFFFFFFFULL && base < (~0ULL - 0xFFFFULL)) {
+          int64_t abs_delta = (int64_t)(base - op2);
+          dfsan_label residual = add_info->l2;
+          if (abs_delta == 0) return residual;
+          return do_taint_union(residual, 0, __dfsan::Add, 64, 0,
+                                (uint64_t)abs_delta);
+        }
+      }
+    }
+  }
+  // Both sides symbolic: Sub(ptr_a, ptr_b) with matching Add(const_base, *)
+  // shape (advanced ip minus earlier ip along the same buffer).
+  if (op == __dfsan::Sub && size == 64 && l1 >= CONST_OFFSET &&
+      l2 >= CONST_OFFSET) {
+    auto peel_base_offset = [&](dfsan_label lab, uint64_t *base_out,
+                                dfsan_label *off_out) -> bool {
+      dfsan_label_info *inf = get_label_info(lab);
+      if (inf->op == __dfsan::PtrToInt && inf->l1 >= CONST_OFFSET)
+        inf = get_label_info(inf->l1);
+      if (inf->op == __dfsan::Add && inf->l1 == 0 &&
+          inf->l2 >= CONST_OFFSET && inf->op1.i > 0xFFFFFFFFULL &&
+          inf->op1.i < (~0ULL - 0xFFFFULL)) {
+        *base_out = inf->op1.i;
+        *off_out = inf->l2;
+        return true;
+      }
+      return false;
+    };
+    uint64_t b1 = 0, b2 = 0;
+    dfsan_label o1 = 0, o2 = 0;
+    if (peel_base_offset(l1, &b1, &o1) && peel_base_offset(l2, &b2, &o2)) {
+      int64_t abs_delta = (int64_t)(b1 - b2);
+      dfsan_label residual =
+          (o1 == o2) ? 0
+                     : do_taint_union(o1, o2, __dfsan::Sub, 64, 0, 0);
+      if (abs_delta == 0) {
+        AOUT("simplify ptr-sub both-sides: residual %u\n", residual);
+        return residual;
+      }
+      if (residual == 0) {
+        // Pure constant difference of bases (no residual taint).
+        return 0;
+      }
+      return do_taint_union(residual, 0, __dfsan::Add, 64, 0,
+                            (uint64_t)abs_delta);
+    }
   }
   if (op == __dfsan::Trunc) {
     if (__dfsan_label_info[l1].op == __dfsan::ZExt ||

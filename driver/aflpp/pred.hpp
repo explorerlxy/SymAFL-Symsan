@@ -241,6 +241,23 @@ struct EvalStats {
   uint64_t read_bytes = 0;
 };
 
+// When a converted comparison disagrees with the training run because of an
+// incomplete pointer-diff / FSE size model, add a path-local constant
+// correction on each side:
+//   left'  = left  + (concrete_op1 - eval(left))
+//   right' = right + (concrete_op2 - eval(right))
+// Allowed only when the source label DAG or converted arena still shows a
+// frozen absolute address (stack/heap base). concrete_op1/op2 are the ICmp
+// label's captured operands. Returns true if rewritten and matching
+// expected_result on input.
+bool calibrate_pointer_train_pred(PredArena &arena, Predicate *pred,
+                                  const uint8_t *input, uint32_t len,
+                                  uint8_t expected_result,
+                                  uint64_t concrete_op1, uint64_t concrete_op2,
+                                  const dfsan_label_info *table = nullptr,
+                                  size_t table_labels = 0,
+                                  uint32_t source_label = 0);
+
 // Evaluate only the root-reachable DAG against a concrete input. Returns false
 // on undefined evaluation (read past input end); on success sets *out to the
 // root value (0/1 for comparison roots). Passing a context retains values from
