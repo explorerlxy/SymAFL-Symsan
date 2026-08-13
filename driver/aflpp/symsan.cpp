@@ -191,6 +191,26 @@ struct my_mutator_t {
   // incomplete forkserver captures from true decision-omission pure-prefix.
   uint64_t replay_short_capture_skipped = 0;
   char *concolic_target = nullptr;
+  // Three-fsrv pipeline: the main forkserver runs the concrete target; the
+  // concolic and sanitizer forkservers are spawned by AFL++ at startup. The
+  // sanitizer target is optional (SYMAFL_SANITIZER_TARGET).
+  char *sanitizer_target = nullptr;
+  // Init-time queue_new_entry batch: read_testcases runs before the concolic
+  // forkserver exists, so seed entries are queued here and flushed at the
+  // first afl_custom_queue_get (before any post_process).
+  std::vector<std::string> pending_seeds;
+  bool seeds_flushed = false;
+  // Pipeline accounting: concolic runs are executed only for coverage-gaining
+  // admitted candidates (production) plus every admitted candidate under
+  // REPLAY_ALL / probe_diag measurement modes.
+  uint64_t concolic_run_calls = 0;
+  uint64_t concolic_run_failed = 0;
+  uint64_t san_run_calls = 0;
+  uint64_t san_tmouts = 0;
+  uint64_t san_crashes = 0;          // sanitizer crash events (all)
+  uint64_t san_crashes_saved = 0;    // crash files written
+  std::unordered_map<int, uint64_t> san_crash_sig_counts;  // per-signal dedup
+  uint64_t san_crash_seq = 0;        // monotonic id for saved crashes
   // Full-stream capture artifacts: empty event list (taint/capture not armed)
   // or first event is not the entry constraint. Counted separately from
   // truncated decision-omission so hard-gate zeroing is not poisoned by
@@ -538,7 +558,11 @@ static void init_forkserver_capture(my_mutator_t *data) {
     (void)fcntl(pipefd[1], F_SETPIPE_SZ, want);
   }
 #endif
-  data->afl->fsrv.sym_trace_fd = data->full_stream_read_fd;
+  // The trace pipe belongs to the concolic forkserver: only its children
+  // carry the SymAFL runtime that writes condition frames. The main
+  // (concrete) forkserver never writes to it and must keep sym_trace_fd = -1
+  // so its runs do not drain into the wrong buffer.
+  data->afl->fsrv_concolic.sym_trace_fd = data->full_stream_read_fd;
 
   const char *old_options = getenv("TAINT_OPTIONS");
   char *pipe_option = alloc_printf(":pipe_fd=%d", data->full_stream_write_fd);
@@ -575,21 +599,27 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     return NULL;
   }
 
-  // PCBT has two distinct execution phases. The initial target must be the
-  // concolic binary; after the tree is exhausted AFL++ restarts its
-  // forkserver with the concrete binary and rebuilds coverage from the queue.
+  // Three-fsrv pipeline: the CLI target is the concrete binary (drives the
+  // main loop and coverage feedback); SYMAFL_CONCOLIC_TARGET names the
+  // concolic forkserver binary (run only on coverage-gaining admissions) and
+  // SYMAFL_SANITIZER_TARGET (optional) the sanitizer forkserver binary (run
+  // after the concolic stage on the same gaining candidates). AFL++ spawns
+  // both secondary forkservers at startup after this init returns.
   const char *concolic = getenv("SYMAFL_CONCOLIC_TARGET");
-  const char *concrete = getenv("SYMAFL_CONCRETE_TARGET");
-  if (!concolic || !*concolic || !concrete || !*concrete) {
-    FATAL("PCBT mode requires SYMAFL_CONCOLIC_TARGET and "
-          "SYMAFL_CONCRETE_TARGET");
+  if (!concolic || !*concolic) {
+    FATAL("PCBT mode requires SYMAFL_CONCOLIC_TARGET (CLI target is the "
+          "concrete binary)");
   }
-  if (access(concolic, X_OK) || access(concrete, X_OK)) {
-    PFATAL("PCBT target is not executable");
+  if (access(concolic, X_OK)) {
+    PFATAL("PCBT concolic target is not executable");
+  }
+  const char *san = getenv("SYMAFL_SANITIZER_TARGET");
+  if (san && *san && access(san, X_OK)) {
+    PFATAL("PCBT sanitizer target is not executable");
   }
   data->afl->pcbt_mode = 1;
-  data->afl->pcbt_concrete_target = ck_strdup((u8 *)concrete);
   data->concolic_target = (char *)ck_strdup((u8 *)concolic);
+  if (san && *san) data->sanitizer_target = (char *)ck_strdup((u8 *)san);
 
   if (const char *mode = getenv("SYMAFL_TRACE_MODE")) {
     WARNF("SYMAFL_TRACE_MODE=%s is ignored: PCBT transport is selected "
@@ -877,6 +907,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           "admit_empty=%llu admit_opaque=%llu follow_tautology=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
           "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu probe_admitted=%llu probe_gained=%llu "
           "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
+          "concolic_runs=%llu concolic_failed=%llu "
+          "san_runs=%llu san_tmouts=%llu san_crashes=%llu san_saved=%llu "
           "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
           "replay_ns=%llu replay_calls=%llu decode_ns=%llu decode_calls=%llu "
           "insert_ns=%llu insert_calls=%llu exec_ns=%llu exec_calls=%llu\n",
@@ -914,6 +946,12 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->probe_gained_terminal,
           (unsigned long long)data->probe_gained_rlimit,
           (int)(data->profile_enabled ? 1 : 0),
+          (unsigned long long)data->concolic_run_calls,
+          (unsigned long long)data->concolic_run_failed,
+          (unsigned long long)data->san_run_calls,
+          (unsigned long long)data->san_tmouts,
+          (unsigned long long)data->san_crashes,
+          (unsigned long long)data->san_crashes_saved,
           (unsigned long long)data->profile_check_ns,
           (unsigned long long)data->profile_check_calls,
           (unsigned long long)data->profile_trace_ns,
@@ -1238,10 +1276,19 @@ static bool decode_full_stream(const u8 *wire, size_t wire_size,
   return true;
 }
 
+// The forkserver that executes the concolic target. Its children write the
+// condition frames into the mutator-owned pipe; the drain machinery
+// (read_s32_timed_with_trace / drain_sym_trace_complete) fills its
+// sym_trace_buf/len, and its child_status / last_run_timed_out /
+// last_kill_signal describe the concolic run.
+static inline afl_forkserver_t *concolic_fsrv(my_mutator_t *data) {
+  return &data->afl->fsrv_concolic;
+}
+
 static bool decode_pipe_events(my_mutator_t *data,
                                std::vector<pcbt::Event> *events,
                                const char *fname) {
-  afl_forkserver_t *fsrv = &data->afl->fsrv;
+  afl_forkserver_t *fsrv = concolic_fsrv(data);
   if (decode_full_stream(fsrv->sym_trace_buf, fsrv->sym_trace_len, events)) {
     return true;
   }
@@ -1481,7 +1528,7 @@ static bool replay_check_trace(my_mutator_t *data,
   // was interrupted, not divergent. Count it separately and skip: timeout
   // handling is a performance/robustness concern, not a decision-omission
   // signal.
-  if (data->afl->fsrv.last_run_timed_out) {
+  if (concolic_fsrv(data)->last_run_timed_out) {
     data->replay_timeout_skipped += 1;
     return true;
   }
@@ -1490,12 +1537,12 @@ static bool replay_check_trace(my_mutator_t *data,
   // FSRV_RUN_OK) and would false-positive every later run after one crash.
   // Incomplete stream by construction, not entry_artifact / truncated.
   // Timeouts already returned above (also WIFSIGNALED with SIGKILL).
-  if (WIFSIGNALED(data->afl->fsrv.child_status)) {
+  if (WIFSIGNALED(concolic_fsrv(data)->child_status)) {
     data->replay_crash_skipped += 1;
     WARNF("[pcbt-replay] crash-skipped: kill_sig=%u events=%zu "
           "pipe_bytes=%zu input_len=%zu; skip\n",
-          (unsigned)WTERMSIG(data->afl->fsrv.child_status), events.size(),
-          data->afl->fsrv.sym_trace_len, buf_size);
+          (unsigned)WTERMSIG(concolic_fsrv(data)->child_status), events.size(),
+          concolic_fsrv(data)->sym_trace_len, buf_size);
     (void)capture_anomaly_case(data, "crash-skipped", events, buf, buf_size);
     return true;
   }
@@ -1533,7 +1580,7 @@ static bool replay_check_trace(my_mutator_t *data,
       if (data->afl->stop_soon && empty_nonempty_input) {
         WARNF("[pcbt-replay] entry-empty during stop_soon: pipe_bytes=%zu "
               "input_len=%zu; skip (not entry_artifact)\n",
-              data->afl->fsrv.sym_trace_len, buf_size);
+              concolic_fsrv(data)->sym_trace_len, buf_size);
         return true;
       }
       data->replay_entry_artifact += 1;
@@ -1544,9 +1591,9 @@ static bool replay_check_trace(my_mutator_t *data,
             events.empty() ? 0u : (events.front().constraint ? 1u : 0u),
             events.size(),
             have_entry ? data->tree.cid_of(entry) : 0u,
-            entry_is_constraint ? 1 : 0, data->afl->fsrv.sym_trace_len,
-            data->afl->fsrv.last_kill_signal,
-            data->afl->fsrv.last_run_timed_out);
+            entry_is_constraint ? 1 : 0, concolic_fsrv(data)->sym_trace_len,
+            concolic_fsrv(data)->last_kill_signal,
+            concolic_fsrv(data)->last_run_timed_out);
       (void)capture_anomaly_case(data, "entry-artifact", events, buf,
                                  buf_size);
       request_residual_abort(data, "entry_artifact");
@@ -1576,8 +1623,8 @@ static bool replay_check_trace(my_mutator_t *data,
   // short_capture_skipped (transport), not hard truncated.
   if (report.error == pcbt::Tree::ReplayError::TruncatedTrace && buf &&
       buf_size > 0 && !is_suffix &&
-      !WIFSIGNALED(data->afl->fsrv.child_status) &&
-      !data->afl->fsrv.last_run_timed_out && data->concolic_target) {
+      !WIFSIGNALED(concolic_fsrv(data)->child_status) &&
+      !concolic_fsrv(data)->last_run_timed_out && data->concolic_target) {
     std::vector<pcbt::Event> re_events;
     if (reexec_full_stream(data, buf, buf_size, &re_events)) {
       if (re_events.size() > events.size()) {
@@ -1693,16 +1740,16 @@ static bool replay_check_trace(my_mutator_t *data,
     // returned above). Sticky SIGKILL from an earlier hang was poisoning
     // truncated meta and hiding real clean-exit pure-prefix holes.
     const uint32_t run_kill =
-        WIFSIGNALED(data->afl->fsrv.child_status)
-            ? (uint32_t)WTERMSIG(data->afl->fsrv.child_status)
+        WIFSIGNALED(concolic_fsrv(data)->child_status)
+            ? (uint32_t)WTERMSIG(concolic_fsrv(data)->child_status)
             : 0u;
     size_t shown = buf_size < 64 ? buf_size : 64;
     fprintf(stderr,
             "[pcbt-replay] truncated input len=%zu events=%zu "
             "verified=%zu pipe_bytes=%zu kill_sig=%u timeout=%u hex=",
             buf_size, events.size(), report.verified_events,
-            data->afl->fsrv.sym_trace_len, run_kill,
-            data->afl->fsrv.last_run_timed_out);
+            concolic_fsrv(data)->sym_trace_len, run_kill,
+            concolic_fsrv(data)->last_run_timed_out);
     for (size_t k = 0; k < shown; ++k)
       fprintf(stderr, "%02x", buf[k]);
     fprintf(stderr, "%s\n", shown < buf_size ? " TRUNC" : "");
@@ -1838,7 +1885,7 @@ static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
   // Raw pipe bytes for the just-finished child (may be empty for true empty
   // streams; non-empty with empty decoded events indicates decode failure).
   {
-    afl_forkserver_t *fsrv = &data->afl->fsrv;
+    afl_forkserver_t *fsrv = concolic_fsrv(data);
     int pfd = open(pipe_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (pfd >= 0) {
       if (fsrv->sym_trace_buf && fsrv->sym_trace_len) {
@@ -1881,17 +1928,17 @@ static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
   const uint32_t first_cid = events.empty() ? 0 : events.front().cid;
   const uint32_t first_constraint =
       events.empty() ? 0u : (events.front().constraint ? 1u : 0u);
-  const size_t pipe_bytes = data->afl->fsrv.sym_trace_len;
+  const size_t pipe_bytes = concolic_fsrv(data)->sym_trace_len;
   // Prefer this-run signal; fall back to sticky last_kill only on timeout
   // (where AFL sets last_kill_signal = child_kill_signal without always
   // leaving WIFSIGNALED visible by the time the mutator runs).
   const uint32_t kill_sig =
-      WIFSIGNALED(data->afl->fsrv.child_status)
-          ? (uint32_t)WTERMSIG(data->afl->fsrv.child_status)
-          : (data->afl->fsrv.last_run_timed_out
-                 ? data->afl->fsrv.last_kill_signal
+      WIFSIGNALED(concolic_fsrv(data)->child_status)
+          ? (uint32_t)WTERMSIG(concolic_fsrv(data)->child_status)
+          : (concolic_fsrv(data)->last_run_timed_out
+                 ? concolic_fsrv(data)->last_kill_signal
                  : 0u);
-  const uint32_t timed_out = data->afl->fsrv.last_run_timed_out;
+  const uint32_t timed_out = concolic_fsrv(data)->last_run_timed_out;
 
   // ADMIT partner: first input that created the mismatch tree node.
   std::string admit_input_path = std::string(base) + "-admit-input.bin";
@@ -2399,9 +2446,11 @@ static bool replay_pipe_suffix(my_mutator_t *data, const u8 *buf,
   ProfileSegment replay_seg(data, &data->profile_replay_ns,
                             &data->profile_replay_calls);
   arm_pipe_suffix_capture(data, node, dir);
+  // Testcase writes go through the MAIN fsrv (afl_fsrv_init_dup does not copy
+  // the shmem_fuzz pointers); the run executes the concolic forkserver.
   afl_fsrv_write_to_testcase(&data->afl->fsrv, const_cast<u8 *>(buf), buf_size);
-  fsrv_run_result_t result = afl_fsrv_run_target(&data->afl->fsrv,
-      data->afl->fsrv.exec_tmout, &data->afl->stop_soon);
+  fsrv_run_result_t result = afl_fsrv_run_target(concolic_fsrv(data),
+      data->afl->fsrv_concolic.exec_tmout, &data->afl->stop_soon);
   if (result != FSRV_RUN_OK) {
     WARNF("forkserver pipe-suffix replay failed for %s (%u)\n", fname,
           result);
@@ -2417,9 +2466,11 @@ static bool replay_full_capture(my_mutator_t *data, const u8 *buf,
   ProfileSegment replay_seg(data, &data->profile_replay_ns,
                             &data->profile_replay_calls);
   arm_full_capture(data);
+  // Testcase writes go through the MAIN fsrv (see replay_pipe_suffix); the
+  // run executes the concolic forkserver.
   afl_fsrv_write_to_testcase(&data->afl->fsrv, const_cast<u8 *>(buf), buf_size);
-  fsrv_run_result_t result = afl_fsrv_run_target(&data->afl->fsrv,
-      data->afl->fsrv.exec_tmout, &data->afl->stop_soon);
+  fsrv_run_result_t result = afl_fsrv_run_target(concolic_fsrv(data),
+      data->afl->fsrv_concolic.exec_tmout, &data->afl->stop_soon);
   if (result != FSRV_RUN_OK) {
     WARNF("full-pipe replay failed for %s (%u)\n", fname, result);
     data->failed_runs += 1;
@@ -2427,6 +2478,28 @@ static bool replay_full_capture(my_mutator_t *data, const u8 *buf,
     return false;
   }
   return insert_full_stream(data, buf, buf_size, fname);
+}
+
+// Execute the concolic forkserver once on the given candidate. The caller
+// must have armed the capture (full/suffix/root) first; the child's event
+// stream lands in the concolic fsrv's sym_trace_buf (or SHM) and is consumed
+// by the caller. Testcase bytes are written through the MAIN fsrv (the dup'd
+// secondary fsrvs share its out_file/shmem_fuzz).
+static bool run_concolic_fsrv(my_mutator_t *data, const u8 *buf, size_t len,
+                              const char *what) {
+  afl_forkserver_t *cfsrv = concolic_fsrv(data);
+  afl_fsrv_write_to_testcase(&data->afl->fsrv, const_cast<u8 *>(buf), len);
+  ProfileSegment seg(data, &data->profile_exec_ns, &data->profile_exec_calls);
+  fsrv_run_result_t result =
+      afl_fsrv_run_target(cfsrv, cfsrv->exec_tmout, &data->afl->stop_soon);
+  data->concolic_run_calls += 1;
+  if (result != FSRV_RUN_OK) {
+    WARNF("concolic run failed for %s (%u)\n", what, result);
+    data->concolic_run_failed += 1;
+    if (cfsrv->last_run_timed_out) data->trace_timeouts += 1;
+    return false;
+  }
+  return true;
 }
 
 static bool read_queue_file(const char *fname, std::vector<u8> *buf) {
@@ -2539,6 +2612,39 @@ static void classify_suffix(my_mutator_t *data, uint64_t *empty,
   }
 }
 
+// Sanitizer crash forensics: the sanitizer forkserver re-executes every
+// coverage-gaining candidate to catch memory-safety bugs. The sanitizer
+// binary is built with AFL_SAN_NO_INST (no coverage writes), so a nonzero
+// run result here is a genuine sanitizer report. Per-signal dedup v1: the
+// first crash per signal is saved to crashes/, repeats only bump counters.
+static void handle_san_crash(my_mutator_t *data, const u8 *buf, size_t len) {
+  afl_forkserver_t *sfsrv = &data->afl->fsrv_san;
+  int sig = 0;
+  if (sfsrv->child_status != -1 && WIFSIGNALED(sfsrv->child_status)) {
+    sig = WTERMSIG(sfsrv->child_status);
+  }
+  data->san_crashes += 1;
+  auto it = data->san_crash_sig_counts.find(sig);
+  if (it == data->san_crash_sig_counts.end()) {
+    it = data->san_crash_sig_counts.emplace(sig, 0).first;
+  }
+  uint64_t seen = it->second;
+  it->second += 1;
+  if (seen > 0 || !data->afl->out_dir) return;
+  char *path = alloc_printf("%s/crashes/id:%06llu,sig:%02u,san",
+                            data->afl->out_dir,
+                            (unsigned long long)data->san_crash_seq++, sig);
+  int fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+  if (fd < 0) {
+    PFATAL("cannot create sanitizer crash case %s", path);
+  }
+  ck_write(fd, const_cast<u8 *>(buf), len, path);
+  close(fd);
+  data->san_crashes_saved += 1;
+  WARNF("sanitizer crash saved: %s (sig=%d)\n", path, sig);
+  ck_free(path);
+}
+
 extern "C" void afl_custom_post_run(my_mutator_t *data) {
   // Probe diagnostic: classify what a sampled vetoed candidate executed past
   // the known terminal prefix. Nonempty suffix = screening defect (the tree
@@ -2563,15 +2669,21 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
           fprintf(stderr,
                   "[pcbt-replay] veto forensics cur_input_len=%zu "
                   "pipe_bytes=%zu hex=",
-                  buf.size(), data->afl->fsrv.sym_trace_len);
+                  buf.size(), concolic_fsrv(data)->sym_trace_len);
           for (size_t k = 0; k < fshown; ++k)
             fprintf(stderr, "%02x", buf[k]);
           fprintf(stderr, "\n");
         }
-        std::vector<pcbt::Event> events;
-        if (decode_pipe_events(data, &events, "replay-all-veto")) {
-          (void)replay_check_trace(data, events, buf.data(), buf.size(),
-                                   "replay-all-veto", false);
+        // The probe executed the CONCRETE target on the main fsrv; the armed
+        // capture is empty. Materialize the vetoed candidate's full stream by
+        // executing the concolic forkserver now.
+        if (run_concolic_fsrv(data, buf.data(), buf.size(),
+                              "replay-all-veto")) {
+          std::vector<pcbt::Event> events;
+          if (decode_pipe_events(data, &events, "replay-all-veto")) {
+            (void)replay_check_trace(data, events, buf.data(), buf.size(),
+                                     "replay-all-veto", false);
+          }
         }
       }
       disarm_capture(data);
@@ -2580,6 +2692,17 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
     if (!data->probe_diag) {
       if (!data->probe_capture_pending) disarm_capture(data);
       return;
+    }
+    // Same as above: the concrete probe run produced no capture, so execute
+    // the concolic forkserver (suffix capture armed at post_process) to
+    // classify what the vetoed candidate does past the terminal prefix.
+    {
+      std::vector<u8> buf;
+      if (!read_cur_input(data, &buf) ||
+          !run_concolic_fsrv(data, buf.data(), buf.size(), "probe-diag")) {
+        if (!data->probe_capture_pending) disarm_capture(data);
+        return;
+      }
     }
     symafl_single_pass_control *control = data->single_pass_control;
     uint32_t count = __atomic_load_n(&control->event_count, __ATOMIC_ACQUIRE);
@@ -2656,41 +2779,54 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
       if (mode == SYMAFL_TRACE_FULL_STREAM) {
         std::vector<u8> buf;
         if (read_cur_input(data, &buf)) {
-          std::vector<pcbt::Event> events;
-          if (decode_pipe_events(data, &events, "replay-all")) {
-            if (data->tree.conflict_diag()) {
-              // skipCnt hypothesis: if the tree's suffix start position
-              // (skip_for) exceeds the candidate's actual event count, a
-              // steady-state suffix capture would be empty and the empty
-              // suffix would close a (possibly fake) terminal. Print the
-              // comparison for every admitted run while diagnosing.
-              uint32_t skip_for =
-                  data->last_node != pcbt::kUnexplored
-                      ? data->tree.skip_for(data->last_node, data->last_dir)
-                      : 0;
-              uint64_t ev_total = 0;
-              for (const pcbt::Event &ev : events) ev_total += ev.count;
-              fprintf(stderr,
-                      "[pcbt-replay] admit skipcnt node=%u dir=%u "
-                      "skip_for=%u events=%zu expanded=%llu\n",
-                      data->last_node, data->last_dir, skip_for,
-                      events.size(), (unsigned long long)ev_total);
+          // The admitted candidate just ran CONCRETE on the main fsrv; the
+          // armed capture is empty. Execute the concolic forkserver to
+          // materialize its full stream for tree validation.
+          if (run_concolic_fsrv(data, buf.data(), buf.size(), "replay-all")) {
+            std::vector<pcbt::Event> events;
+            if (decode_pipe_events(data, &events, "replay-all")) {
+              if (data->tree.conflict_diag()) {
+                // skipCnt hypothesis: if the tree's suffix start position
+                // (skip_for) exceeds the candidate's actual event count, a
+                // steady-state suffix capture would be empty and the empty
+                // suffix would close a (possibly fake) terminal. Print the
+                // comparison for every admitted run while diagnosing.
+                uint32_t skip_for =
+                    data->last_node != pcbt::kUnexplored
+                        ? data->tree.skip_for(data->last_node, data->last_dir)
+                        : 0;
+                uint64_t ev_total = 0;
+                for (const pcbt::Event &ev : events) ev_total += ev.count;
+                fprintf(stderr,
+                        "[pcbt-replay] admit skipcnt node=%u dir=%u "
+                        "skip_for=%u events=%zu expanded=%llu\n",
+                        data->last_node, data->last_dir, skip_for,
+                        events.size(), (unsigned long long)ev_total);
+              }
+              (void)replay_check_trace(data, events, buf.data(), buf.size(),
+                                       "replay-all", false);
+              data->replay_run_done = true;
             }
-            (void)replay_check_trace(data, events, buf.data(), buf.size(),
-                                     "replay-all", false);
-            data->replay_run_done = true;
           }
         }
       }
     }
     // Admitted-run diagnostic: does the frontier suffix carry decisions
-    // (tree gain) even when the run gains no bitmap coverage?
+    // (tree gain) even when the run gains no bitmap coverage? Also needs the
+    // concolic execution (the concrete run produced no capture). A gaining
+    // candidate here pays one concolic run total: queue_new_entry consumes
+    // replay_run_done and inserts from the same capture.
     if (data->probe_diag && data->single_pass_armed &&
         data->last_node != pcbt::kUnexplored) {
-      classify_suffix(data, &data->diag_admit_suffix_empty,
-                      &data->diag_admit_suffix_nonempty,
-                      &data->diag_admit_suffix_overflow,
-                      &data->diag_admit_suffix_events);
+      std::vector<u8> buf;
+      if (read_cur_input(data, &buf) &&
+          run_concolic_fsrv(data, buf.data(), buf.size(), "admit-diag")) {
+        classify_suffix(data, &data->diag_admit_suffix_empty,
+                        &data->diag_admit_suffix_nonempty,
+                        &data->diag_admit_suffix_overflow,
+                        &data->diag_admit_suffix_events);
+        data->replay_run_done = true;
+      }
     }
     // The tree learns an admitted run's suffix ONLY when the run gains
     // coverage (afl_custom_queue_new_entry inserts it). A non-gaining run
@@ -2703,33 +2839,13 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
     // post_process disarms it when no gain happened.
     return;
   }
-  if (!data->single_pass_armed) return;
-  uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
-                                  __ATOMIC_ACQUIRE);
-  pcbt::NodeRef tail_node = pcbt::kUnexplored;
-  uint8_t tail_dir = 0;
-  if (mode == SYMAFL_TRACE_SUFFIX_SHM &&
-      data->last_node != pcbt::kUnexplored) {
-    (void)insert_suffix_capture(data, nullptr, 0, "bootstrap", &tail_node,
-                                &tail_dir);
-  } else if (mode == SYMAFL_TRACE_FULL_STREAM) {
-    std::vector<u8> buf;
-    if (read_cur_input(data, &buf)) {
-      (void)insert_full_stream(data, buf.data(), buf.size(), "bootstrap",
-                               &tail_node, &tail_dir);
-    } else {
-      fprintf(stderr, "[pcbt] bootstrap cur_input unreadable (out_dir=%s); "
-              "replay with len=0\n",
-              data->afl->out_dir ? (const char *)data->afl->out_dir
-                                 : "(null)");
-      (void)insert_full_stream(data, nullptr, 0, "bootstrap", &tail_node,
-                               &tail_dir);
-    }
-  }
-  // The bootstrap admit that created a terminal edge is the pair partner
-  // for later veto-but-gain probes on that edge; record it too (the empty
-  // tree case has last_node == kUnexplored and is skipped by the guard).
-  record_admitted_pair(data, tail_node, tail_dir);
+  // Bootstrap: the initial corpus entries are inserted into the tree at the
+  // first afl_custom_queue_get (the concolic forkserver does not exist before
+  // that; queue_new_entry buffers the seed names). The runs that reach this
+  // branch are concrete dry-run/calibration executions on the main fsrv —
+  // their armed capture is empty and must be disarmed WITHOUT insertion (an
+  // empty full stream would otherwise close tree edges with no evidence).
+  if (data->single_pass_armed) disarm_capture(data);
   data->last_node = pcbt::kUnexplored;
 }
 
@@ -2742,6 +2858,46 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   if (data->full_stream_write_fd >= 0) {
     close(data->full_stream_write_fd);
     data->full_stream_write_fd = -1;
+  }
+  // Init-time seed flush: read_testcases queued the seeds while the concolic
+  // forkserver did not exist (queue_new_entry buffered their names in
+  // pending_seeds). Run each seed through the concolic forkserver now — it is
+  // up by the first queue_get — and insert its full stream into the tree so
+  // the SEDBT is ready before the first post_process. last_gained is set per
+  // seed so the run that follows this queue_get does not misattribute a
+  // non-gain to the flushed seed's frontier edge.
+  if (!data->seeds_flushed) {
+    data->seeds_flushed = true;
+    if (data->screening) {
+      for (const std::string &seed : data->pending_seeds) {
+        std::vector<u8> buf;
+        if (!read_queue_file(seed.c_str(), &buf)) {
+          WARNF("cannot read bootstrap seed %s\n", seed.c_str());
+          data->failed_runs += 1;
+          continue;
+        }
+        arm_full_capture(data);
+        if (!run_concolic_fsrv(data, buf.data(), buf.size(),
+                               "bootstrap-seed")) {
+          disarm_capture(data);
+          data->last_gained = false;
+          data->failed_runs += 1;
+          continue;
+        }
+        pcbt::NodeRef tail_node = pcbt::kUnexplored;
+        uint8_t tail_dir = 0;
+        if (!insert_full_stream(data, buf.data(), buf.size(), seed.c_str(),
+                                &tail_node, &tail_dir)) {
+          data->last_gained = false;
+          data->failed_runs += 1;
+          continue;
+        }
+        data->traced_entries.insert(seed);
+        record_admitted_pair(data, tail_node, tail_dir);
+        data->last_gained = true;
+      }
+      data->pending_seeds.clear();
+    }
   }
   data->bootstrap_done = true;
   if (data->concolic_deadline && !data->phase_start) {
@@ -2901,11 +3057,9 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   (void)filename_orig_queue;
   if (getenv("SYMAFL_MUTATOR_QUEUE_DIAG")) {
     fprintf(stderr,
-            "[mutator-queue] marker=%u bootstrap=%u screening=%u "
-            "concrete=%u fname=%s\n",
+            "[mutator-queue] marker=%u bootstrap=%u screening=%u fname=%s\n",
             data->last_was_probe ? 1u : 0u, data->bootstrap_done ? 1u : 0u,
             data->screening ? 1u : 0u,
-            data->afl->pcbt_concrete_active ? 1u : 0u,
             filename_new_queue ? (const char *)filename_new_queue : "(null)");
   }
   // Probe results are consumed by afl_custom_probe_result before AFL creates a
@@ -2918,16 +3072,13 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     if (data->single_pass_armed) disarm_capture(data);
     return 0;
   }
-  // Seeds and post-saturation concrete-phase gains are not PCBT admissions.
-  if (!data->bootstrap_done || !data->screening) return 0;
-  // This admitted run gained coverage, so its suffix is tree material:
-  // post_run inserts nothing (non-gaining runs only bump rCnt), and the
-  // run's SHM capture is still armed for us to consume here.
-  if (!data->single_pass_armed) {
-    data->last_gained = false;
-    data->failed_runs += 1;
-    WARNF("coverage-gaining admitted entry has no trace capture: %s\n",
-          filename_new_queue);
+  // Init-time seed batch: read_testcases runs before the concolic forkserver
+  // exists, so record the seed names here and flush them into the tree at the
+  // first afl_custom_queue_get.
+  if (!data->bootstrap_done) {
+    if (data->screening && filename_new_queue) {
+      data->pending_seeds.push_back((const char *)filename_new_queue);
+    }
     return 0;
   }
   const char *fname = (const char *)filename_new_queue;
@@ -2939,43 +3090,83 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     data->failed_runs += 1;
     return 0;
   }
-  uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
-                                  __ATOMIC_ACQUIRE);
-  pcbt::NodeRef node = data->last_node;
-  bool root_capture = data->root_shm_capture;
-  uint8_t dir = data->last_dir;
-  pcbt::NodeRef tail_node = pcbt::kUnexplored;
-  uint8_t tail_dir = 0;
-  bool inserted = mode == SYMAFL_TRACE_SUFFIX_SHM
-      ? insert_suffix_capture(data, buf.data(), buf.size(), fname,
-                              &tail_node, &tail_dir)
-      : mode == SYMAFL_TRACE_SUFFIX_PIPE
-            ? insert_pipe_suffix_capture(data, buf.data(), buf.size(), fname,
-                                         &tail_node, &tail_dir)
-            : mode == SYMAFL_TRACE_FULL_STREAM
-                  ? insert_full_stream(data, buf.data(), buf.size(), fname,
-                                       &tail_node, &tail_dir)
-                  : false;
-  bool committed = inserted;
-  if (!inserted && root_capture) {
-    committed = replay_full_capture(data, buf.data(), buf.size(), fname);
-  } else if (!inserted && node != pcbt::kUnexplored) {
-    committed = replay_pipe_suffix(data, buf.data(), buf.size(), fname, node,
-                                   dir);
-  }
-  if (committed) {
-    if (data->admitted_gained_log) {
-      fprintf(data->admitted_gained_log, "node=%u dir=%u root=%u %s\n",
-              data->last_node, data->last_dir,
-              data->root_shm_capture ? 1u : 0u, filename_new_queue);
-      fflush(data->admitted_gained_log);
+  // CONCOLIC STAGE (screening only): this admitted candidate gained coverage
+  // on the CONCRETE main fsrv. The capture was armed at post_process; execute
+  // the concolic forkserver now to materialize the symbolic decision stream
+  // and extend the SEDBT. Under REPLAY_ALL/probe_diag post_run already ran
+  // the concolic forkserver (replay_run_done) — insert from that capture.
+  bool committed = false;
+  if (data->screening) {
+    if (data->replay_run_done) {
+      data->replay_run_done = false;  // post_run already ran the fsrv
+    } else if (data->single_pass_armed) {
+      if (!run_concolic_fsrv(data, buf.data(), buf.size(), fname)) {
+        disarm_capture(data);
+        data->last_gained = false;
+        data->failed_runs += 1;
+        return 0;
+      }
+    } else {
+      data->last_gained = false;
+      data->failed_runs += 1;
+      WARNF("coverage-gaining admitted entry has no trace capture: %s\n",
+            fname);
+      return 0;
     }
-    data->traced_entries.insert((const char *)filename_new_queue);
-    record_admitted_pair(data, tail_node, tail_dir);
-  } else {
-    WARNF("coverage-gaining admitted entry was not inserted: %s\n", fname);
+    uint32_t mode = __atomic_load_n(&data->single_pass_control->mode,
+                                    __ATOMIC_ACQUIRE);
+    pcbt::NodeRef node = data->last_node;
+    bool root_capture = data->root_shm_capture;
+    uint8_t dir = data->last_dir;
+    pcbt::NodeRef tail_node = pcbt::kUnexplored;
+    uint8_t tail_dir = 0;
+    bool inserted = mode == SYMAFL_TRACE_SUFFIX_SHM
+        ? insert_suffix_capture(data, buf.data(), buf.size(), fname,
+                                &tail_node, &tail_dir)
+        : mode == SYMAFL_TRACE_SUFFIX_PIPE
+              ? insert_pipe_suffix_capture(data, buf.data(), buf.size(), fname,
+                                           &tail_node, &tail_dir)
+              : mode == SYMAFL_TRACE_FULL_STREAM
+                    ? insert_full_stream(data, buf.data(), buf.size(), fname,
+                                         &tail_node, &tail_dir)
+                    : false;
+    committed = inserted;
+    if (!inserted && root_capture) {
+      committed = replay_full_capture(data, buf.data(), buf.size(), fname);
+    } else if (!inserted && node != pcbt::kUnexplored) {
+      committed = replay_pipe_suffix(data, buf.data(), buf.size(), fname, node,
+                                     dir);
+    }
+    if (committed) {
+      if (data->admitted_gained_log) {
+        fprintf(data->admitted_gained_log, "node=%u dir=%u root=%u %s\n",
+                data->last_node, data->last_dir,
+                data->root_shm_capture ? 1u : 0u, filename_new_queue);
+        fflush(data->admitted_gained_log);
+      }
+      data->traced_entries.insert((const char *)filename_new_queue);
+      record_admitted_pair(data, tail_node, tail_dir);
+    } else {
+      WARNF("coverage-gaining admitted entry was not inserted: %s\n", fname);
+    }
   }
   data->last_gained = committed;
+  // SANITIZER STAGE: every coverage-gaining candidate (screening or not) is
+  // re-executed on the sanitizer forkserver to catch memory-safety bugs.
+  // Crashes are saved by the mutator; timeouts are counted only.
+  if (data->afl->fsrv_san.fsrv_pid > 0) {
+    afl_fsrv_write_to_testcase(&data->afl->fsrv, const_cast<u8 *>(buf.data()),
+                               buf.size());
+    fsrv_run_result_t sres = afl_fsrv_run_target(
+        &data->afl->fsrv_san, data->afl->fsrv_san.exec_tmout,
+        &data->afl->stop_soon);
+    data->san_run_calls += 1;
+    if (sres == FSRV_RUN_CRASH) {
+      handle_san_crash(data, buf.data(), buf.size());
+    } else if (sres == FSRV_RUN_TMOUT) {
+      data->san_tmouts += 1;
+    }
+  }
   return 0;
 }
 
@@ -3030,18 +3221,16 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
       print_concolic_phase_snapshot(data);
       fprintf(stderr,
               "[pcbt] concolic phase deadline (%llus) reached; "
-              "switching to concrete\n",
+              "screening off (concolic stage disabled, sanitizer continues)\n",
               (unsigned long long)data->concolic_deadline);
       data->screening = false;
-      data->afl->pcbt_switch_pending = 1;
     }
   }
 
   if (!data->screening) {
     data->screened += 1;
     data->admitted += 1;
-    data->profile_exec_armed = data->profile_enabled &&
-                               !data->afl->pcbt_concrete_active;
+    data->profile_exec_armed = data->profile_enabled;
     data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
     write_progress(data, false);
     *out_buf = buf;
@@ -3057,8 +3246,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                     &data->last_veto_dir,
                                     &data->last_veto_kind);
   if (admitted) {
-    data->profile_exec_armed = data->profile_enabled &&
-                               !data->afl->pcbt_concrete_active;
+    data->profile_exec_armed = data->profile_enabled;
     data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
     data->admitted += 1;
     data->vetoes_since_admit = 0;
@@ -3200,7 +3388,7 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
         fprintf(stderr,
                 "[pcbt] probe-gain saturation after %llu vetoes "
                 "(window=%llu gains=%llu consec=%llu phase_secs=%llu); "
-                "switching to concrete\n",
+                "screening off (concolic stage disabled, sanitizer continues)\n",
                 (unsigned long long)data->vetoed,
                 (unsigned long long)data->sat_window,
                 (unsigned long long)data->sat_min_gains,
@@ -3210,20 +3398,19 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                     : 0ull);
       }
       data->screening = false;
-      data->afl->pcbt_switch_pending = 1;
     }
   }
-  // A saturated PCBT is a phase boundary, not a local screening fallback.
-  // Let AFL++ perform the restart at its next scheduler boundary, where it
-  // can safely replace the forkserver and rebuild its coverage state.
+  // A saturated PCBT is a phase boundary, not a local screening fallback:
+  // the main forkserver already runs the concrete target, so nothing is
+  // switched or restarted — the concolic stage simply stops being fed.
   if (data->tree.IsSaturated(data->rlimit, data->len_rlimit)) {
     data->screening = false;
-    data->afl->pcbt_switch_pending = 1;
     if (!data->saturation_logged) {
       data->saturation_logged = true;
       fprintf(stderr,
               "[pcbt] tree saturated after %llu vetoes "
-              "(phase_secs=%llu); switching to concrete\n",
+              "(phase_secs=%llu); screening off (concolic stage disabled, "
+              "sanitizer continues)\n",
               (unsigned long long)data->vetoed,
               data->phase_start
                   ? (unsigned long long)(time(nullptr) - data->phase_start)
@@ -3245,6 +3432,8 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            "admit_empty=%llu admit_opaque=%llu follow_tautology=%llu admit_eval_failure=%llu admit_frontier=%llu admit_unstable=%llu "
            "admit_len_veto=%llu veto_terminal=%llu veto_rlimit=%llu veto_unstable=%llu probe_admitted=%llu probe_gained=%llu "
            "probe_gained_terminal=%llu probe_gained_rlimit=%llu profile=%d "
+           "concolic_runs=%llu concolic_failed=%llu "
+           "san_runs=%llu san_tmouts=%llu san_crashes=%llu san_saved=%llu "
            "check_ns=%llu check_calls=%llu trace_ns=%llu trace_calls=%llu "
            "replay_ns=%llu replay_calls=%llu exec_ns=%llu exec_calls=%llu",
            (unsigned long long)t.num_traces, (unsigned long long)t.num_nodes,
@@ -3278,6 +3467,12 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)data->probe_gained_terminal,
            (unsigned long long)data->probe_gained_rlimit,
            (int)(data->profile_enabled ? 1 : 0),
+           (unsigned long long)data->concolic_run_calls,
+           (unsigned long long)data->concolic_run_failed,
+           (unsigned long long)data->san_run_calls,
+           (unsigned long long)data->san_tmouts,
+           (unsigned long long)data->san_crashes,
+           (unsigned long long)data->san_crashes_saved,
            (unsigned long long)data->profile_check_ns,
            (unsigned long long)data->profile_check_calls,
            (unsigned long long)data->profile_trace_ns,
