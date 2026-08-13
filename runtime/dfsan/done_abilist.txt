@@ -747,3 +747,9 @@ fun:assume_cond=uninstrumented
 fun:LLVMFuzzerTestOneInput=uninstrumented
 fun:__afl_manual_init=uninstrumented
 fun:__afl_manual_init=discard
+
+##########
+# M2-A (ADR 0008): RSan runtime (swiftsan_*) stays concrete — it is the
+# instrumented side, not a taint target. Without this, TaintPass renames
+# swiftsan_printf etc. to *.taint and linking fails.
+fun:swiftsan_*=uninstrumented

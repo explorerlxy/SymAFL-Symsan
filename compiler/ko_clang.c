@@ -377,7 +377,11 @@ static void edit_params(u32 argc, char **argv) {
       maybe_linking = 0;
 
     if (!strncmp(cur, "-fsanitize=", strlen("-fsanitize="))) {
-      continue; // doesn't work together
+      // M2-A (ADR 0008): -fsanitize=safe-stack activates the RSan pass in
+      // the MixSan (LLVM 16) toolchain and must be forwarded. All other
+      // -fsanitize= flags are incompatible with SymSan and are dropped.
+      if (strcmp(cur, "-fsanitize=safe-stack") != 0)
+        continue; // doesn't work together
     }
 
     if (!use_native_zlib && !strcmp(cur, "-lz"))
