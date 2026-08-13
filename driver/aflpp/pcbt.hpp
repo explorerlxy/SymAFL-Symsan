@@ -216,6 +216,16 @@ class Tree {
   // unstable mark / prefix-drift / already-unstable hit with node cid+depth.
   void set_conflict_diag(bool enabled) { diag_conflicts_ = enabled; }
   bool conflict_diag() const { return diag_conflicts_; }
+  // Pair forensics: keep the first input that *created* each node so a later
+  // cid/dir mismatch can dump the admit partner (not only the probe).
+  // Disabled by default (memory); enable when anomaly/forensics dirs are set.
+  void set_store_creators(bool enabled, uint32_t max_len = 65536) {
+    store_creators_ = enabled;
+    if (max_len) creator_max_len_ = max_len;
+  }
+  bool store_creators() const { return store_creators_; }
+  // Copy creator input for `ref` into *out. Returns false if none stored.
+  bool creator_of(NodeRef ref, std::vector<uint8_t> *out) const;
   void DebugPredicate(NodeRef ref, const uint8_t *input, uint32_t len) const;
 
   // stats
@@ -289,11 +299,14 @@ class Tree {
   Node &node(NodeRef ref) { return nodes_[ref]; }
   const Node &node(NodeRef ref) const { return nodes_[ref]; }
   NodeRef append(Node &&node);
+  void maybe_store_creator(NodeRef ref, const uint8_t *input, uint32_t len);
   bool IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const;
   bool debug_ = false;
   bool profile_ = false;
   bool rlimit_unlimited_ = false;
   bool diag_conflicts_ = false;
+  bool store_creators_ = false;
+  uint32_t creator_max_len_ = 65536;
   StructuralFault last_struct_fault_{};
   // Persistent eval context for CheckInput: the values_/stamps_ vectors are
   // keyed by arena index, so they must only grow (the arena is append-only
@@ -305,6 +318,8 @@ class Tree {
   // Index 1 is a global terminal node; index 2 is the virtual root.
   std::vector<Node> nodes_;
   PredArena pred_arena_;
+  // First-creating input blob per node (only when store_creators_).
+  std::unordered_map<NodeRef, std::vector<uint8_t>> creators_;
 };
 
 }  // namespace pcbt

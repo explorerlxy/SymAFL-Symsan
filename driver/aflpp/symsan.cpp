@@ -634,6 +634,9 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
         ck_free(case_dir);
       } else {
         data->anomaly_case_dir = case_dir;
+        // Pair RCA: retain first-creating input per tree node so cid/dir
+        // mismatch dumps include ADMIT as well as PROBE.
+        data->tree.set_store_creators(true, /*max_len=*/65536);
         char *index_path =
             alloc_printf("%s/index.tsv", data->anomaly_case_dir);
         data->anomaly_index = fopen(index_path, "a");
@@ -643,14 +646,15 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
             fprintf(data->anomaly_index,
                     "seq\treason\tinput_len\tpipe_bytes\tevents\t"
                     "first_cid\tfirst_constraint\tkill_sig\ttimeout\t"
-                    "mode\tentry_cid\tentry_constraint\tpath\n");
+                    "mode\tentry_cid\tentry_constraint\tpath\t"
+                    "admit_found\tadmit_len\tmismatch_node\n");
             fflush(data->anomaly_index);
           }
         }
         ck_free(index_path);
         fprintf(stderr,
                 "[pcbt] anomaly case dump: %s (entry/replay hard faults "
-                "save input+pipe+meta)\n",
+                "save probe+admit pair: input/pipe/events)\n",
                 data->anomaly_case_dir);
       }
     }
@@ -1283,11 +1287,14 @@ static void request_residual_abort(my_mutator_t *data, const char *reason) {
 // Direct re-exec of the concolic target for TruncatedTrace isolation.
 // Uses posix_spawn (AFL is multi-threaded; plain fork is unsafe).
 // Returns true when a stream was collected into *out.
+// Direct re-exec. When out_wire is non-null, also returns the raw pipe bytes
+// (for admit-pipe.bin pair forensics).
 static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
-                               size_t buf_size,
-                               std::vector<pcbt::Event> *out) {
+                               size_t buf_size, std::vector<pcbt::Event> *out,
+                               std::vector<u8> *out_wire = nullptr) {
   if (!data->concolic_target || !buf || buf_size == 0 || !out) return false;
   out->clear();
+  if (out_wire) out_wire->clear();
 
   char tmpl[] = "/home/hahafish/symafl2-work/pcbt-reexec-XXXXXX";
   int ifd = mkstemp(tmpl);
@@ -1414,6 +1421,7 @@ static bool reexec_full_stream(my_mutator_t *data, const u8 *buf,
   }
   fprintf(stderr, "[pcbt-reexec] wire=%zu events=%zu\n", wire.size(),
           decoded.size());
+  if (out_wire) *out_wire = wire;
   *out = std::move(decoded);
   return true;
 }
@@ -1455,9 +1463,11 @@ static void dump_label_dag(dfsan_label root) {
   }
 }
 
-static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
-                                 const std::vector<pcbt::Event> &events,
-                                 const u8 *input, size_t input_len);
+static bool capture_anomaly_case(
+    my_mutator_t *data, const char *reason,
+    const std::vector<pcbt::Event> &events, const u8 *input, size_t input_len,
+    pcbt::NodeRef mismatch_node = pcbt::kUnexplored, size_t event_index = 0,
+    uint32_t expected_cid = 0, uint32_t observed_cid = 0);
 
 static bool replay_check_trace(my_mutator_t *data,
                                const std::vector<pcbt::Event> &events,
@@ -1737,8 +1747,11 @@ static bool replay_check_trace(my_mutator_t *data,
       dump_label_dag(ev.label);
     }
   }
-  // Dump the candidate so hard-gate counters are always offline-reproducible.
-  (void)capture_anomaly_case(data, case_reason, events, buf, buf_size);
+  // Dump PROBE (this candidate) + ADMIT (creator of mismatch_node) so RCA
+  // always has a real test-case pair, not probe-only guesswork.
+  (void)capture_anomaly_case(data, case_reason, events, buf, buf_size,
+                             report.mismatch_node, report.event_index,
+                             report.expected_cid, report.observed_cid);
   return false;  // discard mismatched trace
 }
 
@@ -1773,16 +1786,25 @@ static void write_forensic_input(const std::string &path, const u8 *input,
 
 // Persist a hard-anomaly test case so counters are always actionable.
 // Writes under anomaly_case_dir:
-//   case-NNNNNN-<reason>-input.bin
-//   case-NNNNNN-<reason>-pipe.bin   (raw drained bytes; may be empty)
+//   case-NNNNNN-<reason>-input.bin          (PROBE: the mismatched candidate)
+//   case-NNNNNN-<reason>-pipe.bin
 //   case-NNNNNN-<reason>-events.tsv
 //   case-NNNNNN-<reason>-meta.txt
+//   case-NNNNNN-<reason>-admit-input.bin    (ADMIT: first creator of mismatch
+//                                           tree node, when stored)
+//   case-NNNNNN-<reason>-admit-events.tsv   (reexec of admit, best-effort)
+//   case-NNNNNN-<reason>-admit-pipe.bin
 //   index.tsv (append one row)
 // Entry-artifact cases use a high limit (default max(forensic_limit, 64));
 // replay mismatches share the same budget so rare faults are not dropped.
+// mismatch_node / expected_cid / observed_cid are optional pair forensics
+// (pass kUnexplored / 0 when unknown).
 static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
                                  const std::vector<pcbt::Event> &events,
-                                 const u8 *input, size_t input_len) {
+                                 const u8 *input, size_t input_len,
+                                 pcbt::NodeRef mismatch_node,
+                                 size_t event_index, uint32_t expected_cid,
+                                 uint32_t observed_cid) {
   if (!data->anomaly_case_dir) return false;
 
   const bool is_entry = (strcmp(reason, "entry-artifact") == 0);
@@ -1871,12 +1893,72 @@ static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
                  : 0u);
   const uint32_t timed_out = data->afl->fsrv.last_run_timed_out;
 
+  // ADMIT partner: first input that created the mismatch tree node.
+  std::string admit_input_path = std::string(base) + "-admit-input.bin";
+  std::string admit_events_path = std::string(base) + "-admit-events.tsv";
+  std::string admit_pipe_path = std::string(base) + "-admit-pipe.bin";
+  int admit_found = 0;
+  size_t admit_len = 0;
+  size_t admit_events_n = 0;
+  size_t admit_pipe_n = 0;
+  uint32_t admit_node_cid = 0;
+  uint32_t admit_node_depth = 0;
+  if (mismatch_node != pcbt::kUnexplored &&
+      mismatch_node != pcbt::kTerminal &&
+      mismatch_node != pcbt::kRoot) {
+    admit_node_cid = data->tree.cid_of(mismatch_node);
+    admit_node_depth = data->tree.depth(mismatch_node);
+    std::vector<uint8_t> admit_buf;
+    if (data->tree.creator_of(mismatch_node, &admit_buf) &&
+        !admit_buf.empty()) {
+      admit_found = 1;
+      admit_len = admit_buf.size();
+      write_forensic_input(admit_input_path, admit_buf.data(), admit_buf.size());
+      // Best-effort reexec to materialize admit event stream offline.
+      // (AFL-session pipe is not retained; reexec is the reproducible partner
+      // trace. Note: rare env skew vs AFL is documented in meta.)
+      std::vector<pcbt::Event> admit_ev;
+      std::vector<u8> admit_wire;
+      if (reexec_full_stream(data, admit_buf.data(), admit_buf.size(),
+                             &admit_ev, &admit_wire)) {
+        admit_events_n = admit_ev.size();
+        admit_pipe_n = admit_wire.size();
+        FILE *aef = fopen(admit_events_path.c_str(), "w");
+        if (aef) {
+          fprintf(aef, "index\tcid\tlabel\tresult\tconstraint\tcount\n");
+          for (size_t i = 0; i < admit_ev.size(); ++i) {
+            const pcbt::Event &ev = admit_ev[i];
+            fprintf(aef, "%zu\t%u\t%u\t%u\t%u\t%u\n", i, ev.cid, ev.label,
+                    ev.result, ev.constraint, ev.count);
+          }
+          fclose(aef);
+        }
+        int apfd = open(admit_pipe_path.c_str(), O_WRONLY | O_CREAT | O_TRUNC,
+                        0600);
+        if (apfd >= 0) {
+          if (!admit_wire.empty()) {
+            ck_write(apfd, admit_wire.data(), admit_wire.size(),
+                     admit_pipe_path.c_str());
+          }
+          close(apfd);
+        }
+      }
+    }
+  }
+
   FILE *meta_file = fopen(meta_path.c_str(), "w");
   if (meta_file) {
-    fprintf(meta_file, "snapshot_version=1\nreason=%s\nsequence=%llu\n",
+    fprintf(meta_file, "snapshot_version=2\nreason=%s\nsequence=%llu\n",
             reason, (unsigned long long)sequence);
+    fprintf(meta_file,
+            "role_probe=input/pipe/events (mismatched candidate)\n"
+            "role_admit=admit-input/admit-pipe/admit-events "
+            "(first creator of mismatch_node)\n");
     fprintf(meta_file, "input=%s\npipe=%s\nevents=%s\n", input_path.c_str(),
             pipe_path.c_str(), events_path.c_str());
+    fprintf(meta_file, "admit_input=%s\nadmit_pipe=%s\nadmit_events=%s\n",
+            admit_input_path.c_str(), admit_pipe_path.c_str(),
+            admit_events_path.c_str());
     fprintf(meta_file,
             "input_len=%zu\npipe_bytes=%zu\nevents=%zu\n"
             "first_cid=%u\nfirst_constraint=%u\n"
@@ -1887,30 +1969,51 @@ static bool capture_anomaly_case(my_mutator_t *data, const char *reason,
             kill_sig, timed_out, mode_name, mode, entry_cid, entry_constraint,
             data->single_pass_armed ? 1u : 0u, data->bootstrap_done ? 1u : 0u,
             data->replay_all ? 1u : 0u);
+    fprintf(meta_file,
+            "mismatch_node=%u\nmismatch_node_cid=%u\nmismatch_node_depth=%u\n"
+            "event_index=%zu\nexpected_cid=%u\nobserved_cid=%u\n"
+            "admit_found=%d\nadmit_len=%zu\nadmit_events=%zu\n"
+            "admit_pipe_bytes=%zu\n"
+            "admit_trace_note=reexec_not_afl_session_pipe\n",
+            mismatch_node, admit_node_cid, admit_node_depth, event_index,
+            expected_cid, observed_cid, admit_found, admit_len, admit_events_n,
+            admit_pipe_n);
     // Hex head of input for quick grep without opening the bin.
     size_t shown = input_len < 64 ? input_len : 64;
     fprintf(meta_file, "input_hex=");
     for (size_t k = 0; k < shown; ++k)
       fprintf(meta_file, "%02x", input ? input[k] : 0);
     fprintf(meta_file, "%s\n", shown < input_len ? " TRUNC" : "");
+    if (admit_found) {
+      std::vector<uint8_t> ab;
+      if (data->tree.creator_of(mismatch_node, &ab)) {
+        size_t ashown = ab.size() < 64 ? ab.size() : 64;
+        fprintf(meta_file, "admit_hex=");
+        for (size_t k = 0; k < ashown; ++k)
+          fprintf(meta_file, "%02x", ab[k]);
+        fprintf(meta_file, "%s\n", ashown < ab.size() ? " TRUNC" : "");
+      }
+    }
     fclose(meta_file);
   }
 
   if (data->anomaly_index) {
     fprintf(data->anomaly_index,
-            "%llu\t%s\t%zu\t%zu\t%zu\t%u\t%u\t%u\t%u\t%s\t%u\t%d\t%s\n",
+            "%llu\t%s\t%zu\t%zu\t%zu\t%u\t%u\t%u\t%u\t%s\t%u\t%d\t%s\t"
+            "admit_found=%d\tadmit_len=%zu\tmismatch_node=%u\n",
             (unsigned long long)sequence, reason, input_len, pipe_bytes,
             events.size(), first_cid, first_constraint, kill_sig, timed_out,
-            mode_name, entry_cid, entry_constraint, input_path.c_str());
+            mode_name, entry_cid, entry_constraint, input_path.c_str(),
+            admit_found, admit_len, mismatch_node);
     fflush(data->anomaly_index);
   }
 
   *captured += 1;
-  WARNF("[pcbt-anomaly] reason=%s case=%s input_len=%zu pipe_bytes=%zu "
-        "events=%zu first_cid=%u first_constraint=%u kill=%u timeout=%u "
-        "mode=%s\n",
-        reason, base, input_len, pipe_bytes, events.size(), first_cid,
-        first_constraint, kill_sig, timed_out, mode_name);
+  WARNF("[pcbt-anomaly] reason=%s case=%s probe_len=%zu pipe_bytes=%zu "
+        "events=%zu admit_found=%d admit_len=%zu mismatch_node=%u "
+        "expected_cid=%u observed_cid=%u mode=%s\n",
+        reason, base, input_len, pipe_bytes, events.size(), admit_found,
+        admit_len, mismatch_node, expected_cid, observed_cid, mode_name);
   ck_free(base);
   return true;
 }

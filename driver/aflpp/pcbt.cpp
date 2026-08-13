@@ -166,6 +166,24 @@ NodeRef Tree::append(Node &&new_node) {
   return (NodeRef)nodes_.size() - 1;
 }
 
+void Tree::maybe_store_creator(NodeRef ref, const uint8_t *input,
+                               uint32_t len) {
+  if (!store_creators_ || !input || len == 0) return;
+  if (ref < kRoot) return;
+  if (creators_.find(ref) != creators_.end()) return;  // first creator only
+  const uint32_t n =
+      len < creator_max_len_ ? len : creator_max_len_;
+  creators_.emplace(ref, std::vector<uint8_t>(input, input + n));
+}
+
+bool Tree::creator_of(NodeRef ref, std::vector<uint8_t> *out) const {
+  if (!out) return false;
+  auto it = creators_.find(ref);
+  if (it == creators_.end() || it->second.empty()) return false;
+  *out = it->second;
+  return true;
+}
+
 // Does the predicate's DAG contain a length/count-family leaf?
 // Length-derived decisions are path-dependent in label presence (a trace
 // whose length counter was never symbolically updated contributes no event,
@@ -507,6 +525,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       }
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) return created;
+      maybe_store_creator(next, input, len);
       node(parent).child[dir] = next;
       parent = next;
       dir = pred.tautology ? pred.fixed_dir : (ev.result ? 1 : 0);
@@ -682,6 +701,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       if (cls == InsertPredClass::Tautology) num_tautology += 1;
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) return created;
+      maybe_store_creator(next, input, len);
       node(cur).child[dir] = next;
       cur = next;
       dir = pred.tautology ? pred.fixed_dir : (event.result ? 1 : 0);
