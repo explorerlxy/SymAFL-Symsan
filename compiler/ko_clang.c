@@ -190,7 +190,13 @@ static void add_runtime() {
   cc_params[cc_par_cnt++] =
       alloc_printf("-Wl,--dynamic-list=%s/libdfsan_rt-x86_64.a.syms", obj_path);
 
-  cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/taint.ld", obj_path);
+  // KO_NO_TAINT_LD: skip taint.ld so a second linker script (RSan
+  // linkglobals.ld, INSERT AFTER .strtab) can place basebounds sections.
+  // taint.ld is a full script that pins text at 0x700000200000; combining it
+  // with linkglobals.ld's absolute high VMAs yields R_X86_64_PC32 out of range.
+  if (!getenv("KO_NO_TAINT_LD")) {
+    cc_params[cc_par_cnt++] = alloc_printf("-Wl,-T%s/taint.ld", obj_path);
+  }
 
   if (is_cxx && use_ucsan_only) {
     // UCSan-only: link the plain (uninstrumented) EH runtime so C++ exception
@@ -471,8 +477,16 @@ static void edit_params(u32 argc, char **argv) {
     }
   }
 
-  cc_params[cc_par_cnt++] = "-pie";
-  cc_params[cc_par_cnt++] = "-fpic";
+  // Default PIE. lld honours -pie even with taint.ld and emits ET_DYN, which
+  // the kernel then loads at 0x5555… (inside DFSAN shadow) — SIGSEGV in
+  // dfsan_init. bfd+taint.ld still emits ET_EXEC despite -pie. KO_NO_PIE
+  // forces ET_EXEC for the lld / RSan dual-instrumented path.
+  if (getenv("KO_NO_PIE")) {
+    cc_params[cc_par_cnt++] = "-no-pie";
+  } else {
+    cc_params[cc_par_cnt++] = "-pie";
+    cc_params[cc_par_cnt++] = "-fpic";
+  }
   cc_params[cc_par_cnt++] = "-Qunused-arguments";
   cc_params[cc_par_cnt++] = "-fno-vectorize";
   cc_params[cc_par_cnt++] = "-fno-slp-vectorize";
