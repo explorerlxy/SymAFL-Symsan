@@ -24,6 +24,13 @@ constexpr size_t kMaxPredicateNodes = 2'000'000;
 constexpr size_t kMaxStrlenBytes = 256;
 constexpr size_t kMaxSearchBytes = 512;
 constexpr size_t kFstrcmpCaptureBytes = 32;
+// Upper bound for a memcmp consumed by a comparison with zero when BOTH
+// operands are tainted: the string shadows expand byte-wise, so the bound
+// only limits node count (sqlite binCollFunc compares b-tree keys of
+// arbitrary length; the census corpus stays well below this).  A constant
+// operand still uses the runtime's capture window and fails conservatively
+// beyond it.
+constexpr size_t kFmemcmpTaintedMaxBytes = 256;
 
 // Length-boundary count ops (flen_count family). They share the Count-family
 // node lowering; flen_eof and fsize are handled separately.
@@ -333,10 +340,39 @@ uint32_t RunConverter::convert(uint32_t label) {
         if (child < table_labels_ && table_[child].size > 64)
           count = 0;
       }
-      if (op_lo == ICmp && info->l2 == 0 && info->l1 != 0 &&
-          info->l1 < table_labels_ && is_fmemcmp(table_[info->l1].op) &&
-          table_[info->l1].size > 8)
-        count = 0;
+      // A memcmp result consumed by a comparison with zero is lowered by
+      // convert_fmemcmp_cmp (canonical sign semantics); its operand must not
+      // be walked as a child.  Peel sign-preserving cast wrappers
+      // (`rc = memcmp(...); if (rc == 0)` reaches the ICmp as
+      // Trunc/SExt/ZExt(fmemcmp-label), e.g. sqlite binCollFunc).
+      {
+        dfsan_label cmp_side = info->l1;
+        for (int depth = 0; depth < 2 && cmp_side != 0 &&
+                            cmp_side < table_labels_; ++depth) {
+          uint16_t lo = table_[cmp_side].op & 0xff;
+          if (lo == Trunc || lo == SExt || lo == ZExt)
+            cmp_side = table_[cmp_side].l1;
+          else
+            break;
+        }
+        if (info->l2 == 0 && cmp_side != 0 && cmp_side < table_labels_ &&
+            is_fmemcmp(table_[cmp_side].op) && table_[cmp_side].size > 8)
+          count = 0;
+      }
+      {
+        dfsan_label cmp_side = info->l2;
+        for (int depth = 0; depth < 2 && cmp_side != 0 &&
+                            cmp_side < table_labels_; ++depth) {
+          uint16_t lo = table_[cmp_side].op & 0xff;
+          if (lo == Trunc || lo == SExt || lo == ZExt)
+            cmp_side = table_[cmp_side].l1;
+          else
+            break;
+        }
+        if (info->l1 == 0 && cmp_side != 0 && cmp_side < table_labels_ &&
+            is_fmemcmp(table_[cmp_side].op) && table_[cmp_side].size > 8)
+          count = 0;
+      }
       if (op_lo == Concat && info->size > 64)
         count = 0;
       if (count == 2) {
@@ -625,9 +661,45 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
       fail(PredError::UncapturedMemcmpOperand, info->op);
       return kInvalidNode;
     }
-    uint16_t child_bits = static_cast<uint16_t>(info->size * 8);
-    uint32_t a = conv_child(info->l1, info->op1.i, child_bits);
-    uint32_t b = conv_child(info->l2, info->op2.i, child_bits);
+    // Build one operand from its string shadow when it is a byte-string
+    // shape (raw/Load/Concat -> input Reads, exact).  A shadow that is NOT
+    // byte-string shaped (e.g. a >64-bit truthiness label from sqlite's
+    // VList name shadow) must NOT be converted as a scalar value:
+    // convert_wide_truth would OR its per-byte nonzero tests, producing a
+    // boolean aggregate instead of the compared bytes.  Fall back to the
+    // runtime-captured bytes (little-endian packed), which are the actual
+    // compared content.
+    auto operand_value = [&](dfsan_label l, uint64_t low, uint64_t high,
+                             bool operand2) -> uint32_t {
+      if (l != 0 && l < table_labels_) {
+        std::vector<StringByte> bytes;
+        if (collect_string_nodes(l, info->size, bytes) &&
+            bytes.size() == info->size) {
+          uint32_t packed = bytes[0].node;
+          for (uint32_t i = 1; i < info->size; ++i) {
+            packed = add(PKind::Concat, (uint16_t)((i + 1) * 8),
+                         packed, bytes[i].node);
+            if (packed == kInvalidNode) return kInvalidNode;
+          }
+          return packed;
+        }
+      }
+      if (!fmemcmp_operand_captured(info->op, operand2)) {
+        fail(PredError::UncapturedMemcmpOperand, info->op);
+        return kInvalidNode;
+      }
+      uint32_t packed = add_const(low & 0xff, 8);
+      for (uint32_t i = 1; i < info->size; ++i) {
+        uint64_t word = i < 8 ? low : high;
+        uint32_t byte = static_cast<uint32_t>((word >> (8 * (i % 8))) & 0xff);
+        packed = add(PKind::Concat, (uint16_t)((i + 1) * 8),
+                     packed, add_const(byte, 8));
+        if (packed == kInvalidNode) return kInvalidNode;
+      }
+      return packed;
+    };
+    uint32_t a = operand_value(info->l1, info->op1.i, info->op1_hi, false);
+    uint32_t b = operand_value(info->l2, info->op2.i, info->op2_hi, true);
     return a == kInvalidNode || b == kInvalidNode
                ? kInvalidNode : add(PKind::Memcmp, 32, a, b, info->size);
   }
@@ -853,23 +925,43 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
     return convert_strlen_expr(*info);
   }
   if (op_lo == ICmp) {
+    // Peel sign-preserving cast wrappers around a memcmp result.  C code
+    // assigns memcmp() to an int before comparing (`rc = memcmp(...);
+    // if (rc == 0)`), so the DFSan shadow reaches the ICmp as
+    // Trunc/SExt/ZExt(fmemcmp-label); the canonical memcmp sign comparison
+    // must still be recognized (sqlite binCollFunc, sqlite3.c:178629).
+    auto unwrap_memcmp = [&](dfsan_label l) -> dfsan_label {
+      for (int depth = 0; depth < 2 && l != 0 && l < table_labels_; ++depth) {
+        const dfsan_label_info &li = table_[l];
+        uint16_t lo = li.op & 0xff;
+        if (lo == Trunc || lo == SExt || lo == ZExt) l = li.l1;
+        else break;
+      }
+      return l;
+    };
+    dfsan_label l1_unwrapped = unwrap_memcmp(info->l1);
+    dfsan_label l2_unwrapped = unwrap_memcmp(info->l2);
     // A C memcmp result is specified only by its sign.  The scalar Memcmp node
     // therefore has a total canonical sign representation, but it is sound
     // only when consumed immediately by a comparison with zero.
     const bool left_memcmp =
-        info->l1 != 0 && info->l1 < table_labels_ &&
-        is_fmemcmp(table_[info->l1].op);
+        l1_unwrapped != 0 && l1_unwrapped < table_labels_ &&
+        is_fmemcmp(table_[l1_unwrapped].op);
     const bool right_memcmp =
-        info->l2 != 0 && info->l2 < table_labels_ &&
-        is_fmemcmp(table_[info->l2].op);
+        l2_unwrapped != 0 && l2_unwrapped < table_labels_ &&
+        is_fmemcmp(table_[l2_unwrapped].op);
     if ((left_memcmp && (info->l2 != 0 || info->op2.i != 0)) ||
         (right_memcmp && (info->l1 != 0 || info->op1.i != 0))) {
       fail(PredError::UnsupportedOp, static_cast<uint16_t>(op));
       return kInvalidNode;
     }
     if (left_memcmp && info->l2 == 0 &&
-        table_[info->l1].size > 8) {
-      return convert_fmemcmp_cmp(info, op, table_[info->l1]);
+        table_[l1_unwrapped].size > 8) {
+      return convert_fmemcmp_cmp(info, op, table_[l1_unwrapped]);
+    }
+    if (right_memcmp && info->l1 == 0 &&
+        table_[l2_unwrapped].size > 8) {
+      return convert_fmemcmp_cmp(info, op, table_[l2_unwrapped]);
     }
     // fstrcmp/fstrcasecmp results are lowered byte-wise from the string
     // shadows plus the operand bytes captured by the comparison wrappers.
@@ -1663,8 +1755,14 @@ uint32_t RunConverter::convert_fmemcmp_cmp(
     const dfsan_label_info *info, uint32_t op,
     const dfsan_label_info &memcmp_info) {
   const uint32_t n = memcmp_info.size;
-  // Match the 32-byte capture window used by the runtime fmemcmp wrappers.
-  if (n == 0 || n > kFstrcmpCaptureBytes) {
+  // Both operands tainted: the string shadows expand byte-wise, so the bound
+  // only limits node count (sqlite binCollFunc compares b-tree keys of
+  // arbitrary length).  A constant operand is limited by the runtime capture
+  // window and fails conservatively beyond it.
+  const size_t limit = (memcmp_info.l1 != 0 && memcmp_info.l2 != 0)
+                           ? kFmemcmpTaintedMaxBytes
+                           : kFstrcmpCaptureBytes;
+  if (n == 0 || n > limit) {
     fail(PredError::InvalidWidth, static_cast<uint16_t>(memcmp_info.op));
     return kInvalidNode;
   }
