@@ -50,7 +50,10 @@
 #include "UCSanSummary.h"
 
 #include <optional>
-#include "llvm/IR/AttributeMask.h"
+#include "llvm/IR/Attributes.h"
+#if LLVM_VERSION_MAJOR >= 17
+#include "llvm/IR/AttributeMask.h"  // split out of Attributes.h in LLVM 17
+#endif
 #include "llvm/TargetParser/Triple.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"

@@ -48,12 +48,13 @@ if (LLVM_FOUND)
     message(STATUS "LLVM_VERSION_MAJOR: ${LLVM_VERSION_MAJOR}")
     message(STATUS "LLVM_VERSION_MINOR: ${LLVM_VERSION_MINOR}")
     message(STATUS "LLVM_VERSION_PATCH: ${LLVM_VERSION_PATCH}")
-    # SymSan requires LLVM >= 18 (the default on Ubuntu 24.04). Older versions
-    # predate opaque pointers and the DFSan trampoline removal and are no longer
-    # supported. (find_package(LLVM 18) can't be used: LLVM's version config
-    # requires an exact major.minor match.)
-    if (LLVM_VERSION_MAJOR LESS 18)
-        message(FATAL_ERROR "SymSan requires LLVM >= 18, found ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}")
+    # SymSan supports LLVM 16 (MixSan/RSan toolchain, ADR 0008) and LLVM 18
+    # (Ubuntu 24.04 default). 16 predates opaque pointers and the DFSan
+    # trampoline removal but the MixSan tree carries the TargetParser layout
+    # the passes are written against. (find_package(LLVM 18) can't be used:
+    # LLVM's version config requires an exact major.minor match.)
+    if (LLVM_VERSION_MAJOR LESS 16)
+        message(FATAL_ERROR "SymSan requires LLVM >= 16, found ${LLVM_VERSION_MAJOR}.${LLVM_VERSION_MINOR}")
     endif()
 else()
     message(FATAL_ERROR "You haven't install LLVM !")

@@ -33,7 +33,10 @@
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/Transforms/Utils/ScalarEvolutionExpander.h"
 #include "llvm/IR/Argument.h"
-#include "llvm/IR/AttributeMask.h"
+#include "llvm/IR/Attributes.h"
+#if LLVM_VERSION_MAJOR >= 17
+#include "llvm/IR/AttributeMask.h"  // split out of Attributes.h in LLVM 17
+#endif
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
@@ -94,6 +97,16 @@ using namespace llvm;
 
 // This must be consistent with ShadowWidthBits.
 static const Align ShadowTLSAlignment = Align(4);
+
+// LLVM 16 names scalable-vector query isScalable(); renamed isScalableTy()
+// in LLVM 17. (ADR 0008: support the LLVM 16 MixSan toolchain.)
+static inline bool typeIsScalableTy(const VectorType *VT) {
+#if LLVM_VERSION_MAJOR >= 17
+  return VT->isScalableTy();
+#else
+  return VT->getElementCount().isScalable();
+#endif
+}
 
 // The size of TLS variables. These constants must be kept in sync with the ones
 // in dfsan.cpp.
@@ -856,7 +869,7 @@ bool Taint::isZeroShadow(Value *V) {
 
 Constant *Taint::getUninitializedShadow(Type *OrigTy) {
   if (VectorType *VT = dyn_cast<VectorType>(OrigTy)) {
-    if (VT->isScalableTy()) return UninitializedPrimitiveShadow;
+    if (typeIsScalableTy(VT)) return UninitializedPrimitiveShadow;
     SmallVector<Constant *, 4> Elements(
         VT->getElementCount().getFixedValue(), UninitializedPrimitiveShadow);
     return ConstantVector::get(Elements);
@@ -879,7 +892,7 @@ Constant *Taint::getUninitializedShadow(Type *OrigTy) {
 
 Constant *Taint::getZeroShadow(Type *OrigTy) {
   if (VectorType *VT = dyn_cast<VectorType>(OrigTy)) {
-    if (VT->isScalableTy()) return ZeroPrimitiveShadow;
+    if (typeIsScalableTy(VT)) return ZeroPrimitiveShadow;
     SmallVector<Constant *, 4> Elements(
         VT->getElementCount().getFixedValue(), ZeroPrimitiveShadow);
     return ConstantVector::get(Elements);
@@ -902,7 +915,7 @@ Type *Taint::getShadowTy(Type *OrigTy) {
   if (VectorType *VT = dyn_cast<VectorType>(OrigTy)) {
     // Fixed-length vectors keep one shadow per lane (per-lane SIMD
     // modeling). Scalable vectors stay collapsed to one scalar shadow.
-    if (VT->isScalableTy()) return PrimitiveShadowTy;
+    if (typeIsScalableTy(VT)) return PrimitiveShadowTy;
     return FixedVectorType::get(PrimitiveShadowTy,
                                 VT->getElementCount().getFixedValue());
   }
@@ -3347,7 +3360,7 @@ Value *TaintFunction::loadShadowRecursive(
     // the lane's byte range (one union per lane) instead of collapsing the
     // whole vector into a single label. Scalable vectors fall back to the
     // collapsed scalar load below.
-    if (!VT->isScalableTy()) {
+    if (!typeIsScalableTy(VT)) {
       Type *ElemTy = VT->getElementType();
       uint64_t ElemSize = DL.getTypeStoreSize(ElemTy);
       for (unsigned Idx = 0, N = VT->getElementCount().getFixedValue();
@@ -3683,7 +3696,7 @@ void TaintFunction::storeShadowRecursive(
     // lane's byte range (TaintUnionStore per lane) instead of decomposing
     // one collapsed label over the whole vector. Scalable vectors fall back
     // to the collapsed scalar store below.
-    if (!VT->isScalableTy()) {
+    if (!typeIsScalableTy(VT)) {
       Type *ElemTy = VT->getElementType();
       uint64_t ElemSize = DL.getTypeStoreSize(ElemTy);
       for (unsigned Idx = 0, N = VT->getElementCount().getFixedValue();
