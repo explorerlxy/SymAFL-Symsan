@@ -124,11 +124,10 @@ struct my_mutator_t {
   std::unordered_set<std::string> traced_entries;
   bool bootstrap_done = false;
 
-  // screening state (post_process). screening gates the concolic stage
-  // (bootstrap flush + gain-gated insert). veto_enabled gates CheckInput;
-  // SYMAFL_NO_VETO clears only the latter (ADR 0009).
+  // screening gates the concolic stage (bootstrap flush + gain-gated insert).
+  // veto_enabled gates CheckInput; production default is off (ADR 0009).
   bool screening = true;
-  bool veto_enabled = true;
+  bool veto_enabled = false;
   uint8_t rlimit = 16;
   uint8_t len_rlimit = 16;
   pcbt::NodeRef last_node = pcbt::kUnexplored;
@@ -735,8 +734,17 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
             "granted (rCnt bypassed); saturation decided by terminal closure "
             "alone\n");
   }
+  data->veto_enabled = false;
+  if (const char *veto = getenv("SYMAFL_VETO")) {
+    data->veto_enabled = strcmp(veto, "0") != 0 && veto[0] != '\0';
+  }
   if (getenv("SYMAFL_NO_VETO")) {
     data->veto_enabled = false;
+  }
+  if (data->veto_enabled) {
+    fprintf(stderr,
+            "[pcbt] veto: CheckInput + suffix capture (SYMAFL_VETO=1)\n");
+  } else {
     fprintf(stderr,
             "[pcbt] no-veto: CheckInput skipped; full-stream capture; "
             "concolic stage still runs on coverage gainers "
@@ -746,7 +754,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->screening = false;
     if (!data->veto_enabled) {
       fprintf(stderr,
-              "[pcbt] SYMAFL_NO_SCREEN wins over SYMAFL_NO_VETO: "
+              "[pcbt] SYMAFL_NO_SCREEN wins over no-veto: "
               "no capture, no concolic insert\n");
     }
   }
@@ -3106,11 +3114,11 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     return 0;
   }
   // CONCOLIC STAGE (learning): this admitted candidate gained coverage on
-  // the CONCRETE main fsrv. Capture was armed at post_process (suffix when
-  // CheckInput selected a frontier; full-stream under SYMAFL_NO_VETO).
+  // the CONCRETE main fsrv. Capture was armed at post_process (full-stream
+  // by default; suffix when SYMAFL_VETO selected a CheckInput frontier).
   // Under REPLAY_ALL/probe_diag post_run already ran the concolic forkserver
   // (replay_run_done) — insert from that capture. screening=false (saturation,
-  // deadline, or SYMAFL_NO_SCREEN) skips this stage; NO_VETO does not.
+  // deadline, or SYMAFL_NO_SCREEN) skips this stage; no-veto does not.
   bool committed = false;
   if (data->screening) {
     if (data->replay_run_done) {
@@ -3253,9 +3261,9 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     return buf_size;
   }
 
-  // ADR 0009: admit every candidate, arm a complete stream, keep learning.
-  // No CheckInput frontier, so InsertSuffix is invalid — last_node stays
-  // unexplored and queue_new_entry uses InsertTrace.
+  // Production default (ADR 0009): admit every candidate, arm a complete
+  // stream, keep learning. No CheckInput frontier, so InsertSuffix is
+  // invalid — last_node stays unexplored and queue_new_entry uses InsertTrace.
   if (!data->veto_enabled) {
     data->screened += 1;
     data->admitted += 1;
