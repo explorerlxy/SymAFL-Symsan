@@ -1,9 +1,9 @@
 # SymAFL v2 AFL++ custom mutator
 
-This directory implements the current SymAFL v2 PCBT custom mutator.  It is
-not the upstream SymSan task-generation/constraint-solving plugin: the v2
-fuzzing path does not spawn a launcher sidecar, generate solving tasks, or
-invoke Jigsaw or Z3.
+This directory implements the current SymAFL v2 PCBT custom mutator and
+`symafl-worker`. It is not the upstream SymSan task-generation/constraint-solving
+plugin: the v2 fuzzing path does not spawn a launcher sidecar, generate solving
+tasks, or invoke Jigsaw or Z3.
 
 For project setup, complete local verification commands, and experiment design,
 see the superproject [README](../../../README.md), the documentation map under
@@ -14,34 +14,26 @@ runtime workflow, and PCBT semantics are in
 
 ## Current execution model
 
-PCBT mode requires two locally built target binaries, supplied through
-`SYMAFL_CONCOLIC_TARGET` and `SYMAFL_CONCRETE_TARGET`:
+ADR 0010: `symafl-worker` owns concolic + the writable SEDBT. The mutator is
+the concrete fuzzer side. `SYMAFL_WORKER_SOCK` is required.
 
-1. AFL++ first starts the concolic target.  The `afl_custom_post_process`
-   hook evaluates PCBT predicates and vetoes candidates that cannot reach a
-   frontier; every admitted candidate executes with DFSan tracking.
-2. Bootstrap reports every symbolic conditional event over a pipe and inserts
-   the complete trace into PCBT (`pipe-full`).  AFL++ itself drains that pipe
-   while waiting for the forkserver child.
-3. After bootstrap, the admitted candidate reports only the suffix after its
-   known frontier into bounded shared memory (`shm-suffix`).  The mutator adds
-   this suffix only after AFL++ confirms a coverage gain.  If that buffer
-   overflows, the same gaining input is replayed through the concolic
-   forkserver with `pipe-suffix` and is then inserted.
-4. When PCBT saturates, AFL++ stops the concolic forkserver, restarts the
-   concrete target, retains the queue, rebuilds its coverage bitmap, and
-   continues with ordinary AFL++ fuzzing.
+1. Worker `InsertTrace` of `-i`, then **TREE_READY**.
+2. Fuzzer CheckInput of initial seeds (learn-gate / closures), **BOOTSTRAP_ACK**.
+3. Concrete havoc. Coverage gain → LearnJob `{cand_idx, frontier, dir, skip_cnt}`.
+4. Optional sanitizer forkserver re-executes the same gainers.
 
-The lifecycle, rather than `SYMAFL_TRACE_MODE`, selects transport mode.  The
-environment variable is intentionally ignored if set.
+Production default does not veto concrete (ADR 0009). Focused mutation uses
+RSan closures from the live tree SHM.
 
 ## Source map
 
 | File | Responsibility |
 |---|---|
-| `symsan.cpp` | AFL++ custom-mutator hooks, transport lifecycle, coverage-gain suffix handling |
-| `pcbt.hpp`, `pcbt.cpp` | path-constraint binary tree, trace/suffix insertion, frontier screening |
+| `symsan.cpp` | AFL++ custom-mutator hooks, worker client, focused mutation |
+| `symafl_worker.cpp` | concolic + SEDBT writer |
+| `pcbt.hpp`, `pcbt.cpp` | path-constraint binary tree, trace/suffix insertion, closures |
 | `pred.hpp`, `pred.cpp` | label-DAG conversion and conservative <=64-bit SMT bit-vector predicate interpreter |
+| `shm_sedbt.*`, `worker_client.*`, `worker_ipc.hpp` | live tree SHM and LearnJob IPC |
 
 Expressions outside the interpreter's supported domain (including wider
 bit-vectors) are opaque and conservatively admitted, rather than truncated or
@@ -52,14 +44,10 @@ rejected.
 Run from the superproject root after `scripts/build-all.sh`:
 
 ```bash
-python3 tests/trace_check.py direct
-python3 tests/trace_check.py afl
-python3 tests/pcbt_pipe_check.py
-python3 tests/pcbt_toy_modes_check.py
-scripts/run-fuzz.sh pcbt
+python3 tests/w1_worker_smoke.py
+python3 tests/w2_worker_smoke.py
+python3 tests/w3_oob_closure_smoke.py
+python3 tests/worker_san_smoke.py
+python3 tests/p1_no_veto_smoke.py
+scripts/run-fuzz.sh worker
 ```
-
-`pcbt_toy_modes_check.py` uses `tests/toy.c` with a one-event SHM capacity to
-verify `pipe-full -> shm-suffix overflow -> pipe-suffix` without advancing to
-the concrete phase.  The final smoke test verifies the PCBT-to-concrete phase
-switch.
