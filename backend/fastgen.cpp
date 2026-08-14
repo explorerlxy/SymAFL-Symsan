@@ -146,7 +146,9 @@ __taint_trace_cond(dfsan_label label, bool r, uint8_t flag, uint32_t cid) {
        label, r, __taint_trace_callstack, cid, addr);
 
   uint8_t add_nested = flag & UndefinedCheck ? 0 : 1;
-  uint8_t loop_flag = flag & LoopFlagMask;
+  // Keep loop, constraint, and RSan bits. LoopFlagMask is 0xF and would
+  // strip RsanCheckFlag/RsanBugDirFlag (and ConstraintFlag) before send_cond.
+  uint8_t loop_flag = flag & (uint8_t)~UndefinedCheck;
 
   // always add nested
   __taint_send_cond(label, r, add_nested, loop_flag, cid, addr);

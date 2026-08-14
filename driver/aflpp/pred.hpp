@@ -230,6 +230,9 @@ class EvalContext {
   std::vector<uint32_t> stamps_;
   uint32_t generation_ = 1;
   std::vector<std::pair<uint32_t, bool>> stack_;
+  friend bool eval_predicate(const PNode *, size_t, const Predicate &,
+                             const uint8_t *, uint32_t, uint64_t *,
+                             EvalContext *, EvalStats *);
   friend bool eval_predicate(const PredArena &, const Predicate &,
                              const uint8_t *, uint32_t, uint64_t *,
                              EvalContext *, EvalStats *);
@@ -266,9 +269,27 @@ bool calibrate_pointer_train_pred(PredArena &arena, Predicate *pred,
 // on undefined evaluation (read past input end); on success sets *out to the
 // root value (0/1 for comparison roots). Passing a context retains values from
 // earlier roots for the same input; callers must Reset() it for a new input.
+bool eval_predicate(const PNode *nodes, size_t n, const Predicate &pred,
+                    const uint8_t *input, uint32_t len, uint64_t *out,
+                    EvalContext *context = nullptr,
+                    EvalStats *stats = nullptr);
 bool eval_predicate(const PredArena &arena, const Predicate &pred,
                     const uint8_t *input, uint32_t len, uint64_t *out,
                     EvalContext *context = nullptr,
                     EvalStats *stats = nullptr);
+
+// Unique input-byte offsets reachable from `root` (Read / EofRead / Crc32).
+void collect_input_offsets(const PNode *nodes, size_t n, uint32_t root,
+                           std::vector<uint32_t> *out);
+void collect_input_offsets(const PredArena &arena, const Predicate &pred,
+                           std::vector<uint32_t> *out);
+
+// Evaluate one polarity: negated=0 requires a non-zero root, else zero.
+bool eval_clause(const PNode *nodes, size_t n, uint32_t pred_root,
+                 uint8_t negated, const uint8_t *input, uint32_t len,
+                 EvalContext *context = nullptr);
+bool eval_clause(const PredArena &arena, uint32_t pred_root, uint8_t negated,
+                 const uint8_t *input, uint32_t len,
+                 EvalContext *context = nullptr);
 
 }  // namespace pcbt

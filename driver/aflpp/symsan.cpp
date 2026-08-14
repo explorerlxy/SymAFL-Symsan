@@ -16,6 +16,7 @@
 #include "dfsan/dfsan.h"
 
 #include "pcbt.hpp"
+#include "worker_client.hpp"
 
 extern "C" {
 #include "afl-fuzz.h"
@@ -24,6 +25,7 @@ extern "C" {
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -100,6 +102,7 @@ struct my_mutator_t {
     }
     if (full_stream_read_fd >= 0) close(full_stream_read_fd);
     if (full_stream_write_fd >= 0) close(full_stream_write_fd);
+    worker_close(&worker);
     if (probe_case_dir) ck_free(probe_case_dir);
     if (probe_terminal_dir) ck_free(probe_terminal_dir);
     if (probe_rlimit_dir) ck_free(probe_rlimit_dir);
@@ -202,6 +205,17 @@ struct my_mutator_t {
   // first afl_custom_queue_get (before any post_process).
   std::vector<std::string> pending_seeds;
   bool seeds_flushed = false;
+  bool worker_mode = false;
+  WorkerClient worker;
+  std::unordered_map<std::string, std::vector<pcbt::AttachedClosure>>
+      closures_by_file;
+  std::vector<pcbt::AttachedClosure> current_closures;
+  std::vector<u8> focused_scratch;
+  uint32_t focused_rr = 0;
+  uint64_t focused_rng = 1;
+  uint64_t focused_tried = 0;
+  uint64_t focused_screened = 0;
+  uint64_t focused_exec = 0;
   // Pipeline accounting: concolic runs are executed only for coverage-gaining
   // admitted candidates (production) plus every admitted candidate under
   // REPLAY_ALL / probe_diag measurement modes.
@@ -593,13 +607,12 @@ extern "C" void afl_custom_splice_optout(my_mutator_t *data) {
 }
 
 extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
-  (void)(seed);
-
   my_mutator_t *data = new my_mutator_t(afl);
   if (!data) {
     FATAL("afl_custom_init alloc");
     return NULL;
   }
+  data->focused_rng = seed ? seed : 1u;
 
   // Three-fsrv pipeline: the CLI target is the concrete binary (drives the
   // main loop and coverage feedback); SYMAFL_CONCOLIC_TARGET names the
@@ -628,7 +641,15 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
           "by lifecycle (bootstrap=pipe-full, steady=shm-suffix, "
           "overflow+gain=pipe-suffix)\n", mode);
   }
-  init_forkserver_capture(data);
+  if (const char *wsock = getenv("SYMAFL_WORKER_SOCK")) {
+    data->worker_mode = true;
+    if (!worker_connect(&data->worker, wsock)) {
+      FATAL("SYMAFL_WORKER_SOCK connect failed: %s", wsock);
+    }
+    fprintf(stderr, "[pcbt] worker client connected (%s)\n", wsock);
+  } else {
+    init_forkserver_capture(data);
+  }
 
   if (const char *forensics = getenv("SYMAFL_FORENSICS_DIR")) {
     if (!*forensics) FATAL("SYMAFL_FORENSICS_DIR must not be empty");
@@ -919,6 +940,71 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   return data;
 }
 
+extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
+                                     size_t buf_size) {
+  (void)buf;
+  (void)buf_size;
+  if (data->current_closures.empty()) return 0;
+  uint32_t n = (uint32_t)data->current_closures.size() * 32u;
+  if (n < 16) n = 16;
+  if (n > 256) n = 256;
+  return n;
+}
+
+static uint32_t focused_rand(my_mutator_t *data, uint32_t limit) {
+  if (limit <= 1) return 0;
+  data->focused_rng = data->focused_rng * 6364136223846793005ULL + 1;
+  return (uint32_t)(data->focused_rng >> 33) % limit;
+}
+
+static bool eval_focused(my_mutator_t *data, const pcbt::AttachedClosure &c,
+                         const u8 *buf, uint32_t len) {
+  if (data->worker_mode && data->worker.tree) {
+    uint32_t np =
+        data->worker.tree->hdr.n_preds.load(std::memory_order_acquire);
+    return pcbt::eval_e_use(data->worker.tree->preds, np, c, buf, len);
+  }
+  return data->tree.eval_attached(c, buf, len);
+}
+
+extern "C" size_t afl_custom_fuzz(my_mutator_t *data, u8 *buf, size_t buf_size,
+                                  u8 **out_buf, u8 *add_buf,
+                                  size_t add_buf_size, size_t max_size) {
+  (void)add_buf;
+  (void)add_buf_size;
+  (void)max_size;
+  data->focused_tried += 1;
+  if (data->current_closures.empty() || buf_size == 0) {
+    *out_buf = buf;
+    return 0;
+  }
+  const pcbt::AttachedClosure &c =
+      data->current_closures[data->focused_rr++ % data->current_closures.size()];
+  if (c.s.empty()) {
+    *out_buf = buf;
+    return 0;
+  }
+  if (data->focused_scratch.size() < buf_size)
+    data->focused_scratch.resize(buf_size);
+  memcpy(data->focused_scratch.data(), buf, buf_size);
+  uint32_t off = c.s[focused_rand(data, (u32)c.s.size())];
+  if (off >= buf_size) {
+    data->focused_screened += 1;
+    *out_buf = data->focused_scratch.data();
+    return 0;
+  }
+  data->focused_scratch[off] = (u8)focused_rand(data, 256);
+  if (!eval_focused(data, c, data->focused_scratch.data(),
+                    (uint32_t)buf_size)) {
+    data->focused_screened += 1;
+    *out_buf = data->focused_scratch.data();
+    return 0;
+  }
+  data->focused_exec += 1;
+  *out_buf = data->focused_scratch.data();
+  return buf_size;
+}
+
 extern "C" void afl_custom_deinit(my_mutator_t *data) {
   write_progress(data, true);
   const pcbt::Tree &t = data->tree;
@@ -987,6 +1073,13 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->profile_insert_calls,
           (unsigned long long)data->profile_exec_ns,
           (unsigned long long)data->profile_exec_calls);
+  fprintf(stderr,
+          "[pcbt] focused_tried=%llu focused_screened=%llu focused_exec=%llu "
+          "closure_seeds=%llu\n",
+          (unsigned long long)data->focused_tried,
+          (unsigned long long)data->focused_screened,
+          (unsigned long long)data->focused_exec,
+          (unsigned long long)data->closures_by_file.size());
   if (data->forensics_dir || data->anomaly_case_dir) {
     fprintf(stderr,
             "[pcbt-forensics] dir=%s anomaly_dir=%s opaque_seen=%llu "
@@ -1178,6 +1271,11 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
 
 static void disarm_capture(my_mutator_t *data) {
   symafl_single_pass_control *control = data->single_pass_control;
+  if (!control) {
+    data->single_pass_armed = false;
+    data->root_shm_capture = false;
+    return;
+  }
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELEASE);
   __atomic_store_n(&control->mode, SYMAFL_TRACE_OFF, __ATOMIC_RELEASE);
   data->single_pass_armed = false;
@@ -1186,6 +1284,7 @@ static void disarm_capture(my_mutator_t *data) {
 
 static void arm_full_capture(my_mutator_t *data) {
   symafl_single_pass_control *control = data->single_pass_control;
+  if (!control) return;
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
@@ -1200,6 +1299,7 @@ static void arm_full_capture(my_mutator_t *data) {
 
 static void arm_root_shm_capture(my_mutator_t *data) {
   symafl_single_pass_control *control = data->single_pass_control;
+  if (!control) return;
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
@@ -1214,6 +1314,7 @@ static void arm_root_shm_capture(my_mutator_t *data) {
 static void arm_suffix_capture(my_mutator_t *data, pcbt::NodeRef node,
                                uint8_t dir) {
   symafl_single_pass_control *control = data->single_pass_control;
+  if (!control) return;
   __atomic_store_n(&control->event_count, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->overflow, 0, __ATOMIC_RELAXED);
   __atomic_store_n(&control->armed, 0, __ATOMIC_RELAXED);
@@ -1263,8 +1364,11 @@ static bool decode_full_stream(const u8 *wire, size_t wire_size,
       if (msg.label == kInitializingLabel) { n_dropped_init++; continue; }
       if (msg.label >= MAX_LABEL) return false;
       uint8_t is_constraint = (msg.flags & F_CONSTRAINT) ? 1 : 0;
+      uint8_t rsan_bug = (msg.flags & F_RSAN_CHECK)
+          ? (uint8_t)((msg.flags & F_RSAN_BUG_DIR) ? 1 : 0)
+          : 0xff;
       events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0),
-                         is_constraint, 1});
+                         is_constraint, 1, rsan_bug});
       continue;
     }
     if (msg.msg_type == fold_type) {
@@ -2288,7 +2392,8 @@ static bool decode_probe_capture(my_mutator_t *data,
     const symafl_single_pass_event &event = control->events[i];
     events->push_back({event.cid, event.label, event.result,
                        event.constraint,
-                       static_cast<uint16_t>(event.count ? event.count : 1)});
+                       static_cast<uint16_t>(event.count ? event.count : 1),
+                       event.rsan_bug_dir});
   }
   return true;
 }
@@ -2425,7 +2530,7 @@ static bool insert_suffix_capture(my_mutator_t *data, const u8 *buf,
     }
     uint16_t fold = event.count != 0 ? event.count : 1;
     events.push_back({event.cid, event.label, event.result,
-                      event.constraint, fold});
+                      event.constraint, fold, event.rsan_bug_dir});
   }
   profile_stop(data, decode_start, &data->profile_decode_ns,
                &data->profile_decode_calls);
@@ -2536,6 +2641,41 @@ static bool read_queue_file(const char *fname, std::vector<u8> *buf) {
   ssize_t got = read(fd, buf->data(), buf->size());
   close(fd);
   return got == (ssize_t)buf->size();
+}
+
+static void stash_closures(my_mutator_t *data, const std::string &fname,
+                           std::vector<pcbt::AttachedClosure> &&cls) {
+  if (!cls.empty()) {
+    const auto &c0 = cls[0];
+    fprintf(stderr, "[pcbt] attached closures=%zu s=", cls.size());
+    for (size_t i = 0; i < c0.s.size() && i < 8; ++i)
+      fprintf(stderr, "%s%u", i ? "," : "", c0.s[i]);
+    fprintf(stderr, " node=%u %s\n", c0.node, fname.c_str());
+  }
+  data->closures_by_file[fname] = std::move(cls);
+}
+
+static void load_current_closures(my_mutator_t *data, const char *filename) {
+  data->current_closures.clear();
+  if (!filename) return;
+  auto it = data->closures_by_file.find(filename);
+  if (it != data->closures_by_file.end()) {
+    data->current_closures = it->second;
+    return;
+  }
+  std::vector<u8> buf;
+  if (!read_queue_file(filename, &buf)) return;
+  if (data->worker_mode) {
+    auto wr = worker_check(&data->worker, buf.data(), (uint32_t)buf.size());
+    stash_closures(data, filename, std::move(wr.closures));
+  } else {
+    std::vector<pcbt::AttachedClosure> cls;
+    data->tree.collect_bug_closures(buf.data(), (uint32_t)buf.size(), &cls);
+    stash_closures(data, filename, std::move(cls));
+  }
+  auto it2 = data->closures_by_file.find(filename);
+  if (it2 != data->closures_by_file.end())
+    data->current_closures = it2->second;
 }
 
 static char *save_probe_case(my_mutator_t *data, const u8 *buf, size_t len,
@@ -2873,7 +3013,6 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
 }
 
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
-  (void)filename;
   // Forkserver is up by the first queue_get. Drop the parent's write end so
   // only the target forkserver/children hold it. Keeping it open in afl-fuzz
   // prevents EOF on the read side and is a common source of incomplete
@@ -2891,7 +3030,24 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   // non-gain to the flushed seed's frontier edge.
   if (!data->seeds_flushed) {
     data->seeds_flushed = true;
-    if (data->screening) {
+    if (data->worker_mode) {
+      if (!worker_wait_tree_ready(&data->worker)) {
+        FATAL("worker TREE_READY failed");
+      }
+      for (const std::string &seed : data->pending_seeds) {
+        std::vector<u8> buf;
+        if (!read_queue_file(seed.c_str(), &buf)) continue;
+        auto wr = worker_check(&data->worker, buf.data(), (uint32_t)buf.size());
+        data->worker.learned[seed] = wr.learned;
+        stash_closures(data, seed, std::move(wr.closures));
+        fprintf(stderr, "[pcbt] worker seed learned=%u %s\n", wr.learned,
+                seed.c_str());
+      }
+      data->pending_seeds.clear();
+      if (!worker_ack(&data->worker) || !worker_wait_done(&data->worker)) {
+        FATAL("worker bootstrap ACK/DONE failed");
+      }
+    } else if (data->screening) {
       for (const std::string &seed : data->pending_seeds) {
         std::vector<u8> buf;
         if (!read_queue_file(seed.c_str(), &buf)) {
@@ -2918,6 +3074,9 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
         data->traced_entries.insert(seed);
         record_admitted_pair(data, tail_node, tail_dir);
         data->last_gained = true;
+        std::vector<pcbt::AttachedClosure> cls;
+        data->tree.collect_bug_closures(buf.data(), (uint32_t)buf.size(), &cls);
+        stash_closures(data, seed, std::move(cls));
       }
       data->pending_seeds.clear();
     }
@@ -2926,6 +3085,7 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   if (data->concolic_deadline && !data->phase_start) {
     data->phase_start = time(nullptr);
   }
+  load_current_closures(data, filename ? (const char *)filename : nullptr);
   return 1;
 }
 
@@ -3099,7 +3259,7 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   // exists, so record the seed names here and flush them into the tree at the
   // first afl_custom_queue_get.
   if (!data->bootstrap_done) {
-    if (data->screening && filename_new_queue) {
+    if ((data->screening || data->worker_mode) && filename_new_queue) {
       data->pending_seeds.push_back((const char *)filename_new_queue);
     }
     return 0;
@@ -3113,14 +3273,19 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
     data->failed_runs += 1;
     return 0;
   }
-  // CONCOLIC STAGE (learning): this admitted candidate gained coverage on
-  // the CONCRETE main fsrv. Capture was armed at post_process (full-stream
-  // by default; suffix when SYMAFL_VETO selected a CheckInput frontier).
-  // Under REPLAY_ALL/probe_diag post_run already ran the concolic forkserver
-  // (replay_run_done) — insert from that capture. screening=false (saturation,
-  // deadline, or SYMAFL_NO_SCREEN) skips this stage; no-veto does not.
   bool committed = false;
-  if (data->screening) {
+  if (data->worker_mode) {
+    auto wr = worker_check(&data->worker, buf.data(), (uint32_t)buf.size());
+    data->worker.learned[fname] = wr.learned;
+    stash_closures(data, fname, std::move(wr.closures));
+    if (wr.learned == symafl::kUnlearned) {
+      if (!worker_submit(&data->worker, wr.frontier, wr.dir, wr.skip_cnt,
+                         buf.data(), (uint32_t)buf.size())) {
+        fprintf(stderr, "[pcbt] worker ring full, learned=0 %s\n", fname);
+      }
+    }
+    committed = true;
+  } else if (data->screening) {
     if (data->replay_run_done) {
       data->replay_run_done = false;  // post_run already ran the fsrv
     } else if (data->single_pass_armed) {
@@ -3168,8 +3333,11 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                 data->root_shm_capture ? 1u : 0u, filename_new_queue);
         fflush(data->admitted_gained_log);
       }
-      data->traced_entries.insert((const char *)filename_new_queue);
-      record_admitted_pair(data, tail_node, tail_dir);
+        data->traced_entries.insert((const char *)filename_new_queue);
+        record_admitted_pair(data, tail_node, tail_dir);
+        std::vector<pcbt::AttachedClosure> cls;
+        data->tree.collect_bug_closures(buf.data(), (uint32_t)buf.size(), &cls);
+        stash_closures(data, fname, std::move(cls));
     } else {
       WARNF("coverage-gaining admitted entry was not inserted: %s\n", fname);
     }
@@ -3256,6 +3424,22 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
     data->admitted += 1;
     data->profile_exec_armed = data->profile_enabled;
     data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
+    write_progress(data, false);
+    *out_buf = buf;
+    return buf_size;
+  }
+
+  // ADR 0010 W1: the worker owns capture + insert. Admit every concrete
+  // candidate; CheckInput on the live SHM happens in queue_new_entry.
+  if (data->worker_mode) {
+    data->screened += 1;
+    data->admitted += 1;
+    data->profile_exec_armed = data->profile_enabled;
+    data->afl->pcbt_candidate_kind = PCBT_CANDIDATE_ADMIT;
+    data->vetoes_since_admit = 0;
+    data->last_gained = false;
+    data->last_node = pcbt::kUnexplored;
+    data->last_dir = 0;
     write_progress(data, false);
     *out_buf = buf;
     return buf_size;

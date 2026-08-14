@@ -2535,12 +2535,11 @@ bool calibrate_pointer_train_pred(PredArena &arena, Predicate *pred,
   return true;
 }
 
-bool eval_predicate(const PredArena &arena, const Predicate &pred,
+bool eval_predicate(const PNode *nodes, size_t n, const Predicate &pred,
                     const uint8_t *input, uint32_t len, uint64_t *out,
                     EvalContext *context, EvalStats *stats) {
   if (stats) stats->predicate_calls += 1;
-  if (pred.opaque || pred.root >= arena.nodes.size()) return false;
-  const auto &nodes = arena.nodes;
+  if (pred.opaque || pred.root >= n) return false;
   static thread_local EvalContext local_context;
   if (!context) {
     context = &local_context;
@@ -2560,7 +2559,7 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
   while (!context->stack_.empty()) {
     auto frame = context->stack_.back();
     context->stack_.pop_back();
-    if (frame.first >= nodes.size()) return false;
+    if (frame.first >= n) return false;
     if (context->stamps_[frame.first] == stamp) {
       if (stats) stats->cache_hits += 1;
       continue;
@@ -2835,6 +2834,68 @@ bool eval_predicate(const PredArena &arena, const Predicate &pred,
   if (context->stamps_[pred.root] != stamp) return false;
   *out = context->values_[pred.root];
   return true;
+}
+
+bool eval_predicate(const PredArena &arena, const Predicate &pred,
+                    const uint8_t *input, uint32_t len, uint64_t *out,
+                    EvalContext *context, EvalStats *stats) {
+  return eval_predicate(arena.nodes.data(), arena.nodes.size(), pred, input,
+                        len, out, context, stats);
+}
+
+void collect_input_offsets(const PNode *nodes, size_t n, uint32_t root,
+                           std::vector<uint32_t> *out) {
+  if (!out || !nodes || root >= n) return;
+  std::unordered_set<uint32_t> seen_idx;
+  std::unordered_set<uint32_t> seen_off;
+  std::vector<uint32_t> stack = {root};
+  while (!stack.empty()) {
+    uint32_t i = stack.back();
+    stack.pop_back();
+    if (i >= n || !seen_idx.insert(i).second) continue;
+    const PNode &nd = nodes[i];
+    auto add_range = [&](uint32_t off, uint32_t nbytes) {
+      if (nbytes == 0) nbytes = 1;
+      for (uint32_t k = 0; k < nbytes; ++k) {
+        if (seen_off.insert(off + k).second) out->push_back(off + k);
+      }
+    };
+    if (nd.kind == PKind::Read) {
+      uint32_t nbytes = nd.bits / 8;
+      if (nbytes == 0) nbytes = 1;
+      add_range((uint32_t)nd.value, nbytes);
+    } else if (nd.kind == PKind::EofRead) {
+      add_range((uint32_t)nd.value, 1);
+    } else if (nd.kind == PKind::Crc32 && nd.b != kNoChild && nd.b < n &&
+               nodes[nd.b].kind == PKind::Const) {
+      add_range((uint32_t)nd.value, (uint32_t)nodes[nd.b].value);
+    }
+    if (nd.a != kNoChild) stack.push_back(nd.a);
+    if (nd.b != kNoChild) stack.push_back(nd.b);
+  }
+  std::sort(out->begin(), out->end());
+}
+
+void collect_input_offsets(const PredArena &arena, const Predicate &pred,
+                           std::vector<uint32_t> *out) {
+  collect_input_offsets(arena.nodes.data(), arena.nodes.size(), pred.root, out);
+}
+
+bool eval_clause(const PNode *nodes, size_t n, uint32_t pred_root,
+                 uint8_t negated, const uint8_t *input, uint32_t len,
+                 EvalContext *context) {
+  Predicate p;
+  p.root = pred_root;
+  uint64_t v = 0;
+  if (!eval_predicate(nodes, n, p, input, len, &v, context)) return false;
+  const bool truth = v != 0;
+  return negated ? !truth : truth;
+}
+
+bool eval_clause(const PredArena &arena, uint32_t pred_root, uint8_t negated,
+                 const uint8_t *input, uint32_t len, EvalContext *context) {
+  return eval_clause(arena.nodes.data(), arena.nodes.size(), pred_root,
+                     negated, input, len, context);
 }
 
 }  // namespace pcbt

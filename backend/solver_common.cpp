@@ -261,7 +261,7 @@ static void write_fold_frame(uint32_t cid, dfsan_label label, uint8_t result,
     // A singleton sequence is an ordinary event, not a fold frame (the
     // decoder rejects count < 2).
     uint16_t wire_count = count == 1 ? 0 : count;
-    __single_pass->events[index] = {cid, label, result, 0, wire_count, 0};
+    __single_pass->events[index] = {cid, label, result, 0, wire_count, 0xff};
     return;
   }
   if (trace_mode != SYMAFL_TRACE_FULL_STREAM &&
@@ -302,7 +302,7 @@ static void flush_slot() {
 // strictly consecutive run may remain pending; an interrupt is flushed first.
 static bool fold_absorb(dfsan_label label, uint8_t result, uint8_t loop_flag,
                         uint32_t cid, void *addr) {
-  if (loop_flag & ConstraintFlag) {
+  if (loop_flag & (ConstraintFlag | RsanCheckFlag)) {
     flush_slot();
     return false;
   }
@@ -393,7 +393,11 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
       return;
     }
     uint8_t constraint = (loop_flag & ConstraintFlag) ? 1 : 0;
-    __single_pass->events[index] = {cid, label, result, constraint, 0, 0};
+    uint8_t rsan_bug = (loop_flag & RsanCheckFlag)
+        ? (uint8_t)((loop_flag & RsanBugDirFlag) ? 1 : 0)
+        : 0xff;
+    __single_pass->events[index] = {cid, label, result, constraint, 0,
+                                    rsan_bug};
     return;
   }
 
@@ -426,6 +430,10 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
   uint16_t flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
   if (loop_flag & ConstraintFlag) flags |= F_CONSTRAINT;
+  if (loop_flag & RsanCheckFlag) {
+    flags |= F_RSAN_CHECK;
+    if (loop_flag & RsanBugDirFlag) flags |= F_RSAN_BUG_DIR;
+  }
 
   // set the loop flags according to branching results
   switch (loop_flag) {

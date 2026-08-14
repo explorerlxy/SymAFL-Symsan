@@ -1,5 +1,9 @@
 #include "pcbt.hpp"
 
+#include <algorithm>
+#include <unordered_map>
+#include <unordered_set>
+
 namespace pcbt {
 
 namespace {
@@ -520,6 +524,8 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.pred = pred;
       new_node.constraint = ev.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
+      new_node.rsan_bug_dir = ev.rsan_bug_dir;
+      new_node.parent = parent;
       if (cls == InsertPredClass::Tautology) {
         num_tautology += 1;
       }
@@ -544,6 +550,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   if (trace_depth > max_depth) max_depth = trace_depth;
   if (out_tail_node) *out_tail_node = parent;
   if (out_tail_dir) *out_tail_dir = dir;
+  finalize_closures(parent, dir);
   return created;
 }
 
@@ -698,6 +705,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.pred = pred;
       new_node.constraint = event.constraint != 0;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
+      new_node.rsan_bug_dir = event.rsan_bug_dir;
+      new_node.parent = cur;
       if (cls == InsertPredClass::Tautology) num_tautology += 1;
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) return created;
@@ -729,6 +738,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
 
   if (out_tail_node) *out_tail_node = cur;
   if (out_tail_dir) *out_tail_dir = dir;
+  finalize_closures(cur, dir);
   return created;
 }
 
@@ -1210,6 +1220,211 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     if (debug_) DebugPredicate(cur, input, len);
   }
   return r;
+}
+
+namespace {
+
+void add_clause(std::vector<Clause> *e, uint32_t root, uint8_t negated) {
+  for (const Clause &c : *e) {
+    if (c.pred_root == root && c.negated == negated) return;
+  }
+  e->push_back({root, negated});
+}
+
+void union_offsets(std::vector<uint32_t> *s, const std::vector<uint32_t> &add,
+                   std::unordered_set<uint32_t> *have,
+                   std::vector<uint32_t> *work) {
+  for (uint32_t off : add) {
+    if (have->insert(off).second) {
+      s->push_back(off);
+      work->push_back(off);
+    }
+  }
+}
+
+}  // namespace
+
+bool build_closure(const PNode *preds, size_t n_preds, uint32_t trigger_root,
+                   uint8_t trigger_neg,
+                   const std::vector<ClosureAncestor> &ancestors,
+                   Closure *out) {
+  if (!out || !preds || trigger_root >= n_preds) return false;
+  out->present = false;
+  out->trigger_neg = trigger_neg;
+  out->s.clear();
+  out->e.clear();
+
+  std::vector<uint32_t> trig_s;
+  collect_input_offsets(preds, n_preds, trigger_root, &trig_s);
+
+  std::unordered_set<uint32_t> have(trig_s.begin(), trig_s.end());
+  out->s = trig_s;
+  std::vector<uint32_t> work = trig_s;
+
+  std::vector<std::vector<uint32_t>> anc_s(ancestors.size());
+  std::unordered_map<uint32_t, std::vector<size_t>> off_index;
+  for (size_t i = 0; i < ancestors.size(); ++i) {
+    collect_input_offsets(preds, n_preds, ancestors[i].pred_root, &anc_s[i]);
+    for (uint32_t off : anc_s[i]) off_index[off].push_back(i);
+  }
+
+  std::vector<uint8_t> used(ancestors.size(), 0);
+  while (!work.empty()) {
+    uint32_t off = work.back();
+    work.pop_back();
+    auto it = off_index.find(off);
+    if (it == off_index.end()) continue;
+    for (size_t i : it->second) {
+      if (used[i]) continue;
+      used[i] = 1;
+      const ClosureAncestor &M = ancestors[i];
+      if (M.cached && M.cached->present && M.rsan_bug_dir <= 1) {
+        union_offsets(&out->s, M.cached->s, &have, &work);
+        for (const Clause &c : M.cached->e)
+          add_clause(&out->e, c.pred_root, c.negated);
+        add_clause(&out->e, M.pred_root, (uint8_t)(M.trigger_neg ? 0 : 1));
+        continue;
+      }
+      bool hit = false;
+      for (uint32_t o : anc_s[i]) {
+        if (have.count(o)) {
+          hit = true;
+          break;
+        }
+      }
+      if (!hit) continue;
+      if (M.usable)
+        add_clause(&out->e, M.pred_root, (uint8_t)(M.taken_dir == 0 ? 1 : 0));
+      union_offsets(&out->s, anc_s[i], &have, &work);
+    }
+  }
+
+  // e must not contain trigger (same root + same polarity).
+  out->e.erase(std::remove_if(out->e.begin(), out->e.end(),
+                              [&](const Clause &c) {
+                                return c.pred_root == trigger_root &&
+                                       c.negated == trigger_neg;
+                              }),
+               out->e.end());
+  std::sort(out->s.begin(), out->s.end());
+  out->s.erase(std::unique(out->s.begin(), out->s.end()), out->s.end());
+  out->present = true;
+  return true;
+}
+
+bool eval_e_use(const PNode *preds, size_t n_preds, const AttachedClosure &c,
+                const uint8_t *input, uint32_t len) {
+  EvalContext ctx;
+  ctx.Reset();
+  if (!eval_clause(preds, n_preds, c.trigger_root, c.trigger_neg, input, len,
+                   &ctx))
+    return false;
+  for (const Clause &cl : c.e) {
+    if (!eval_clause(preds, n_preds, cl.pred_root, cl.negated, input, len,
+                     &ctx))
+      return false;
+  }
+  return true;
+}
+
+bool eval_e_use(const PredArena &arena, const AttachedClosure &c,
+                const uint8_t *input, uint32_t len) {
+  return eval_e_use(arena.nodes.data(), arena.nodes.size(), c, input, len);
+}
+
+void Tree::compute_closure(
+    NodeRef n, const std::vector<std::pair<NodeRef, uint8_t>> &path) {
+  if (n < kRoot || n >= nodes_.size()) return;
+  Node &N = node(n);
+  if (N.rsan_bug_dir > 1 || N.pred.opaque) return;
+  const uint8_t trigger_neg = (N.rsan_bug_dir == 0) ? 1 : 0;
+  std::vector<ClosureAncestor> ancs;
+  for (const auto &pd : path) {
+    if (pd.first == n) break;
+    if (pd.first < kRoot || pd.first >= nodes_.size()) continue;
+    const Node &M = node(pd.first);
+    ClosureAncestor a;
+    a.pred_root = M.pred.root;
+    a.taken_dir = pd.second;
+    a.rsan_bug_dir = M.rsan_bug_dir;
+    a.trigger_neg = M.closure.present ? M.closure.trigger_neg
+                                      : (uint8_t)((M.rsan_bug_dir == 0) ? 1 : 0);
+    a.usable = !M.pred.opaque && !M.pred.tautology && !M.constraint;
+    a.cached = M.closure.present ? &M.closure : nullptr;
+    ancs.push_back(a);
+  }
+  build_closure(pred_arena_.nodes.data(), pred_arena_.nodes.size(),
+                N.pred.root, trigger_neg, ancs, &N.closure);
+}
+
+void Tree::finalize_closures(NodeRef tail, uint8_t tail_dir) {
+  if (tail < kRoot || tail >= nodes_.size()) return;
+  std::vector<NodeRef> chain;
+  for (NodeRef x = tail; x >= kRoot && x < nodes_.size(); x = node(x).parent) {
+    chain.push_back(x);
+    if (x == kRoot || node(x).parent == x) break;
+  }
+  std::reverse(chain.begin(), chain.end());
+  std::vector<std::pair<NodeRef, uint8_t>> path;
+  path.reserve(chain.size());
+  for (size_t i = 0; i < chain.size(); ++i) {
+    if (chain[i] == kRoot) continue;
+    uint8_t d = tail_dir;
+    if (i + 1 < chain.size())
+      d = (node(chain[i]).child[1] == chain[i + 1]) ? 1 : 0;
+    path.emplace_back(chain[i], d);
+  }
+  for (size_t i = 0; i < path.size(); ++i) {
+    NodeRef n = path[i].first;
+    if (node(n).rsan_bug_dir > 1) continue;
+    if (node(n).closure.present) continue;
+    std::vector<std::pair<NodeRef, uint8_t>> prefix(path.begin(),
+                                                    path.begin() + i + 1);
+    compute_closure(n, prefix);
+  }
+}
+
+void Tree::collect_bug_closures(const uint8_t *input, uint32_t len,
+                               std::vector<AttachedClosure> *out) const {
+  if (!out) return;
+  out->clear();
+  NodeRef cur = node(kRoot).child[0];
+  if (cur == kUnexplored || cur == kTerminal) return;
+  EvalContext eval;
+  eval.Reset();
+  while (cur >= kRoot && cur < nodes_.size()) {
+    const Node &n = node(cur);
+    if (n.unstable) return;
+    uint8_t dir = 0;
+    if (n.pred.tautology || n.pred.opaque) {
+      dir = n.pred.tautology ? n.pred.fixed_dir : 0;
+    } else {
+      uint64_t v = 0;
+      if (!eval_predicate(pred_arena_, n.pred, input, len, &v, &eval)) return;
+      dir = v ? 1 : 0;
+    }
+    if (n.rsan_bug_dir <= 1) {
+      NodeRef bug = n.child[n.rsan_bug_dir];
+      if (bug == kUnexplored && n.closure.present) {
+        AttachedClosure a;
+        a.node = cur;
+        a.bug_dir = n.rsan_bug_dir;
+        a.trigger_neg = n.closure.trigger_neg;
+        a.trigger_root = n.pred.root;
+        a.s = n.closure.s;
+        a.e = n.closure.e;
+        out->push_back(std::move(a));
+      }
+    }
+    NodeRef next = n.child[dir];
+    if (next == kUnexplored || next == kTerminal) return;
+    cur = next;
+  }
+}
+
+bool Tree::eval_attached(const AttachedClosure &c, const uint8_t *input,
+                         uint32_t len) const {
+  return eval_e_use(pred_arena_, c, input, len);
 }
 
 }  // namespace pcbt

@@ -86,7 +86,7 @@ struct symafl_single_pass_event {
   uint8_t result;
   uint8_t constraint;
   uint16_t count;  // 0 = single event; else fold frame of `count` events
-  uint8_t pad;
+  uint8_t rsan_bug_dir;  // 0xff = not RSan
 };
 
 struct symafl_single_pass_control {
@@ -497,6 +497,11 @@ static const uint8_t UndefinedCheck = 0x10;
 // direction validation for them (they are screening semantics, not real
 // branches). Must be above LoopFlagMask so send_cond's loop switch ignores it.
 static const uint8_t ConstraintFlag = 0x20;
+// RSan/swiftsan bounds-check cond (ADR 0010 W3). RsanBugDirFlag means the
+// bug-trigger direction is 1 (true); clear means 0 (false).
+// __taint_trace_cond must pass these through (~UndefinedCheck), not LoopFlagMask.
+static const uint8_t RsanCheckFlag = 0x40;
+static const uint8_t RsanBugDirFlag = 0x80;
 
 // Reserved constraint cids for the test-input interfaces (multi-successor
 // single-decision: the bytes actually read depend on the candidate length).
@@ -551,6 +556,8 @@ enum undefined_check_ids {
 // traced run). They are screening semantics, not real branches: replay must
 // skip direction validation for them.
 #define F_CONSTRAINT 0x8
+#define F_RSAN_CHECK 0x10
+#define F_RSAN_BUG_DIR 0x20
 
 #define F_MEMERR_UAF  0x1
 #define F_MEMERR_OLB  0x2

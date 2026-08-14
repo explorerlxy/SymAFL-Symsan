@@ -21,6 +21,18 @@ constexpr NodeRef kUnexplored = 0;
 constexpr NodeRef kTerminal = 1;
 constexpr NodeRef kRoot = 2;
 
+struct Clause {
+  uint32_t pred_root = 0;
+  uint8_t negated = 0;
+};
+
+struct Closure {
+  bool present = false;
+  uint8_t trigger_neg = 0;  // 1 iff bug_dir == 0 (trigger is ¬pred)
+  std::vector<uint32_t> s;
+  std::vector<Clause> e;
+};
+
 struct Node {
   uint32_t cid = 0;  // compile-time branch id
   Predicate pred;    // root view into Tree::pred_arena_
@@ -46,7 +58,42 @@ struct Node {
   // selects the optional length retry budget; terminal policy does not
   // downgrade these edges to admissions.
   bool len_related = false;
+  // ADR 0010 W3: 0xff = not RSan; else the bug-trigger child direction.
+  uint8_t rsan_bug_dir = 0xff;
+  NodeRef parent = kUnexplored;
+  Closure closure;
 };
+
+// Cached bug-edge closure: e does not contain trigger. Consume e ∪ {trigger}.
+struct AttachedClosure {
+  NodeRef node = kUnexplored;
+  uint8_t bug_dir = 0xff;
+  uint8_t trigger_neg = 0;
+  uint32_t trigger_root = 0;
+  std::vector<uint32_t> s;
+  std::vector<Clause> e;
+};
+
+// Ancestor on the inserting/walking path (not including the target RSan node).
+struct ClosureAncestor {
+  uint32_t pred_root = 0;
+  uint8_t taken_dir = 0;
+  uint8_t rsan_bug_dir = 0xff;
+  uint8_t trigger_neg = 0;
+  bool usable = true;  // false: opaque / tautology / constraint pin
+  const Closure *cached = nullptr;
+};
+
+// Worklist slice (ADR 0010). ancestors are root→parent of N.
+bool build_closure(const PNode *preds, size_t n_preds, uint32_t trigger_root,
+                   uint8_t trigger_neg,
+                   const std::vector<ClosureAncestor> &ancestors,
+                   Closure *out);
+
+bool eval_e_use(const PNode *preds, size_t n_preds, const AttachedClosure &c,
+                const uint8_t *input, uint32_t len);
+bool eval_e_use(const PredArena &arena, const AttachedClosure &c,
+                const uint8_t *input, uint32_t len);
 
 struct Event {
   uint32_t cid;
@@ -59,6 +106,8 @@ struct Event {
   // share cid/result and a byte-advancing Read-family shape (getc loops,
   // flen_count loop bounds). 1 = plain event.
   uint16_t count = 1;
+  // ADR 0010 W3: 0xff = not an RSan check; else bug-trigger direction 0/1.
+  uint8_t rsan_bug_dir = 0xff;
 };
 
 class Tree {
@@ -152,6 +201,11 @@ class Tree {
   ReplayReport ReplayFullTrace(const std::vector<Event> &events,
                                const uint8_t *input, uint32_t len) const;
 
+  uint32_t live_nodes() const { return (uint32_t)nodes_.size(); }
+  uint32_t live_preds() const { return (uint32_t)pred_arena_.nodes.size(); }
+  const PNode *pred_data() const { return pred_arena_.nodes.data(); }
+  const Node &node_at(NodeRef ref) const { return node(ref); }
+
   bool IsSaturated(uint8_t rlimit, uint8_t len_rlimit = 0) const;
 
   // Dump the tree topology (node id, cid, depth, skipCnt, constraint,
@@ -177,6 +231,17 @@ class Tree {
   bool is_len_related(NodeRef ref) const {
     return ref >= kRoot && ref < nodes_.size() ? node(ref).len_related : false;
   }
+  uint8_t rsan_bug_dir_of(NodeRef ref) const {
+    return ref >= kRoot && ref < nodes_.size() ? node(ref).rsan_bug_dir : 0xff;
+  }
+  const Closure &closure_of(NodeRef ref) const {
+    static const Closure kEmpty{};
+    return ref >= kRoot && ref < nodes_.size() ? node(ref).closure : kEmpty;
+  }
+  void collect_bug_closures(const uint8_t *input, uint32_t len,
+                            std::vector<AttachedClosure> *out) const;
+  bool eval_attached(const AttachedClosure &c, const uint8_t *input,
+                     uint32_t len) const;
   bool is_unstable(NodeRef ref) const {
     return ref >= kRoot && ref < nodes_.size() ? node(ref).unstable : false;
   }
@@ -300,6 +365,8 @@ class Tree {
   const Node &node(NodeRef ref) const { return nodes_[ref]; }
   NodeRef append(Node &&node);
   void maybe_store_creator(NodeRef ref, const uint8_t *input, uint32_t len);
+  void finalize_closures(NodeRef tail, uint8_t tail_dir);
+  void compute_closure(NodeRef n, const std::vector<std::pair<NodeRef, uint8_t>> &path);
   bool IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const;
   bool debug_ = false;
   bool profile_ = false;

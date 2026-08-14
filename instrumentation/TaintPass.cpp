@@ -729,6 +729,8 @@ private:
   static const uint8_t TrueBranchLoopExit = 0x2;
   static const uint8_t FalseBranchLoopExit = 0x1;
   static const uint8_t LoopExitBranch = TrueBranchLoopExit | FalseBranchLoopExit;
+  static const uint8_t RsanCheckFlag = 0x40;
+  static const uint8_t RsanBugDirFlag = 0x80;
 };
 
 class TaintVisitor : public InstVisitor<TaintVisitor> {
@@ -5435,6 +5437,42 @@ static inline bool isLoopLatch(const BasicBlock *BB, const BasicBlock *Header) {
   return true;
 }
 
+static bool instIsRsanTrap(const Instruction &I) {
+  const auto *CI = dyn_cast<CallInst>(&I);
+  if (!CI) return false;
+  if (CI->isInlineAsm()) {
+    if (const auto *IA = dyn_cast<InlineAsm>(CI->getCalledOperand())) {
+      StringRef Asm = IA->getAsmString();
+      if (Asm.contains("int3") || Asm.contains("brk")) return true;
+    }
+  }
+  if (const Function *F = CI->getCalledFunction()) {
+    if (F->getName().starts_with("swiftsan_")) return true;
+  }
+  return false;
+}
+
+// RSan InsertCheck marks the UGE bounds icmp (true = OOB).
+static bool isRsanBoundsCmp(Value *Condition) {
+  auto *I = dyn_cast<Instruction>(Condition);
+  if (!I) return false;
+  return I->getMetadata("scev_range_chk") ||
+         I->getMetadata("meta_chk_slowzero");
+}
+
+static bool blockHasRsanTrap(const BasicBlock *BB, int depth) {
+  if (!BB || depth < 0) return false;
+  for (const Instruction &I : *BB) {
+    if (instIsRsanTrap(I)) return true;
+  }
+  const Instruction *T = BB->getTerminator();
+  if (!T) return false;
+  for (unsigned i = 0, n = T->getNumSuccessors(); i < n; ++i) {
+    if (blockHasRsanTrap(T->getSuccessor(i), depth - 1)) return true;
+  }
+  return false;
+}
+
 void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   IRBuilder<> IRB(I);
   // get operand
@@ -5465,6 +5503,15 @@ void TaintFunction::visitCondition(Value *Condition, Instruction *I) {
   uint32_t cid = TT.getInstructionId(I);
   if (cid == TT.InvalidInstructionId)
     return; // XXX: forget about loop?
+  if (auto *BI = dyn_cast<BranchInst>(I)) {
+    if (BI->isConditional()) {
+      if (isRsanBoundsCmp(Condition) ||
+          blockHasRsanTrap(BI->getSuccessor(0), 2))
+        flag |= RsanCheckFlag | RsanBugDirFlag;
+      else if (blockHasRsanTrap(BI->getSuccessor(1), 2))
+        flag |= RsanCheckFlag;
+    }
+  }
   ConstantInt *LF = ConstantInt::get(TT.Int8Ty, flag);
   ConstantInt *CID = ConstantInt::get(TT.Int32Ty, cid);
   IRB.CreateCall(TT.TaintTraceCondFn, {Shadow, Condition, LF, CID});
