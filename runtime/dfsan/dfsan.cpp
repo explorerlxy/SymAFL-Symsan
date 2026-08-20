@@ -355,7 +355,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
   // A wide concrete value can legitimately carry a narrower shadow (only the
   // bytes tainted by the input are represented).  Extracting beyond that
   // shadow has no symbolic dependency and must stay clean; retaining a
-  // malformed out-of-range label later makes the PCBT converter invent a
+  // malformed out-of-range label later makes the SEDBT converter invent a
   // dependency or reject an otherwise solvable predicate.
   if (op == __dfsan::Extract && l1 >= CONST_OFFSET && l2 == 0 &&
       op2 >= get_label_info(l1)->size)
@@ -434,7 +434,7 @@ dfsan_label __taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return label;
   } else if (is_fstrcmp_family(op)) {
     // strcmp/strncmp/strcasecmp/strncasecmp wrappers pass the string
-    // addresses in op1/op2.  The scalar PCBT grammar needs the actual bytes
+    // addresses in op1/op2.  The scalar SEDBT grammar needs the actual bytes
     // of both sides to lower the comparison exactly, so materialize up to 32
     // bytes per operand after verifying readability.  A failed probe leaves
     // the address unmarked and the converter rejects the predicate as opaque
@@ -1196,7 +1196,7 @@ void __taint_union_store(dfsan_label l, dfsan_label *ls, uptr n, uint64_t align)
     // store of a folded lane-0 label, e.g. openjpeg's _mm_store_si128 of a
     // 32-bit SIMD-folded value). Those bytes carry no modeled dependency;
     // leave them clean instead of fabricating an out-of-range Extract that
-    // the PCBT converter would fold to 0 and mis-predict.
+    // the SEDBT converter would fold to 0 and mis-predict.
     if (i * 8 >= info->size) {
       ls[i] = 0;
       continue;
@@ -2516,7 +2516,7 @@ static bool icmp_is_heap_layout(dfsan_label label, int depth) {
   if (base == And || base == Or || base == Xor) {
     // Compound branch: suppress only when every present arm is heap-layout
     // (e.g. pure pointer null checks And'd together). Mixed input arms keep
-    // the whole condition so (okey==okey)&&(len==l) still enters the PCBT.
+    // the whole condition so (okey==okey)&&(len==l) still enters the SEDBT.
     bool a_h = info->l1 == 0 ||
                (info->l1 >= CONST_OFFSET &&
                 icmp_is_heap_layout(info->l1, depth + 1));
@@ -2547,7 +2547,7 @@ static bool icmp_is_heap_layout(dfsan_label label, int depth) {
   bool l1_inp = info->l1 >= CONST_OFFSET && label_has_input_leaf(info->l1, 0);
   bool l2_inp = info->l2 >= CONST_OFFSET && label_has_input_leaf(info->l2, 0);
   // Length-boundary shapes (flen_*/fsize, including iend = base + size) must
-  // stay in the PCBT. FSE/xz buffer-end checks `ip <= iend-K` were previously
+  // stay in the SEDBT. FSE/xz buffer-end checks `ip <= iend-K` were previously
   // dropped as "pointer vs input" heap layout, so short streams ended mid-
   // loop without a diverge event (TruncatedTrace vs a longer train path).
   bool l1_len = info->l1 >= CONST_OFFSET &&
@@ -2613,7 +2613,7 @@ static void InitializePlatformEarly() {
 }
 
 static void dfsan_fini() {
-  // Flush pending PCBT fold frames (getc-loop event tails) before the trace
+  // Flush pending SEDBT fold frames (getc-loop event tails) before the trace
   // pipe / SHM go away. Tolerates EPIPE (the reader may already be gone).
   __dfsan_flush_trace_fold();
   if (internal_strcmp(flags().dump_labels_at_exit, "") != 0) {

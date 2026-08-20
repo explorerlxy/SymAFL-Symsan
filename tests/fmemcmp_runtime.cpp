@@ -143,7 +143,7 @@ int main() {
 
   // A bswap-style Extract outside the represented shadow width is concrete,
   // not a symbolic byte. The runtime must drop that label rather than emit an
-  // out-of-range Extract node for the PCBT converter.
+  // out-of-range Extract node for the SEDBT converter.
   {
     dfsan_label result = dfsan_union(
         input_label, 0, __dfsan::Extract, 8, 0, sizeof(input) * 8);

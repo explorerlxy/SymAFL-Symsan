@@ -32,6 +32,15 @@ int __pipe_fd;
 int __control_pipe_fd;
 static uint64_t __taint_symbolic_depth;
 static symafl_single_pass_control *__single_pass;
+static THREADLOCAL uint8_t t_next_cond_gep_pin;
+
+extern "C" void __taint_mark_next_cond_gep_pin() { t_next_cond_gep_pin = 1; }
+
+static uint8_t consume_gep_pin() {
+  uint8_t v = t_next_cond_gep_pin;
+  t_next_cond_gep_pin = 0;
+  return v;
+}
 
 void InitializeSinglePassCapture() {
   if (internal_strcmp(flags().single_pass_name, "") == 0) return;
@@ -90,7 +99,7 @@ static bool pipe_write_all(const void *buf, uptr n) {
       static int once = 0;
       if (once < 3) {
         once++;
-        Printf("[pcbt-pipe] write failed fd=%d left=%zu err=%d (events may "
+        Printf("[sedbt-pipe] write failed fd=%d left=%zu err=%d (events may "
                "be truncated)\n",
                __pipe_fd, (size_t)left, err);
       }
@@ -104,7 +113,7 @@ static bool pipe_write_all(const void *buf, uptr n) {
 }
 
 //===----------------------------------------------------------------------===//
-// PCBT trace folding
+// SEDBT trace folding
 //===----------------------------------------------------------------------===//
 //
 // Long test inputs (e.g. a 64 KiB line without '\n') make getc loops emit one
@@ -352,13 +361,16 @@ extern "C" void __dfsan_flush_trace_fold() {
 extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
                                   uint8_t add_nested, uint8_t loop_flag,
                                   uint32_t cid, void *addr) {
-  // Only input-dependent, initialized labels are symbolic PCBT events. Keep
+  // Consume even on early return so a skipped GEP pin cannot leak onto the
+  // next ordinary branch.
+  const uint8_t gep = consume_gep_pin();
+  // Only input-dependent, initialized labels are symbolic SEDBT events. Keep
   // this guard at the transport boundary as well as in fastgen.cpp because
   // runtime custom hooks also call __taint_send_cond directly.
   if (label == 0 || label == kInitializingLabel) return;
   // Heap-layout conditions (pointer/pointer-diff compares, including
   // pool-freespace vs namelen) are path-local under allocator state. Emitting
-  // them as PCBT events creates site-dependent cid pairs at the same depth
+  // them as SEDBT events creates site-dependent cid pairs at the same depth
   // (libxml2 dict.c:233 AddString pool walk vs dict.c:865 hash lookup).
   // ConstraintFlag events (fread length) always pass.
   if (!(loop_flag & ConstraintFlag) && taint_is_heap_layout_cond(label))
@@ -392,7 +404,9 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
       __atomic_store_n(&__single_pass->overflow, 1, __ATOMIC_RELEASE);
       return;
     }
-    uint8_t constraint = (loop_flag & ConstraintFlag) ? 1 : 0;
+    uint8_t constraint = 0;
+    if (loop_flag & ConstraintFlag)
+      constraint = gep ? 2 : 1;
     uint8_t rsan_bug = (loop_flag & RsanCheckFlag)
         ? (uint8_t)((loop_flag & RsanBugDirFlag) ? 1 : 0)
         : 0xff;
@@ -409,7 +423,7 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
   if (__pipe_fd < 0) return;
 
   // Pipe suffix replay keeps concolic execution and AST construction intact;
-  // it only suppresses already-known PCBT prefix condition events. The
+  // it only suppresses already-known SEDBT prefix condition events. The
   // forkserver cannot reparse TAINT_OPTIONS for every child, so use the shared
   // skip depth in that case. The flag remains for standalone launcher tracing.
   int skip_depth = flags().trace_skip_depth;
@@ -429,7 +443,10 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
 
   uint16_t flags = 0;
   if (add_nested) flags |= F_ADD_CONS;
-  if (loop_flag & ConstraintFlag) flags |= F_CONSTRAINT;
+  if (loop_flag & ConstraintFlag) {
+    flags |= F_CONSTRAINT;
+    if (gep) flags |= F_GEP_PIN;
+  }
   if (loop_flag & RsanCheckFlag) {
     flags |= F_RSAN_CHECK;
     if (loop_flag & RsanBugDirFlag) flags |= F_RSAN_BUG_DIR;

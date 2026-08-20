@@ -1,10 +1,14 @@
-#include "pcbt.hpp"
+#include "sedbt.hpp"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <sys/mman.h>
 #include <unordered_map>
 #include <unordered_set>
 
-namespace pcbt {
+namespace sedbt {
 
 namespace {
 
@@ -13,7 +17,7 @@ namespace {
 // "<abs-path>/dict.c:LINE:COL" for the Realworld build path used here, plus
 // basename forms for portability when SourceInfo is shortened.
 // Pairs historically: 233(AddString pool) <-> 865(Lookup okey/len),
-// 301(QString pool) <-> 1108(QLookup). Emitting them as PCBT events creates
+// 301(QString pool) <-> 1108(QLookup). Emitting them as SEDBT events creates
 // rare cid_mismatch at equal depth without a true input-only omission.
 static bool is_libxml_dict_layout_cid(uint32_t cid) {
   switch (cid) {
@@ -127,47 +131,360 @@ const char *pkind_name(PKind kind) {
 }
 }  // namespace
 
-Tree::Tree() : nodes_(kRoot + 1) {
+static Predicate pred_from(const symafl::ShmNode &n) {
+  Predicate p;
+  p.root = n.pred_root;
+  p.opaque = n.pred_opaque;
+  p.tautology = n.pred_tautology;
+  p.fixed_dir = n.pred_fixed_dir;
+  return p;
+}
+
+void Tree::init_empty() {
+  if (!shm_) return;
+  auto *s = shmp();
+  s->hdr.magic = symafl::kIpcMagic;
+  s->hdr.version = symafl::kIpcVersion;
+  s->hdr.node_cap = symafl::kNodeCap;
+  s->hdr.pred_cap = symafl::kPredCap;
+  s->hdr.s_cap = symafl::kSCap;
+  s->hdr.e_cap = symafl::kECap;
+  s->hdr.clos_cap = symafl::kClosCap;
+  s->hdr.path_s_mode = (uint8_t)path_s_mode_;
+  live_n_ = kRoot + 1;
+  published_n_ = kRoot + 1;
+  s->hdr.n_nodes.store(live_n_, std::memory_order_relaxed);
+  s->hdr.n_preds.store(0, std::memory_order_relaxed);
+  s->hdr.n_s.store(0, std::memory_order_relaxed);
+  s->hdr.n_e.store(0, std::memory_order_relaxed);
+  s->hdr.n_clos.store(0, std::memory_order_relaxed);
+  at(kRoot).child[0] = kUnexplored;
+  at(kRoot).child[1] = kUnexplored;
+  at(kRoot).parent = kUnexplored;
+  at(kRoot).rsan_bug_dir = 0xff;
+}
+
+Tree::Tree() {
+  shm_ = mmap(nullptr, sizeof(symafl::SedbtShm), PROT_READ | PROT_WRITE,
+              MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (shm_ == MAP_FAILED) shm_ = nullptr;
+  owns_shm_ = shm_ != nullptr;
+  if (shm_) {
+    memset(shm_, 0, sizeof(symafl::SedbtShm));
+    init_empty();
+  }
   pred_arena_.nodes.reserve(4096);
+}
+
+Tree::Tree(std::nullptr_t) : shm_(nullptr), owns_shm_(false) {}
+
+Tree::Tree(Tree &&o) noexcept
+    : debug_(o.debug_), profile_(o.profile_),
+      rlimit_unlimited_(o.rlimit_unlimited_), diag_conflicts_(o.diag_conflicts_),
+      store_creators_(o.store_creators_), compute_path_s_(o.compute_path_s_),
+      path_s_mode_(o.path_s_mode_),
+      compute_closures_(o.compute_closures_),
+      creator_max_len_(o.creator_max_len_),
+      shm_(o.shm_), owns_shm_(o.owns_shm_), live_n_(o.live_n_),
+      published_n_(o.published_n_), pred_arena_(std::move(o.pred_arena_)),
+      creators_(std::move(o.creators_)) {
+  o.shm_ = nullptr;
+  o.owns_shm_ = false;
+}
+
+Tree &Tree::operator=(Tree &&o) noexcept {
+  if (this == &o) return *this;
+  if (owns_shm_ && shm_) munmap(shm_, sizeof(symafl::SedbtShm));
+  shm_ = o.shm_;
+  owns_shm_ = o.owns_shm_;
+  live_n_ = o.live_n_;
+  published_n_ = o.published_n_;
+  pred_arena_ = std::move(o.pred_arena_);
+  creators_ = std::move(o.creators_);
+  o.shm_ = nullptr;
+  o.owns_shm_ = false;
+  return *this;
+}
+
+Tree::~Tree() {
+  if (owns_shm_ && shm_) munmap(shm_, sizeof(symafl::SedbtShm));
+}
+
+void Tree::attach(void *sedbt_shm) {
+  if (owns_shm_ && shm_) munmap(shm_, sizeof(symafl::SedbtShm));
+  shm_ = sedbt_shm;
+  owns_shm_ = false;
+  if (!shm_) return;
+  auto *s = shmp();
+  uint32_t nn = s->hdr.n_nodes.load(std::memory_order_relaxed);
+  uint32_t np = s->hdr.n_preds.load(std::memory_order_relaxed);
+  if (nn <= kRoot) {
+    init_empty();
+    pred_arena_.nodes.clear();
+    return;
+  }
+  live_n_ = nn;
+  published_n_ = nn;
+  pred_arena_.nodes.assign(s->preds, s->preds + np);
+}
+
+uint32_t Tree::pred_root_of(NodeRef ref) const {
+  return ref < kRoot || ref >= live_n_ ? 0 : at(ref).pred_root;
+}
+
+const Node &Tree::node_at(NodeRef ref) const {
+  static thread_local Node view;
+  view = Node{};
+  if (ref < kRoot || ref >= live_n_ || !shm_) return view;
+  const symafl::ShmNode &n = at(ref);
+  view.cid = n.cid;
+  view.pred = pred_from(n);
+  view.child[0] = n.child[0];
+  view.child[1] = n.child[1];
+  view.depth = n.depth;
+  view.skipCnt = n.skipCnt;
+  view.constraint = n.constraint != 0;
+  view.gep_pin = n.constraint == kConstraintGep;
+  view.unstable = n.unstable;
+  view.len_related = n.len_related;
+  view.rsan_bug_dir = n.rsan_bug_dir;
+  view.parent = n.parent;
+  return view;
+}
+
+uint32_t Tree::depth(NodeRef ref) const {
+  return ref < kRoot || ref >= live_n_ ? 0 : at(ref).depth;
+}
+uint32_t Tree::cid_of(NodeRef ref) const {
+  return ref < kRoot || ref >= live_n_ ? 0 : at(ref).cid;
+}
+NodeRef Tree::root_child0() const {
+  return !shm_ ? kUnexplored : at(kRoot).child[0];
+}
+NodeRef Tree::child(NodeRef ref, uint8_t direction) const {
+  return ref < kRoot || ref >= live_n_ ? kUnexplored
+                                       : at(ref).child[direction & 1];
+}
+uint32_t Tree::skip_of(NodeRef ref) const {
+  return ref < kRoot || ref >= live_n_ ? 0 : at(ref).skipCnt;
+}
+bool Tree::is_constraint(NodeRef ref) const {
+  return ref >= kRoot && ref < live_n_ && at(ref).constraint != 0;
+}
+bool Tree::is_len_related(NodeRef ref) const {
+  return ref >= kRoot && ref < live_n_ && at(ref).len_related;
+}
+uint8_t Tree::rsan_bug_dir_of(NodeRef ref) const {
+  return ref >= kRoot && ref < live_n_ ? at(ref).rsan_bug_dir : 0xff;
+}
+const Closure &Tree::closure_of(NodeRef ref) const {
+  static thread_local Closure tmp;
+  tmp = Closure{};
+  if (!shm_ || ref < kRoot || ref >= live_n_) return tmp;
+  const symafl::ShmNode &n = at(ref);
+  if (!n.clos_i) return tmp;
+  uint32_t i = n.clos_i - 1;
+  uint32_t nc = shmp()->hdr.n_clos.load(std::memory_order_acquire);
+  if (i >= nc) return tmp;
+  const symafl::ShmClosure &c = shmp()->clos[i];
+  tmp.present = true;
+  tmp.trigger_neg = c.trigger_neg;
+  tmp.s.assign(shmp()->s_offs + c.s_off, shmp()->s_offs + c.s_off + c.s_n);
+  tmp.e.clear();
+  for (uint16_t k = 0; k < c.e_n; ++k) {
+    const auto &cl = shmp()->e_clauses[c.e_off + k];
+    tmp.e.push_back({cl.pred_root, cl.negated});
+  }
+  return tmp;
+}
+bool Tree::is_unstable(NodeRef ref) const {
+  return ref >= kRoot && ref < live_n_ && at(ref).unstable;
+}
+void Tree::mark_unstable(NodeRef ref) {
+  if (ref >= kRoot && ref < live_n_) at(ref).unstable = true;
+}
+uint32_t Tree::skip_for(NodeRef frontier_parent, uint8_t direction) const {
+  if (frontier_parent == kRoot || frontier_parent >= live_n_) return 0;
+  const symafl::ShmNode &p = at(frontier_parent);
+  return p.skipCnt + (p.constraint && direction == 1 ? 1 : 0);
 }
 
 void Tree::DebugPredicate(NodeRef ref, const uint8_t *input,
                           uint32_t len) const {
-  if (ref == kUnexplored || ref == kTerminal || ref == kRoot) return;
-  const Node &n = node(ref);
+  if (ref == kUnexplored || ref == kTerminal || ref == kRoot || !shm_) return;
+  const symafl::ShmNode &n = at(ref);
   fprintf(stderr,
-          "[pcbt-dbg] node=%u cid=%u depth=%u opaque=%d tautology=%d fixed_dir=%u\n",
-          ref, n.cid, n.depth, n.pred.opaque ? 1 : 0, n.pred.tautology ? 1 : 0,
-          n.pred.fixed_dir);
-  if (n.pred.opaque || n.pred.tautology) return;
-  fprintf(stderr, "[pcbt-dbg] reads:");
-  for (const auto &r : n.pred.reads) {
-    fprintf(stderr, " %u+%u=[", r.first, r.second);
-    for (uint32_t k = 0; k < r.second && r.first + k < len; k++)
-      fprintf(stderr, "%02x", input[r.first + k]);
-    fprintf(stderr, "]");
-  }
-  fprintf(stderr, "\n");
+          "[sedbt-dbg] node=%u cid=%u depth=%u opaque=%d tautology=%d fixed_dir=%u\n",
+          ref, n.cid, n.depth, n.pred_opaque ? 1 : 0, n.pred_tautology ? 1 : 0,
+          n.pred_fixed_dir);
+  if (n.pred_opaque || n.pred_tautology) return;
+  fprintf(stderr, "[sedbt-dbg] pred_root=%u\n", n.pred_root);
   std::vector<uint32_t> stack;
-  if (n.pred.root < pred_arena_.nodes.size())
-    stack.push_back(n.pred.root);
+  if (n.pred_root < pred_arena_.nodes.size()) stack.push_back(n.pred_root);
   while (!stack.empty()) {
     uint32_t idx = stack.back();
     stack.pop_back();
     if (idx >= pred_arena_.nodes.size()) continue;
     const PNode &p = pred_arena_.nodes[idx];
-    fprintf(stderr, "[pcbt-dbg]   %u %s bits=%u value=%llu a=%u b=%u\n",
+    fprintf(stderr, "[sedbt-dbg]   %u %s bits=%u value=%llu a=%u b=%u\n",
             idx, pkind_name(p.kind), p.bits, (unsigned long long)p.value,
             p.a, p.b);
     if (p.a != UINT32_MAX) stack.push_back(p.a);
     if (p.b != UINT32_MAX) stack.push_back(p.b);
   }
+  (void)input;
+  (void)len;
 }
 
 NodeRef Tree::append(Node &&new_node) {
-  if (nodes_.size() == UINT32_MAX) return kUnexplored;
-  nodes_.push_back(std::move(new_node));
-  return (NodeRef)nodes_.size() - 1;
+  if (!shm_ || live_n_ >= shmp()->hdr.node_cap) return kUnexplored;
+  symafl::ShmNode &d = at(live_n_);
+  memset(&d, 0, sizeof(d));
+  d.cid = new_node.cid;
+  d.pred_root = new_node.pred.root;
+  d.child[0] = kUnexplored;
+  d.child[1] = kUnexplored;
+  d.depth = new_node.depth;
+  d.skipCnt = new_node.skipCnt;
+  d.parent = new_node.parent;
+  d.clos_i = 0;
+  d.pred_opaque = new_node.pred.opaque ? 1 : 0;
+  d.pred_tautology = new_node.pred.tautology ? 1 : 0;
+  d.pred_fixed_dir = new_node.pred.fixed_dir;
+  d.constraint = new_node.gep_pin
+                     ? kConstraintGep
+                     : (new_node.constraint ? kConstraintPin : kConstraintNone);
+  d.unstable = new_node.unstable ? 1 : 0;
+  d.len_related = new_node.len_related ? 1 : 0;
+  d.rsan_bug_dir = new_node.rsan_bug_dir;
+  NodeRef ref = live_n_;
+  live_n_ += 1;
+  return ref;
+}
+
+void Tree::commit_publish(NodeRef attach, uint8_t attach_dir, NodeRef first) {
+  if (!shm_) return;
+  auto *s = shmp();
+  uint32_t old_p = s->hdr.n_preds.load(std::memory_order_relaxed);
+  uint32_t new_p = (uint32_t)pred_arena_.nodes.size();
+  if (new_p > old_p && new_p <= s->hdr.pred_cap)
+    memcpy(s->preds + old_p, pred_arena_.nodes.data() + old_p,
+           sizeof(PNode) * (new_p - old_p));
+  s->hdr.n_preds.store(new_p, std::memory_order_release);
+  s->hdr.n_nodes.store(live_n_, std::memory_order_release);
+  published_n_ = live_n_;
+  if (attach >= kRoot && attach_dir <= 1 && first != kUnexplored)
+    __atomic_store_n(&at(attach).child[attach_dir], first, __ATOMIC_RELEASE);
+}
+
+void Tree::apply_mut_compute_env() {
+  path_s_mode_ = parse_mut_path_s_env(getenv("SYMAFL_MUT_PATH_S"));
+  compute_path_s_ = path_s_mode_ != PathSMode::Off;
+  if (const char *e = getenv("SYMAFL_MUT_CLOSURE"))
+    compute_closures_ = std::strcmp(e, "0") != 0;
+  if (shm_) shmp()->hdr.path_s_mode = (uint8_t)path_s_mode_;
+}
+
+void Tree::bind_path_s(NodeRef tail, uint8_t tdir, NodeRef frontier,
+                       uint8_t fdir) {
+  if (!shm_ || tail < kRoot || tdir > 1 || fdir > 1) return;
+  if (frontier < kRoot) return;
+  symafl::ShmNode &sn = at(tail);
+  // Latch on bind frontier, not term_s_n: empty suffixes have n=0.
+  if (sn.term_front[tdir]) return;
+  sn.term_front[tdir] = frontier;
+  sn.term_fdir[tdir] = fdir;
+  // Always latch the bind site. Suffix/Full also collect mutation symbols
+  // (GEP-index offsets are the term_cons_n prefix). Off still writes the
+  // root→terminal GEP-offset set (havoc can hit a prefix GEP) and
+  // omits non-constraint symbols. Indcall/read-length pins stay topology
+  // constraints but are not CONS_SAN symbols.
+  const bool off = path_s_mode_ == PathSMode::Off;
+  const bool full = path_s_mode_ == PathSMode::Full || off;
+  std::unordered_set<uint32_t> cons_set;
+  std::unordered_set<uint32_t> all_set;
+  const uint32_t n_preds = (uint32_t)pred_arena_.nodes.size();
+  const PNode *preds = pred_arena_.nodes.data();
+  for (NodeRef x = tail; x >= kRoot && x < live_n_;) {
+    if (x == kRoot) break;
+    if (!full && x == frontier) break;
+    const symafl::ShmNode &n = at(x);
+    if (!n.pred_opaque && !n.pred_tautology) {
+      std::vector<uint32_t> one;
+      collect_input_offsets(preds, n_preds, n.pred_root, &one);
+      for (uint32_t o : one) {
+        if (n.constraint == kConstraintGep) cons_set.insert(o);
+        if (!off) all_set.insert(o);
+      }
+    }
+    NodeRef p = n.parent;
+    if (p == x || p < kRoot) break;
+    x = p;
+  }
+  if (off && cons_set.empty()) return;
+  std::vector<uint32_t> cons(cons_set.begin(), cons_set.end());
+  std::vector<uint32_t> rest;
+  rest.reserve(all_set.size());
+  for (uint32_t o : all_set) {
+    if (!cons_set.count(o)) rest.push_back(o);
+  }
+  std::sort(cons.begin(), cons.end());
+  std::sort(rest.begin(), rest.end());
+  if (cons.size() > 0xffff) cons.resize(0xffff);
+  {
+    const uint32_t room = 0xffff - (uint32_t)cons.size();
+    if (rest.size() > room) rest.resize(room);
+  }
+  uint32_t s_n = shmp()->hdr.n_s.load(std::memory_order_relaxed);
+  const uint32_t write_n = (uint32_t)cons.size() + (uint32_t)rest.size();
+  if (s_n + write_n > shmp()->hdr.s_cap) return;
+  for (uint32_t i = 0; i < cons.size(); ++i) shmp()->s_offs[s_n + i] = cons[i];
+  for (uint32_t i = 0; i < rest.size(); ++i)
+    shmp()->s_offs[s_n + (uint32_t)cons.size() + i] = rest[i];
+  sn.term_s_off[tdir] = s_n;
+  sn.term_s_n[tdir] = (uint16_t)write_n;
+  sn.term_cons_n[tdir] = (uint16_t)cons.size();
+  shmp()->hdr.n_s.store(s_n + write_n, std::memory_order_release);
+}
+
+void Tree::publish_one_closure(const Closure &c, NodeRef ref) {
+  if (!shm_ || !c.present || ref < kRoot || ref >= live_n_) return;
+  symafl::ShmNode &sn = at(ref);
+  if (sn.clos_i) return;
+  auto *s = shmp();
+  uint32_t s_n = s->hdr.n_s.load(std::memory_order_relaxed);
+  uint32_t e_n = s->hdr.n_e.load(std::memory_order_relaxed);
+  uint32_t ci = s->hdr.n_clos.load(std::memory_order_relaxed);
+  if (ci >= s->hdr.clos_cap) return;
+  if (s_n + (uint32_t)c.s.size() > s->hdr.s_cap) return;
+  if (e_n + (uint32_t)c.e.size() > s->hdr.e_cap) return;
+  symafl::ShmClosure &sc = s->clos[ci];
+  sc.s_off = s_n;
+  sc.s_n = (uint16_t)c.s.size();
+  for (uint32_t i = 0; i < c.s.size(); ++i) s->s_offs[s_n + i] = c.s[i];
+  sc.e_off = e_n;
+  sc.e_n = (uint16_t)c.e.size();
+  for (uint32_t i = 0; i < c.e.size(); ++i) {
+    s->e_clauses[e_n + i].pred_root = c.e[i].pred_root;
+    s->e_clauses[e_n + i].negated = c.e[i].negated;
+  }
+  sc.trigger_neg = c.trigger_neg;
+  s->hdr.n_s.store(s_n + (uint32_t)c.s.size(), std::memory_order_release);
+  s->hdr.n_e.store(e_n + (uint32_t)c.e.size(), std::memory_order_release);
+  s->hdr.n_clos.store(ci + 1, std::memory_order_release);
+  sn.clos_i = ci + 1;
+}
+
+void Tree::finish_publish(NodeRef frontier, uint8_t fdir, NodeRef chain_first,
+                         NodeRef tail, uint8_t tdir, bool close_term) {
+  if (!shm_) return;
+  if (close_term && tail >= kRoot && tail < live_n_ && tail >= published_n_)
+    at(tail).child[tdir] = kTerminal;
+  finalize_closures(tail, tdir);
+  if (close_term) bind_path_s(tail, tdir, frontier, fdir);
+  NodeRef first = chain_first;
+  if (first == kUnexplored && close_term) first = kTerminal;
+  commit_publish(frontier, fdir, first);
 }
 
 void Tree::maybe_store_creator(NodeRef ref, const uint8_t *input,
@@ -237,8 +554,8 @@ static bool pred_has_len_kind(const PredArena &arena, const Predicate &pred) {
 // stream position), ordinary nodes advance by one stream position — plus
 // one extra when the parent is a constraint, because the constraint event
 // itself also occupies a stream position.
-static inline uint32_t child_skip_cnt(const Node &parent, uint8_t parent_dir,
-                                      bool constraint) {
+static inline uint32_t child_skip_cnt(const symafl::ShmNode &parent,
+                                      uint8_t parent_dir, bool constraint) {
   if (!parent.constraint) return parent.skipCnt + (constraint ? 0 : 1);
   if (constraint && parent_dir == 0) return parent.skipCnt;
   return parent.skipCnt + (constraint ? 1 : 2);
@@ -326,7 +643,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
                            size_t table_labels,
                            const uint8_t *input, uint32_t len,
                            NodeRef *out_tail_node, uint8_t *out_tail_dir) {
-  if (events.empty()) {
+  if (!shm_ || events.empty()) {
     if (out_tail_node) *out_tail_node = kUnexplored;
     if (out_tail_dir) *out_tail_dir = 0;
     return 0;
@@ -347,15 +664,15 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   // walk steps from a constraint node onto a non-constraint child (the
   // candidate's replacement constraint event shares its stream position
   // with the value-chain, so stepping INTO a constraint consumes nothing).
-  NodeRef cur = node(kRoot).child[0];
+  NodeRef cur = at(kRoot).child[0];
   while (i < events.size() && cur != kUnexplored && cur != kTerminal) {
     const Event &ev = events[i];
-    const Node &cn = node(cur);
+    const symafl::ShmNode &cn = at(cur);
     if (cn.unstable) {
       num_conflicts += 1;
       if (diag_conflicts_)
         fprintf(stderr,
-                "[pcbt-conflict] walk hit already-unstable node=%u cid=%u "
+                "[sedbt-conflict] walk hit already-unstable node=%u cid=%u "
                 "depth=%u ev_cid=%u\n",
                 cur, cn.cid, cn.depth, ev.cid);
       return 0;
@@ -363,23 +680,23 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     uint64_t v = 0;
     bool evaluated = false;
     uint8_t edir;
-    if (cn.pred.tautology) {
-      edir = cn.pred.fixed_dir;
-    } else if (cn.pred.opaque || input == nullptr) {
+    if (cn.pred_tautology) {
+      edir = cn.pred_fixed_dir;
+    } else if (cn.pred_opaque || input == nullptr) {
       edir = ev.result ? 1 : 0;  // follow the recorded direction
     } else {
-      evaluated = eval_predicate(pred_arena_, cn.pred, input, len, &v, &eval);
+      evaluated = eval_predicate(pred_arena_, pred_from(cn), input, len, &v, &eval);
       edir = evaluated ? (v ? 1 : 0) : (ev.result ? 1 : 0);
     }
     const bool cid_ok =
         cn.cid == ev.cid || is_dict_layout_cid_pair(cn.cid, ev.cid);
     if (!cid_ok ||
         (!cn.constraint && evaluated && edir != (ev.result ? 1 : 0))) {
-      node(cur).unstable = true;
+      at(cur).unstable = true;
       num_conflicts += 1;
       if (diag_conflicts_)
         fprintf(stderr,
-                "[pcbt-conflict] InsertTrace marks node=%u cid=%u depth=%u "
+                "[sedbt-conflict] InsertTrace marks node=%u cid=%u depth=%u "
                 "unstable (ev_cid=%u ev_res=%u eval_dir=%u)\n",
                 cur, cn.cid, cn.depth, ev.cid, ev.result,
                 evaluated ? (v ? 1 : 0) : 255);
@@ -388,7 +705,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     trace_depth += 1;
     parent = cur;
     dir = edir;
-    NodeRef nxt = node(parent).child[dir];
+    NodeRef nxt = at(parent).child[dir];
     // A constraint value-fork reuses the same stream frame only when the
     // candidate takes dir-0 into another constraint node. A dir-1 edge is the
     // pinned value's real successor; if that successor also happens to be a
@@ -396,7 +713,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     // the current event.
     bool reuse_constraint =
         cn.constraint && edir == 0 && nxt != kTerminal &&
-        (nxt == kUnexplored || node(nxt).constraint);
+        (nxt == kUnexplored || at(nxt).constraint);
     if (!reuse_constraint) {
       k += 1;
       if (k == ev.count) {
@@ -412,38 +729,39 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
     // The evaluated path reaches an explored-terminal edge while the trace
     // still has events: prefix drift (or a suffix-truncated earlier
     // insertion). Discard; never insert.
-    if (parent >= kRoot && parent < nodes_.size())
-      node(parent).unstable = true;
+    if (parent >= kRoot && parent < live_n_)
+      at(parent).unstable = true;
     num_conflicts += 1;
     if (diag_conflicts_)
       fprintf(stderr,
-              "[pcbt-conflict] InsertTrace prefix-drift marks parent=%u "
+              "[sedbt-conflict] InsertTrace prefix-drift marks parent=%u "
               "cid=%u depth=%u unstable (remaining events start at i=%zu)\n",
-              parent, node(parent).cid, node(parent).depth, i);
+              parent, at(parent).cid, at(parent).depth, i);
     return 0;
   }
 
   if (i == events.size() && k == 0) {
-    NodeRef ch = node(parent).child[dir];
+    NodeRef ch = at(parent).child[dir];
     if (ch == kUnexplored) {
       // The trace ends exactly at this edge: the decision (or the pinned
       // constraint value) produced no further symbolic decisions, so the
       // branch terminates here.
-      node(parent).child[dir] = kTerminal;
-    } else if (ch != kTerminal && ch >= kRoot && ch < nodes_.size()) {
+      bind_path_s(parent, dir, parent, dir);
+      commit_publish(parent, dir, kTerminal);
+    } else if (ch != kTerminal && ch >= kRoot && ch < live_n_) {
       // Complete stream ends on an edge already extended by a longer path.
       // A finished short execution must own a Terminal here (or must have
       // diverged earlier via a symbolic branch). Silent "prefix accept" hides
       // a collection/model hole and makes REPLAY_ALL TruncatedTrace the only
       // exposure. Mirror AfterTerminal: conflict + mark unstable, no insert.
-      node(parent).unstable = true;
+      at(parent).unstable = true;
       num_conflicts += 1;
       if (diag_conflicts_)
         fprintf(stderr,
-                "[pcbt-conflict] InsertTrace early-end marks parent=%u "
+                "[sedbt-conflict] InsertTrace early-end marks parent=%u "
                 "cid=%u depth=%u unstable (child=%u already extended; "
                 "complete short stream has no Terminal edge)\n",
-                parent, node(parent).cid, node(parent).depth, ch);
+                parent, at(parent).cid, at(parent).depth, ch);
       if (out_tail_node) *out_tail_node = parent;
       if (out_tail_dir) *out_tail_dir = dir;
       return 0;
@@ -457,6 +775,9 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   RunConverter conv(table, table_labels, &pred_arena_);
   uint32_t created = 0;
   bool structural_stop = false;
+  const NodeRef frontier = parent;
+  const uint8_t frontier_dir = dir;
+  NodeRef chain_first = kUnexplored;
 
   // Diagnostics: detect label pollution (non-zero label but no input dependency)
   static bool label_pollution_diagnostics = getenv("SYMAFL_LABEL_POLLUTION_DEBUG") != nullptr;
@@ -506,7 +827,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
             /*pending=*/true};
         if (diag_conflicts_) {
           fprintf(stderr,
-                  "[pcbt-struct] InsertTrace stop reason=%s cid=%u label=%u "
+                  "[sedbt-struct] InsertTrace stop reason=%s cid=%u label=%u "
                   "result=%u event_index=%zu created=%u\n",
                   cls == InsertPredClass::StructConvertFail ? "convert_fail"
                                                               : "train_mismatch",
@@ -517,12 +838,13 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       }
       Node new_node;
       new_node.cid = ev.cid;
-      new_node.depth = parent == kRoot ? 1 : node(parent).depth + 1;
+      new_node.depth = parent == kRoot ? 1 : at(parent).depth + 1;
       new_node.skipCnt = parent == kRoot
           ? (ev.constraint ? 0u : 1u)
-          : child_skip_cnt(node(parent), dir, ev.constraint != 0);
+          : child_skip_cnt(at(parent), dir, ev.constraint != 0);
       new_node.pred = pred;
       new_node.constraint = ev.constraint != 0;
+      new_node.gep_pin = ev.constraint == kConstraintGep;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       new_node.rsan_bug_dir = ev.rsan_bug_dir;
       new_node.parent = parent;
@@ -530,9 +852,17 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
         num_tautology += 1;
       }
       NodeRef next = append(std::move(new_node));
-      if (next == kUnexplored) return created;
+      if (next == kUnexplored) {
+        finish_publish(frontier, frontier_dir, chain_first, parent, dir,
+                       /*close_term=*/false);
+        return created;
+      }
       maybe_store_creator(next, input, len);
-      node(parent).child[dir] = next;
+      if (parent < published_n_) {
+        if (chain_first == kUnexplored) chain_first = next;
+      } else {
+        at(parent).child[dir] = next;
+      }
       parent = next;
       dir = pred.tautology ? pred.fixed_dir : (ev.result ? 1 : 0);
       created += 1;
@@ -543,14 +873,12 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   // Close terminal only when the full remaining stream was inserted. A
   // structural stop leaves the current edge unexplored so later candidates
   // can still be admitted there once the model is fixed.
-  if (!structural_stop) {
-    node(parent).child[dir] = kTerminal;
-  }
   num_nodes += created;
   if (trace_depth > max_depth) max_depth = trace_depth;
   if (out_tail_node) *out_tail_node = parent;
   if (out_tail_dir) *out_tail_dir = dir;
-  finalize_closures(parent, dir);
+  finish_publish(frontier, frontier_dir, chain_first, parent, dir,
+                 /*close_term=*/!structural_stop);
   return created;
 }
 
@@ -560,8 +888,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
                             size_t table_labels, const uint8_t *input,
                             uint32_t len, NodeRef *out_tail_node,
                             uint8_t *out_tail_dir) {
-  if (parent < kRoot || parent >= nodes_.size() || direction > 1 ||
-      node(parent).child[direction] != kUnexplored) {
+  if (!shm_ || parent < kRoot || parent >= live_n_ || direction > 1 ||
+      at(parent).child[direction] != kUnexplored) {
     if (out_tail_node) *out_tail_node = kUnexplored;
     if (out_tail_dir) *out_tail_dir = 0;
     return 0;
@@ -570,14 +898,13 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   for (const Event &ev : events) num_events += ev.count;
 
   if (events.empty()) {
-    if (node(parent).constraint) {
+    if (at(parent).constraint) {
       // Constraint value-fork: a candidate walking a constraint node's
       // dir-0 re-emits its own multi-successor decision event at the same
       // stream position, so a complete suffix can never be empty here. An
       // empty suffix on a constraint parent is an incomplete-capture
-      // boundary and must leave the value-fork unexplored (the rCnt/rlimit
-      // budget governs mining); a different pinned value could still carry
-      // further decisions.
+      // boundary and must leave the value-fork unexplored; a different
+      // pinned value could still carry further decisions.
       if (out_tail_node) *out_tail_node = parent;
       if (out_tail_dir) *out_tail_dir = direction;
       return 0;
@@ -598,7 +925,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
     // merely consistent.
     if (out_tail_node) *out_tail_node = parent;
     if (out_tail_dir) *out_tail_dir = direction;
-    node(parent).child[direction] = kTerminal;
+    bind_path_s(parent, direction, parent, direction);
+    commit_publish(parent, direction, kTerminal);
     return 0;
   }
 
@@ -607,6 +935,9 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   uint8_t dir = direction;
   NodeRef cur = parent;
   bool structural_stop = false;
+  const NodeRef frontier = parent;
+  const uint8_t frontier_dir = direction;
+  NodeRef chain_first = kUnexplored;
 
   // Diagnostics: count events with empty reads (label pollution candidates)
   static bool label_pollution_diagnostics = getenv("SYMAFL_LABEL_POLLUTION_DEBUG") != nullptr;
@@ -664,7 +995,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
             /*pending=*/true};
         if (diag_conflicts_) {
           fprintf(stderr,
-                  "[pcbt-struct] InsertSuffix stop reason=%s cid=%u label=%u "
+                  "[sedbt-struct] InsertSuffix stop reason=%s cid=%u label=%u "
                   "result=%u created=%u\n",
                   cls == InsertPredClass::StructConvertFail ? "convert_fail"
                                                               : "train_mismatch",
@@ -700,18 +1031,27 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
 
       Node new_node;
       new_node.cid = event.cid;
-      new_node.depth = node(cur).depth + 1;
-      new_node.skipCnt = child_skip_cnt(node(cur), dir, event.constraint != 0);
+      new_node.depth = at(cur).depth + 1;
+      new_node.skipCnt = child_skip_cnt(at(cur), dir, event.constraint != 0);
       new_node.pred = pred;
       new_node.constraint = event.constraint != 0;
+      new_node.gep_pin = event.constraint == kConstraintGep;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       new_node.rsan_bug_dir = event.rsan_bug_dir;
       new_node.parent = cur;
       if (cls == InsertPredClass::Tautology) num_tautology += 1;
       NodeRef next = append(std::move(new_node));
-      if (next == kUnexplored) return created;
+      if (next == kUnexplored) {
+        finish_publish(frontier, frontier_dir, chain_first, cur, dir,
+                       /*close_term=*/false);
+        return created;
+      }
       maybe_store_creator(next, input, len);
-      node(cur).child[dir] = next;
+      if (cur < published_n_) {
+        if (chain_first == kUnexplored) chain_first = next;
+      } else {
+        at(cur).child[dir] = next;
+      }
       cur = next;
       dir = pred.tautology ? pred.fixed_dir : (event.result ? 1 : 0);
       created += 1;
@@ -719,11 +1059,8 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   }
 
   // Terminal only if the full suffix was accepted (policy A).
-  if (!structural_stop) {
-    node(cur).child[dir] = kTerminal;
-  }
   num_nodes += created;
-  if (node(cur).depth > max_depth) max_depth = node(cur).depth;
+  if (at(cur).depth > max_depth) max_depth = at(cur).depth;
 
   // Report label pollution statistics
   if (label_pollution_diagnostics && total_events_seen > 0) {
@@ -738,8 +1075,88 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
 
   if (out_tail_node) *out_tail_node = cur;
   if (out_tail_dir) *out_tail_dir = dir;
-  finalize_closures(cur, dir);
+  finish_publish(frontier, frontier_dir, chain_first, cur, dir,
+                 /*close_term=*/!structural_stop);
   return created;
+}
+
+Tree::SuffixHit Tree::CheckSuffix(NodeRef parent, uint8_t direction,
+                                  const uint8_t *input, uint32_t len) const {
+  SuffixHit r;
+  r.frontier = parent;
+  r.dir = direction;
+  if (direction > 1) return r;
+  auto walk_from = [&](NodeRef cur) -> SuffixHit {
+    SuffixHit w;
+    while (true) {
+      if (cur == kTerminal) {
+        w.kind = SuffixKind::Terminal;
+        return w;
+      }
+      if (cur < kRoot || cur >= live_n_) return w;
+      const symafl::ShmNode &n = at(cur);
+      if (n.unstable) return w;
+      uint8_t dir = 0;
+      if (n.pred_tautology || n.pred_opaque) {
+        dir = n.pred_tautology ? n.pred_fixed_dir : 0;
+      } else {
+        uint64_t v = 0;
+        if (!eval_predicate(pred_arena_, pred_from(n), input, len, &v)) return w;
+        dir = v ? 1 : 0;
+      }
+      NodeRef next = n.child[dir];
+      if (next == kUnexplored) {
+        w.kind = SuffixKind::Frontier;
+        w.frontier = cur;
+        w.dir = dir;
+        w.skip_cnt = skip_for(cur, dir);
+        return w;
+      }
+      if (next == kTerminal) {
+        w.kind = SuffixKind::Terminal;
+        w.frontier = cur;
+        w.dir = dir;
+        return w;
+      }
+      cur = next;
+    }
+  };
+  if (parent == kRoot) {
+    NodeRef cur = at(kRoot).child[0];
+    if (cur == kUnexplored) {
+      r.kind = SuffixKind::Frontier;
+      r.dir = 0;
+      r.skip_cnt = 0;
+      return r;
+    }
+    if (cur == kTerminal) {
+      r.kind = SuffixKind::Terminal;
+      r.dir = 0;
+      return r;
+    }
+    return walk_from(cur);
+  }
+  if (parent < kRoot || parent >= live_n_) return r;
+  r.skip_cnt = skip_for(parent, direction);
+  NodeRef next = at(parent).child[direction];
+  if (next == kUnexplored) {
+    r.kind = SuffixKind::Frontier;
+    return r;
+  }
+  if (next == kTerminal) {
+    r.kind = SuffixKind::Terminal;
+    return r;
+  }
+  return walk_from(next);
+}
+
+bool Tree::CloseUnexplored(NodeRef ref, uint8_t direction) {
+  if (ref < kRoot || ref >= live_n_ || direction > 1) return false;
+  if (__atomic_load_n(&at(ref).child[direction], __ATOMIC_ACQUIRE) !=
+      kUnexplored)
+    return false;
+  __atomic_store_n(&at(ref).child[direction], kTerminal, __ATOMIC_RELEASE);
+  return true;
 }
 
 bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
@@ -747,8 +1164,10 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
                       uint32_t *out_veto_depth, NodeRef *out_veto_node,
                       uint8_t *out_veto_dir, uint8_t *out_veto_kind,
                       uint8_t len_rlimit) {
-  if (len_rlimit == 0) len_rlimit = rlimit;
-  NodeRef cur = node(kRoot).child[0];
+  (void)rlimit;
+  (void)len_rlimit;
+  if (!shm_) return false;
+  NodeRef cur = at(kRoot).child[0];
   uint32_t walked = 0;
   EvalStats eval_stats;
   auto finish_profile = [&](unsigned outcome, uint32_t depth) {
@@ -776,7 +1195,7 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
   eval.Reset();
   while (true) {
     walked += 1;
-    const Node &current = node(cur);
+    const symafl::ShmNode &current = at(cur);
     if (debug_) {
       fprintf(stderr, "[eval] node=%u cid=%u skip=%u depth=%u cons=%d\n",
               cur, current.cid, current.skipCnt, current.depth,
@@ -805,9 +1224,9 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
     // Tautology: unique fixed direction (constant decision). Continue walk;
     // never whole-candidate admit. Legacy opaque is treated the same when
     // fixed_dir was recorded (should not remain after classify_inserted).
-    if (current.pred.tautology || current.pred.opaque) {
-      uint8_t dir = current.pred.tautology ? current.pred.fixed_dir : 0;
-      if (current.pred.tautology) check_follow_tautology += 1;
+    if (current.pred_tautology || current.pred_opaque) {
+      uint8_t dir = current.pred_tautology ? current.pred_fixed_dir : 0;
+      if (current.pred_tautology) check_follow_tautology += 1;
       else check_admit_opaque += 1;  // legacy residual path (should be ~0)
       NodeRef next = current.child[dir];
       if (next == kTerminal) {
@@ -824,27 +1243,15 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
       if (next == kUnexplored) {
         *out_node = cur;
         *out_dir = dir;
-        const uint8_t edge_rlimit = current.constraint && current.len_related
-                                         ? len_rlimit
-                                         : rlimit;
-        if (rlimit_unlimited_ || current.rCnt[dir] < edge_rlimit) {
-          check_admit_frontier += 1;
-          finish_profile(3, walked);
-          return true;
-        }
-        if (out_veto_depth) *out_veto_depth = current.depth;
-        if (out_veto_node) *out_veto_node = cur;
-        if (out_veto_dir) *out_veto_dir = dir;
-        if (out_veto_kind) *out_veto_kind = 1;
-        check_veto_rlimit += 1;
-        finish_profile(5, walked);
-        return false;
+        check_admit_frontier += 1;
+        finish_profile(3, walked);
+        return true;
       }
       cur = next;
       continue;
     }
     uint64_t v = 0;
-    if (!eval_predicate(pred_arena_, current.pred, input, len, &v, &eval,
+    if (!eval_predicate(pred_arena_, pred_from(current), input, len, &v, &eval,
                         profile_ ? &eval_stats : nullptr)) {
       *out_node = kUnexplored;
       *out_dir = 0;
@@ -878,75 +1285,52 @@ bool Tree::CheckInput(const uint8_t *input, uint32_t len, NodeRef *out_node,
     if (next == kUnexplored) {
       *out_node = cur;
       *out_dir = dir;
-      const uint8_t edge_rlimit = current.constraint && current.len_related
-                                       ? len_rlimit
-                                       : rlimit;
-      // rlimit-unlimited quality mode bypasses the retry budget entirely:
-      // every candidate that reaches an unexplored edge is admitted, so an
-      // exhausted rCnt can never mask a candidate's stream from the replay
-      // census (and saturation is decided by terminal closure alone).
-      if (rlimit_unlimited_ || current.rCnt[dir] < edge_rlimit) {
-        check_admit_frontier += 1;
-        finish_profile(3, walked);
-        return true;
-      }
-      if (out_veto_depth) *out_veto_depth = current.depth;
-      if (out_veto_node) *out_veto_node = cur;
-      if (out_veto_dir) *out_veto_dir = dir;
-      if (out_veto_kind) *out_veto_kind = 1;
-      check_veto_rlimit += 1;
-      finish_profile(5, walked);
-      return false;
+      check_admit_frontier += 1;
+      finish_profile(3, walked);
+      return true;
     }
     cur = next;
   }
 }
 
 void Tree::Dump(const char *path) const {
+  if (!shm_ || !path || !*path) return;
   FILE *f = fopen(path, "w");
   if (!f) return;
-  fprintf(f, "# pcbt tree dump v2\n");
-  fprintf(f, "# node cid depth skipCnt constraint unstable len_related child0 child1 rcnt0 rcnt1\n");
-  for (NodeRef ref = 0; ref < nodes_.size(); ++ref) {
-    const Node &n = node(ref);
-    fprintf(f, "%u %u %u %u %u %u %u %u %u %u %u\n", ref, n.cid,
+  fprintf(f, "# sedbt tree dump v2\n");
+  fprintf(f, "# node cid depth skipCnt constraint unstable len_related child0 child1\n");
+  for (NodeRef ref = 0; ref < live_n_; ++ref) {
+    const symafl::ShmNode &n = at(ref);
+    fprintf(f, "%u %u %u %u %u %u %u %u %u\n", ref, n.cid,
             n.depth, n.skipCnt, n.constraint ? 1 : 0, n.unstable ? 1 : 0,
-            n.len_related ? 1 : 0, n.child[0], n.child[1], n.rCnt[0],
-            n.rCnt[1]);
+            n.len_related ? 1 : 0, n.child[0], n.child[1]);
   }
   fclose(f);
 }
 
 bool Tree::IsSaturated(uint8_t rlimit, uint8_t len_rlimit) const {
   if (len_rlimit == 0) len_rlimit = rlimit;
-  NodeRef entry = node(kRoot).child[0];
+  NodeRef entry = at(kRoot).child[0];
   return entry != kUnexplored && IsSaturated(entry, rlimit, len_rlimit);
 }
 
 bool Tree::IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const {
-  const Node &current = node(ref);
+  (void)rlimit;
+  (void)len_rlimit;
+  const symafl::ShmNode &current = at(ref);
   if (current.unstable) return false;
   // Tautology has a single meaningful direction; the other edge is ignored.
-  if (current.pred.tautology) {
-    NodeRef next = current.child[current.pred.fixed_dir];
+  if (current.pred_tautology) {
+    NodeRef next = current.child[current.pred_fixed_dir];
     if (next == kTerminal) return true;
     if (next == kUnexplored) return false;
     return IsSaturated(next, rlimit, len_rlimit);
   }
-  if (current.pred.opaque) return false;
+  if (current.pred_opaque) return false;
   for (uint8_t direction = 0; direction != 2; ++direction) {
     NodeRef next = current.child[direction];
     if (next == kTerminal) continue;
-    if (next == kUnexplored) {
-      // With an unlimited retry budget an unexplored edge never saturates:
-      // only terminal closure (or unstable/opaque) can saturate the tree.
-      if (rlimit_unlimited_) return false;
-      const uint8_t edge_rlimit = current.constraint && current.len_related
-                                       ? len_rlimit
-                                       : rlimit;
-      if (current.rCnt[direction] < edge_rlimit) return false;
-      continue;
-    }
+    if (next == kUnexplored) return false;
     if (!IsSaturated(next, rlimit, len_rlimit)) return false;
   }
   return true;
@@ -957,7 +1341,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     uint32_t len) const {
   ReplayReport r;
 
-  NodeRef cur = node(kRoot).child[0];
+  NodeRef cur = at(kRoot).child[0];
   if (cur == kUnexplored) {
     r.tree_empty = true;
     return r;
@@ -978,7 +1362,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
       r.event_index = i;
       return false;
     }
-    const Node &current = node(cur);
+    const symafl::ShmNode &current = at(cur);
     // A constraint frame represents one multi-successor decision. The tree
     // may contain several constraint nodes at this same stream position as a
     // value-fork chain (case1 -> case2 -> ...). Reuse this one logical event
@@ -987,13 +1371,13 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     // by InsertTrace's prefix walk and CheckInput's predicate routing.
     if (ev.constraint) {
       while (true) {
-        const Node &constraint = node(cur);
+        const symafl::ShmNode &constraint = at(cur);
         uint64_t v = 0;
         uint8_t dir = ev.result ? 1 : 0;
-        if (constraint.pred.tautology) {
-          dir = constraint.pred.fixed_dir;
-        } else if (!constraint.pred.opaque &&
-                   eval_predicate(pred_arena_, constraint.pred, input, len, &v,
+        if (constraint.pred_tautology) {
+          dir = constraint.pred_fixed_dir;
+        } else if (!constraint.pred_opaque &&
+                   eval_predicate(pred_arena_, pred_from(constraint), input, len, &v,
                                   &eval)) {
           dir = v ? 1 : 0;
         }
@@ -1051,7 +1435,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
         // a value-fork continuation of this same multi-successor decision.
         // The true/pinned edge (dir-1) consumes this frame even when its
         // successor is itself a constraint node from the next wire frame.
-        if (dir == 0 && node(cur).constraint) continue;
+        if (dir == 0 && at(cur).constraint) continue;
         return true;
       }
     }
@@ -1061,8 +1445,8 @@ Tree::ReplayReport Tree::ReplayFullTrace(
     // child is unexplored: the event stream has already drifted at this node.
     // Tautology: follow fixed_dir (must match the stream event for a
     // consistent tree). Continue into the child like an ordinary step.
-    if (current.pred.tautology) {
-      uint8_t dir = current.pred.fixed_dir;
+    if (current.pred_tautology) {
+      uint8_t dir = current.pred_fixed_dir;
       if (current.cid != ev.cid) {
         if (is_dict_layout_cid_pair(current.cid, ev.cid)) {
           r.event_index = i;
@@ -1117,7 +1501,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
       cur = next;
       return true;
     }
-    if (current.pred.opaque) {
+    if (current.pred_opaque) {
       // Legacy residual: treat like tautology using stream direction.
       r.event_index = i;
       r.verified_events = logic - 1;
@@ -1128,7 +1512,7 @@ Tree::ReplayReport Tree::ReplayFullTrace(
       return false;
     }
     uint64_t v = 0;
-    if (!eval_predicate(pred_arena_, current.pred, input, len, &v, &eval)) {
+    if (!eval_predicate(pred_arena_, pred_from(current), input, len, &v, &eval)) {
       r.event_index = i;
       r.verified_events = logic - 1;
       r.reached_frontier = true;
@@ -1293,6 +1677,8 @@ bool build_closure(const PNode *preds, size_t n_preds, uint32_t trigger_root,
         }
       }
       if (!hit) continue;
+      // Constraint pins stay out of e (screening, not a path condition) but
+      // their input symbols still join s.
       if (M.usable)
         add_clause(&out->e, M.pred_root, (uint8_t)(M.taken_dir == 0 ? 1 : 0));
       union_offsets(&out->s, anc_s[i], &have, &work);
@@ -1334,35 +1720,43 @@ bool eval_e_use(const PredArena &arena, const AttachedClosure &c,
 
 void Tree::compute_closure(
     NodeRef n, const std::vector<std::pair<NodeRef, uint8_t>> &path) {
-  if (n < kRoot || n >= nodes_.size()) return;
-  Node &N = node(n);
-  if (N.rsan_bug_dir > 1 || N.pred.opaque) return;
+  if (n < kRoot || n >= live_n_) return;
+  symafl::ShmNode &N = at(n);
+  if (N.rsan_bug_dir > 1 || N.pred_opaque || N.clos_i) return;
   const uint8_t trigger_neg = (N.rsan_bug_dir == 0) ? 1 : 0;
+  std::vector<Closure> held;
+  held.reserve(path.size());
   std::vector<ClosureAncestor> ancs;
   for (const auto &pd : path) {
     if (pd.first == n) break;
-    if (pd.first < kRoot || pd.first >= nodes_.size()) continue;
-    const Node &M = node(pd.first);
+    if (pd.first < kRoot || pd.first >= live_n_) continue;
+    const symafl::ShmNode &M = at(pd.first);
     ClosureAncestor a;
-    a.pred_root = M.pred.root;
+    a.pred_root = M.pred_root;
     a.taken_dir = pd.second;
     a.rsan_bug_dir = M.rsan_bug_dir;
-    a.trigger_neg = M.closure.present ? M.closure.trigger_neg
-                                      : (uint8_t)((M.rsan_bug_dir == 0) ? 1 : 0);
-    a.usable = !M.pred.opaque && !M.pred.tautology && !M.constraint;
-    a.cached = M.closure.present ? &M.closure : nullptr;
+    a.usable = !M.pred_opaque && !M.pred_tautology && !M.constraint;
+    a.cached = nullptr;
+    a.trigger_neg = (uint8_t)((M.rsan_bug_dir == 0) ? 1 : 0);
+    if (M.clos_i) {
+      held.push_back(closure_of(pd.first));
+      a.cached = &held.back();
+      a.trigger_neg = held.back().trigger_neg;
+    }
     ancs.push_back(a);
   }
+  Closure out;
   build_closure(pred_arena_.nodes.data(), pred_arena_.nodes.size(),
-                N.pred.root, trigger_neg, ancs, &N.closure);
+                N.pred_root, trigger_neg, ancs, &out);
+  if (out.present) publish_one_closure(out, n);
 }
 
 void Tree::finalize_closures(NodeRef tail, uint8_t tail_dir) {
-  if (tail < kRoot || tail >= nodes_.size()) return;
+  if (!compute_closures_ || tail < kRoot || tail >= live_n_) return;
   std::vector<NodeRef> chain;
-  for (NodeRef x = tail; x >= kRoot && x < nodes_.size(); x = node(x).parent) {
+  for (NodeRef x = tail; x >= kRoot && x < live_n_; x = at(x).parent) {
     chain.push_back(x);
-    if (x == kRoot || node(x).parent == x) break;
+    if (x == kRoot || at(x).parent == x) break;
   }
   std::reverse(chain.begin(), chain.end());
   std::vector<std::pair<NodeRef, uint8_t>> path;
@@ -1371,13 +1765,13 @@ void Tree::finalize_closures(NodeRef tail, uint8_t tail_dir) {
     if (chain[i] == kRoot) continue;
     uint8_t d = tail_dir;
     if (i + 1 < chain.size())
-      d = (node(chain[i]).child[1] == chain[i + 1]) ? 1 : 0;
+      d = (at(chain[i]).child[1] == chain[i + 1]) ? 1 : 0;
     path.emplace_back(chain[i], d);
   }
   for (size_t i = 0; i < path.size(); ++i) {
     NodeRef n = path[i].first;
-    if (node(n).rsan_bug_dir > 1) continue;
-    if (node(n).closure.present) continue;
+    if (at(n).rsan_bug_dir > 1) continue;
+    if (at(n).clos_i) continue;
     std::vector<std::pair<NodeRef, uint8_t>> prefix(path.begin(),
                                                     path.begin() + i + 1);
     compute_closure(n, prefix);
@@ -1388,32 +1782,35 @@ void Tree::collect_bug_closures(const uint8_t *input, uint32_t len,
                                std::vector<AttachedClosure> *out) const {
   if (!out) return;
   out->clear();
-  NodeRef cur = node(kRoot).child[0];
+  NodeRef cur = at(kRoot).child[0];
   if (cur == kUnexplored || cur == kTerminal) return;
   EvalContext eval;
   eval.Reset();
-  while (cur >= kRoot && cur < nodes_.size()) {
-    const Node &n = node(cur);
+  while (cur >= kRoot && cur < live_n_) {
+    const symafl::ShmNode &n = at(cur);
     if (n.unstable) return;
     uint8_t dir = 0;
-    if (n.pred.tautology || n.pred.opaque) {
-      dir = n.pred.tautology ? n.pred.fixed_dir : 0;
+    if (n.pred_tautology || n.pred_opaque) {
+      dir = n.pred_tautology ? n.pred_fixed_dir : 0;
     } else {
       uint64_t v = 0;
-      if (!eval_predicate(pred_arena_, n.pred, input, len, &v, &eval)) return;
+      if (!eval_predicate(pred_arena_, pred_from(n), input, len, &v, &eval)) return;
       dir = v ? 1 : 0;
     }
     if (n.rsan_bug_dir <= 1) {
       NodeRef bug = n.child[n.rsan_bug_dir];
-      if (bug == kUnexplored && n.closure.present) {
-        AttachedClosure a;
-        a.node = cur;
-        a.bug_dir = n.rsan_bug_dir;
-        a.trigger_neg = n.closure.trigger_neg;
-        a.trigger_root = n.pred.root;
-        a.s = n.closure.s;
-        a.e = n.closure.e;
-        out->push_back(std::move(a));
+      if (bug == kUnexplored && n.clos_i) {
+        const Closure &cl = closure_of(cur);
+        if (cl.present) {
+          AttachedClosure a;
+          a.node = cur;
+          a.bug_dir = n.rsan_bug_dir;
+          a.trigger_neg = cl.trigger_neg;
+          a.trigger_root = n.pred_root;
+          a.s = cl.s;
+          a.e = cl.e;
+          out->push_back(std::move(a));
+        }
       }
     }
     NodeRef next = n.child[dir];
@@ -1427,4 +1824,4 @@ bool Tree::eval_attached(const AttachedClosure &c, const uint8_t *input,
   return eval_e_use(pred_arena_, c, input, len);
 }
 
-}  // namespace pcbt
+}  // namespace sedbt

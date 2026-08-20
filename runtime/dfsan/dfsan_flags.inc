@@ -54,9 +54,9 @@ DFSAN_FLAG(const char *, pipe_name, "", "communication pipe filename.")
 DFSAN_FLAG(int, control_pipe_fd, -1, "control pipe fd.")
 DFSAN_FLAG(const char *, control_pipe_name, "", "control pipe filename.")
 DFSAN_FLAG(bool, trace_bounds, false, "trace bounds info.")
-// SymAFL/PCBT: never return freed blocks to the libc freelist. Address reuse
+// SymAFL/SEDBT: never return freed blocks to the libc freelist. Address reuse
 // makes dict/pool/hash-chain layout depend on free order rather than on the
-// input alone, which poisons PCBT event order (libxml2 cid_mismatch class).
+// input alone, which poisons SEDBT event order (libxml2 cid_mismatch class).
 // Default on; set no_reuse_heap=false to restore stock free/realloc. Child
 // processes exit after one run under the forkserver, so arena growth is bounded
 // by a single execution. Compatible with (and weaker than) trace_bounds.
@@ -77,5 +77,5 @@ DFSAN_FLAG(int, string_map_capacity, 256, "initial capacity for string label map
 DFSAN_FLAG(bool, taint_trace_addr_cond, true,
            "SymAFL v2: emit equality constraints for tainted pointer indexes "
            "(GEP __taint_trace_gep) and tainted indirect-call/indirectbr "
-           "targets (__taint_trace_indcall), so the PCBT diverges when a "
+           "targets (__taint_trace_indcall), so the SEDBT diverges when a "
            "mutated input selects a different array element or jump target.")

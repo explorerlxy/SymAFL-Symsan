@@ -1,11 +1,11 @@
-// Self-contained branch predicates for SymAFL v2 PCBT screening.
+// Self-contained branch predicates for SymAFL v2 SEDBT screening.
 //
 // Tree owns one PredArena for its lifetime. RunConverter converts one traced
 // run into that shared post-order PNode array and memoizes only that run's
 // union-table labels. A Predicate is a root index into the tree arena, so
 // nodes do not retain a per-trace shared_ptr or duplicate expression views.
 //
-// The PCBT condition grammar is the scalar integer bit-vector subset emitted
+// The SEDBT condition grammar is the scalar integer bit-vector subset emitted
 // by the target preflight.  Conversion is iterative and total for that
 // grammar; a condition outside it is rejected by preflight rather than given
 // an invented branch result.
@@ -23,7 +23,7 @@
 
 #include "dfsan/dfsan.h"
 
-namespace pcbt {
+namespace sedbt {
 
 enum class PKind : uint8_t {
   Opaque = 0,
@@ -61,7 +61,7 @@ enum class PKind : uint8_t {
 
 // A conversion failure is never a predicate result.  It is retained as
 // aggregate telemetry so supported-condition coverage can be audited without
-// inflating every PCBT node.
+// inflating every SEDBT node.
 enum class PredError : uint8_t {
   None = 0,
   InvalidRoot,
@@ -213,7 +213,7 @@ class RunConverter {
   uint32_t fp_total_order(uint32_t a, uint16_t w);
 };
 
-// A context shares values across root evaluations for one candidate.  PCBT
+// A context shares values across root evaluations for one candidate.  SEDBT
 // paths created from a single trace share PNodes, so this avoids re-evaluating
 // their common expression DAG at every depth.
 struct EvalStats;
@@ -292,4 +292,4 @@ bool eval_clause(const PredArena &arena, uint32_t pred_root, uint8_t negated,
                  const uint8_t *input, uint32_t len,
                  EvalContext *context = nullptr);
 
-}  // namespace pcbt
+}  // namespace sedbt

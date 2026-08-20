@@ -55,4 +55,9 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
                                   uint8_t add_nested, uint8_t loop_flag,
                                   uint32_t cid, void *addr);
 
+// Mark the next __taint_send_cond as a tainted-GEP-index pin (F_GEP_PIN).
+// Call immediately before the GEP equality send_cond; the flag is consumed
+// once. Indcall / read-length ConstraintFlag events must not set this.
+extern "C" void __taint_mark_next_cond_gep_pin();
+
 #endif // SOLVER_COMMON_H

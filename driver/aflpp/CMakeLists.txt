@@ -16,7 +16,7 @@ if (NOT IS_DIRECTORY "${AFLPP_PATH}/include")
 endif()
 
 add_library(SymSanMutator SHARED
-  symsan.cpp pcbt.cpp pred.cpp shm_sedbt.cpp worker_client.cpp)
+  symsan.cpp sedbt.cpp pred.cpp shm_sedbt.cpp analyzer_client.cpp)
 target_include_directories(SymSanMutator PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include
@@ -26,18 +26,18 @@ target_link_libraries(SymSanMutator
   rt
 )
 
-add_executable(symafl-worker
-  symafl_worker.cpp shm_sedbt.cpp pcbt.cpp pred.cpp)
-target_include_directories(symafl-worker PRIVATE
+add_executable(symafl-analyzer
+  symafl_analyzer.cpp shm_sedbt.cpp sedbt.cpp pred.cpp)
+target_include_directories(symafl-analyzer PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include
 )
-target_compile_features(symafl-worker PRIVATE cxx_std_17)
-target_link_libraries(symafl-worker rt)
-add_custom_command(TARGET symafl-worker POST_BUILD
+target_compile_features(symafl-analyzer PRIVATE cxx_std_17)
+target_link_libraries(symafl-analyzer rt)
+add_custom_command(TARGET symafl-analyzer POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory
           "${CMAKE_INSTALL_PREFIX}/${SYMSAN_BIN_DIR}"
-  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:symafl-worker>
+  COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:symafl-analyzer>
           "${CMAKE_INSTALL_PREFIX}/${SYMSAN_BIN_DIR}/")
 add_custom_command(TARGET SymSanMutator POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory
@@ -50,5 +50,5 @@ if (ASAN_BUILD)
   )
 endif()
 
-install (TARGETS symafl-worker DESTINATION ${SYMSAN_BIN_DIR})
+install (TARGETS symafl-analyzer DESTINATION ${SYMSAN_BIN_DIR})
 install (TARGETS SymSanMutator DESTINATION ${SYMSAN_BIN_DIR})

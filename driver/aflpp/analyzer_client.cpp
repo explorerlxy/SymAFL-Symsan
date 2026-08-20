@@ -1,4 +1,4 @@
-#include "worker_client.hpp"
+#include "analyzer_client.hpp"
 
 #include <errno.h>
 #include <sys/mman.h>
@@ -46,7 +46,7 @@ bool recv_hdr(int fd, symafl::CtrlHdr *h) {
 
 }  // namespace
 
-bool worker_connect(WorkerClient *c, const char *sock_path) {
+bool analyzer_connect(AnalyzerClient *c, const char *sock_path) {
   snprintf(c->cand_name, sizeof(c->cand_name), "/symafl-cand-%d", getpid());
   int cfd = -1;
   c->cand = (symafl::CandArena *)symafl::create_shm(
@@ -80,12 +80,22 @@ bool worker_connect(WorkerClient *c, const char *sock_path) {
   c->ring = (symafl::FuzzerRing *)symafl::open_shm(ok.ring_name,
                                                   sizeof(symafl::FuzzerRing),
                                                   &fd);
-  fprintf(stderr, "[pcbt] worker hello-ok id=%u tree=%s ring=%s cand=%s\n",
+  fprintf(stderr, "[sedbt] analyzer hello-ok id=%u tree=%s ring=%s cand=%s\n",
           c->fuzzer_id, ok.tree_name, ok.ring_name, c->cand_name);
-  return c->tree && c->ring && c->cand;
+  if (!c->tree || !c->ring || !c->cand) return false;
+  if (c->tree->hdr.magic != symafl::kIpcMagic ||
+      c->tree->hdr.version != symafl::kIpcVersion) {
+    fprintf(stderr,
+            "[sedbt] SEDBT SHM layout mismatch magic=0x%x version=%u "
+            "(want 0x%x / %u); rebuild analyzer and mutator together\n",
+            c->tree->hdr.magic, c->tree->hdr.version, symafl::kIpcMagic,
+            symafl::kIpcVersion);
+    return false;
+  }
+  return true;
 }
 
-bool worker_wait_tree_ready(WorkerClient *c) {
+bool analyzer_wait_tree_ready(AnalyzerClient *c) {
   if (!c || c->sock < 0) return false;
   symafl::CtrlHdr h{};
   if (!recv_hdr(c->sock, &h)) return false;
@@ -97,11 +107,11 @@ bool worker_wait_tree_ready(WorkerClient *c) {
   return c->ready;
 }
 
-bool worker_ack(WorkerClient *c) {
+bool analyzer_ack(AnalyzerClient *c) {
   return c && send_hdr(c->sock, symafl::kBootstrapAck, 0, nullptr);
 }
 
-bool worker_wait_done(WorkerClient *c) {
+bool analyzer_wait_done(AnalyzerClient *c) {
   symafl::CtrlHdr h{};
   if (!recv_hdr(c->sock, &h)) return false;
   if (h.nbytes) {
@@ -111,7 +121,7 @@ bool worker_wait_done(WorkerClient *c) {
   return h.type == symafl::kBootstrapDone;
 }
 
-bool worker_submit(WorkerClient *c, uint32_t frontier, uint8_t dir,
+bool analyzer_submit(AnalyzerClient *c, uint32_t frontier, uint8_t dir,
                    uint32_t skip_cnt, const uint8_t *buf, uint32_t len) {
   if (!c || !c->ring || !c->cand || len > symafl::kCandMax) return false;
   uint64_t head = c->ring->head.v.load(std::memory_order_acquire);
@@ -132,17 +142,36 @@ bool worker_submit(WorkerClient *c, uint32_t frontier, uint8_t dir,
   return true;
 }
 
-symafl::WalkResult worker_check(WorkerClient *c, const uint8_t *buf,
+symafl::WalkResult analyzer_check(AnalyzerClient *c, const uint8_t *buf,
                                 uint32_t len) {
   if (!c || !c->tree) {
     symafl::WalkResult r{};
-    r.learned = symafl::kWalkFail;
+    r.learned = symafl::kWalkFailKind;
     return r;
   }
   return symafl::check_input(c->tree, buf, len);
 }
 
-void worker_close(WorkerClient *c) {
+symafl::WalkResult analyzer_check_suffix(AnalyzerClient *c, const uint8_t *buf,
+                                         uint32_t len, uint32_t frontier,
+                                         uint8_t dir) {
+  if (!c || !c->tree) {
+    symafl::WalkResult r{};
+    r.learned = symafl::kWalkFailKind;
+    return r;
+  }
+  return symafl::check_suffix(c->tree, buf, len, frontier, dir);
+}
+
+bool analyzer_close_bug_edge(AnalyzerClient *c, uint32_t node, uint8_t dir) {
+  if (!c || c->sock < 0 || dir > 1) return false;
+  symafl::CloseBugBody b{};
+  b.node = node;
+  b.dir = dir;
+  return send_hdr(c->sock, symafl::kCloseBugEdge, sizeof(b), &b);
+}
+
+void analyzer_close(AnalyzerClient *c) {
   if (!c) return;
   if (c->sock >= 0) {
     close(c->sock);

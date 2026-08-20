@@ -12,7 +12,7 @@
 
 using namespace __dfsan;
 
-namespace pcbt {
+namespace sedbt {
 
 namespace {
 constexpr uint32_t kNoChild = UINT32_MAX;
@@ -412,7 +412,7 @@ uint32_t RunConverter::convert(uint32_t label) {
       if (getenv("SYMAFL_PRED_FORENSICS") && forensic_reports < 64) {
         ++forensic_reports;
         fprintf(stderr,
-                "[pcbt-pred-forensic] error=%s error_op=%u root=%u "
+                "[sedbt-pred-forensic] error=%s error_op=%u root=%u "
                 "root_op=%u root_size=%u root_l1=%u root_l2=%u "
                 "label=%u op=%u size=%u l1=%u l2=%u op1=%llu op2=%llu\n",
                 pred_error_name(error_), error_op_, root_label_,
@@ -426,7 +426,7 @@ uint32_t RunConverter::convert(uint32_t label) {
         for (dfsan_label child : {info->l1, info->l2}) {
           if (child != 0 && child < table_labels_)
             fprintf(stderr,
-                    "[pcbt-pred-forensic] child=%u op=%u size=%u l1=%u l2=%u "
+                    "[sedbt-pred-forensic] child=%u op=%u size=%u l1=%u l2=%u "
                     "op1=%llu op2=%llu\n",
                     child, table_[child].op, table_[child].size,
                     table_[child].l1, table_[child].l2,
@@ -442,7 +442,7 @@ uint32_t RunConverter::convert(uint32_t label) {
           uint32_t l2_op = trace.l2 != 0 && trace.l2 < table_labels_
                                ? table_[trace.l2].op : 0;
           fprintf(stderr,
-                  "[pcbt-pred-forensic] path depth=%u label=%u op=%u size=%u "
+                  "[sedbt-pred-forensic] path depth=%u label=%u op=%u size=%u "
                   "l1=%u(lop=%u) l2=%u(lop=%u)\n",
                   depth, cursor, trace.op, trace.size, trace.l1, l1_op,
                   trace.l2, l2_op);
@@ -475,7 +475,7 @@ uint32_t RunConverter::convert_slice(dfsan_label label, uint64_t cval,
       width > static_cast<uint64_t>(label_bits) - offset) {
     if (getenv("SYMAFL_PRED_FORENSICS"))
       fprintf(stderr,
-              "[pcbt-pred-slice] label=%u op=%u label_bits=%u offset=%llu "
+              "[sedbt-pred-slice] label=%u op=%u label_bits=%u offset=%llu "
               "width=%u cval=%llu\n",
               label, label < table_labels_ ? table_[label].op : 0,
               label_bits, (unsigned long long)offset, width,
@@ -596,7 +596,7 @@ uint32_t RunConverter::convert_slice(dfsan_label label, uint64_t cval,
           width > static_cast<uint64_t>(table_[child].size) - slice_offset) {
         if (getenv("SYMAFL_PRED_FORENSICS"))
           fprintf(stderr,
-                  "[pcbt-pred-slice] scalar-extract label=%u op=%u child=%u "
+                  "[sedbt-pred-slice] scalar-extract label=%u op=%u child=%u "
                   "child_bits=%u child_offset=%llu offset=%llu width=%u\n",
                   label, op, child, table_[child].size,
                   (unsigned long long)child_offset,
@@ -713,7 +713,7 @@ uint32_t RunConverter::convert_op(const dfsan_label_info *info, uint32_t op,
 
   // Pointer-to-integer conversion preserves the 64-bit pointer value. The
   // runtime child already models the absolute pointer expression, so an
-  // identity conversion is both exact and sufficient for scalar PCBT.
+  // identity conversion is both exact and sufficient for scalar SEDBT.
   if (op_lo == PtrToInt) {
     uint32_t child = conv_child(info->l1 ? info->l1 : info->l2,
                                 info->l1 ? info->op1.i : info->op2.i,
@@ -2898,4 +2898,4 @@ bool eval_clause(const PredArena &arena, uint32_t pred_root, uint8_t negated,
                      negated, input, len, context);
 }
 
-}  // namespace pcbt
+}  // namespace sedbt

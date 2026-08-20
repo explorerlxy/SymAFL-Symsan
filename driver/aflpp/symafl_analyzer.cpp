@@ -1,7 +1,7 @@
-// symafl-worker: ADR 0010. Owns SEDBT + concolic exec. --fuzzers N (default 1).
-#include "pcbt.hpp"
+// symafl-analyzer: ADR 0010. Owns SEDBT + concolic exec. --fuzzers N (default 1).
+#include "sedbt.hpp"
 #include "shm_sedbt.hpp"
-#include "worker_ipc.hpp"
+#include "analyzer_ipc.hpp"
 
 #include "dfsan/dfsan.h"
 
@@ -29,7 +29,7 @@ using namespace __dfsan;
 static volatile sig_atomic_t g_stop;
 static void on_stop(int) { g_stop = 1; }
 
-// Worker fork/exec is not the 48GiB mutator union table. Toy/W1 fits in 256MiB.
+// Analyzer fork/exec is not the 48GiB mutator union table. Toy/W1 fits in 256MiB.
 static const size_t kWorkerUnionBytes = 256ull << 20;
 
 static bool send_all(int fd, const void *p, size_t n) {
@@ -62,7 +62,7 @@ static bool send_msg(int fd, uint32_t type, uint32_t nbytes, const void *body) {
 }
 
 static bool decode_full_stream(const uint8_t *wire, size_t wire_size,
-                               std::vector<pcbt::Event> *events) {
+                               std::vector<sedbt::Event> *events) {
   size_t offset = 0;
   while (offset < wire_size) {
     if (wire_size - offset < sizeof(pipe_msg)) return false;
@@ -71,8 +71,20 @@ static bool decode_full_stream(const uint8_t *wire, size_t wire_size,
     offset += sizeof(msg);
     if (msg.msg_type == cond_type) {
       if (msg.label == 0 || msg.label == kInitializingLabel) continue;
-      events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0),
-                         (uint8_t)((msg.flags & F_CONSTRAINT) ? 1 : 0), 1,
+      uint8_t cons = 0;
+      if (msg.flags & F_CONSTRAINT) {
+        cons = sedbt::kConstraintPin;
+        if (msg.flags & F_GEP_PIN) {
+          cons = sedbt::kConstraintGep;
+        } else if (wire_size - offset >= sizeof(pipe_msg)) {
+          // Old Fastgen runtimes (build16 dual) emit GEP pins as
+          // F_CONSTRAINT only; the GEP metadata record follows immediately.
+          pipe_msg nxt;
+          memcpy(&nxt, wire + offset, sizeof(nxt));
+          if (nxt.msg_type == gep_type) cons = sedbt::kConstraintGep;
+        }
+      }
+      events->push_back({msg.id, msg.label, (uint8_t)(msg.result != 0), cons, 1,
                          (uint8_t)((msg.flags & F_RSAN_CHECK)
                                        ? ((msg.flags & F_RSAN_BUG_DIR) ? 1 : 0)
                                        : 0xff)});
@@ -136,7 +148,7 @@ struct Concolic {
 static bool concolic_init(Concolic *c) {
   snprintf(c->union_name, sizeof(c->union_name), "/symafl-wunion-%d", getpid());
   snprintf(c->cur_path, sizeof(c->cur_path),
-           "/home/hahafish/symafl2-work/symafl-worker-%d.cur", getpid());
+           "/home/hahafish/symafl2-work/symafl-analyzer-%d.cur", getpid());
   shm_unlink(c->union_name);
   c->union_fd = shm_open(c->union_name, O_RDWR | O_CREAT | O_EXCL, 0600);
   if (c->union_fd < 0) return false;
@@ -148,7 +160,7 @@ static bool concolic_init(Concolic *c) {
 
 static bool run_concolic(Concolic *c, const char *bin, const uint8_t *buf,
                          uint32_t len, uint32_t skip,
-                         std::vector<pcbt::Event> *events) {
+                         std::vector<sedbt::Event> *events) {
   FILE *tf = fopen(c->cur_path, "wb");
   if (!tf) return false;
   if (len && fwrite(buf, 1, len, tf) != len) {
@@ -208,7 +220,7 @@ int main(int argc, char **argv) {
   if (!sock_path || !seeds || !concolic || n_fuzzers < 1 ||
       n_fuzzers > kMaxFuzzers) {
     fprintf(stderr,
-            "usage: symafl-worker --sock PATH --seeds DIR --concolic BIN "
+            "usage: symafl-analyzer --sock PATH --seeds DIR --concolic BIN "
             "[--fuzzers N]\n");
     return 2;
   }
@@ -218,7 +230,7 @@ int main(int argc, char **argv) {
   int tfd = -1;
   auto *tree_shm = (SedbtShm *)create_shm(tree_name, sizeof(SedbtShm), &tfd);
   if (!tree_shm) {
-    fprintf(stderr, "[worker] tree shm create failed\n");
+    fprintf(stderr, "[analyzer] tree shm create failed\n");
     return 1;
   }
   tree_shm->hdr.magic = kIpcMagic;
@@ -227,9 +239,16 @@ int main(int argc, char **argv) {
   tree_shm->hdr.pred_cap = kPredCap;
   tree_shm->hdr.s_cap = kSCap;
   tree_shm->hdr.e_cap = kECap;
+  tree_shm->hdr.clos_cap = kClosCap;
 
-  pcbt::Tree tree;
-  publish_tree(tree_shm, tree);
+  sedbt::Tree tree(nullptr);
+  tree.attach(tree_shm);
+  tree.apply_mut_compute_env();
+  fprintf(stderr, "[analyzer] compute path_s=%s closure=%s "
+          "(SYMAFL_MUT_PATH_S=0/off binds constraint offsets root→terminal; "
+          "suffix|full also bind mutation symbols; CLOSURE 0 skips)\n",
+          sedbt::path_s_mode_name(tree.path_s_mode()),
+          tree.compute_closures() ? "on" : "off");
 
   unlink(sock_path);
   int ls = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -241,7 +260,7 @@ int main(int argc, char **argv) {
     perror("bind/listen");
     return 1;
   }
-  fprintf(stderr, "[worker] listen %s fuzzers=%u\n", sock_path, n_fuzzers);
+  fprintf(stderr, "[analyzer] listen %s fuzzers=%u\n", sock_path, n_fuzzers);
 
   struct Client {
     int sock = -1;
@@ -272,7 +291,7 @@ int main(int argc, char **argv) {
              i);
     c.ring = (FuzzerRing *)create_shm(c.ring_name, sizeof(FuzzerRing), &rfd);
     if (!c.cand || !c.ring) {
-      fprintf(stderr, "[worker] map ring/cand failed id=%u cand=%s\n", i,
+      fprintf(stderr, "[analyzer] map ring/cand failed id=%u cand=%s\n", i,
               hello.cand_name);
       return 1;
     }
@@ -281,29 +300,30 @@ int main(int argc, char **argv) {
     snprintf(ok.tree_name, sizeof(ok.tree_name), "%s", tree_name);
     snprintf(ok.ring_name, sizeof(ok.ring_name), "%s", c.ring_name);
     if (!send_msg(fsock, kHelloOk, sizeof(ok), &ok)) return 1;
-    fprintf(stderr, "[worker] hello id=%u cand=%s ring=%s\n", i, hello.cand_name,
+    fprintf(stderr, "[analyzer] hello id=%u cand=%s ring=%s\n", i, hello.cand_name,
             c.ring_name);
   }
 
   Concolic co{};
   if (!concolic_init(&co)) {
-    fprintf(stderr, "[worker] concolic shm failed\n");
+    fprintf(stderr, "[analyzer] concolic shm failed\n");
     return 1;
   }
   const size_t max_label = kWorkerUnionBytes / sizeof(dfsan_label_info);
   for (const std::string &sp : list_seeds(seeds)) {
     std::vector<uint8_t> buf;
     if (!read_file(sp.c_str(), &buf)) continue;
-    std::vector<pcbt::Event> ev;
+    std::vector<sedbt::Event> ev;
     if (!run_concolic(&co, concolic, buf.data(), (uint32_t)buf.size(), 0,
                       &ev)) {
-      fprintf(stderr, "[worker] concolic fail %s\n", sp.c_str());
+      fprintf(stderr, "[analyzer] concolic fail %s\n", sp.c_str());
       continue;
     }
+    sedbt::NodeRef tail = sedbt::kUnexplored;
+    uint8_t tdir = 0;
     tree.InsertTrace(ev, co.labels, max_label, buf.data(),
-                     (uint32_t)buf.size());
-    publish_tree(tree_shm, tree);
-    fprintf(stderr, "[worker] bootstrap %s events=%zu nodes=%u\n", sp.c_str(),
+                     (uint32_t)buf.size(), &tail, &tdir);
+    fprintf(stderr, "[analyzer] bootstrap %s events=%zu nodes=%u\n", sp.c_str(),
             ev.size(), tree.live_nodes());
   }
   for (auto &c : clients) {
@@ -327,7 +347,7 @@ int main(int argc, char **argv) {
       CtrlHdr h{};
       if (!recv_all(clients[i].sock, &h, sizeof(h)) ||
           h.type != kBootstrapAck) {
-        fprintf(stderr, "[worker] ACK failed id=%u\n", i);
+        fprintf(stderr, "[analyzer] ACK failed id=%u\n", i);
         return 1;
       }
       if (h.nbytes) {
@@ -336,14 +356,14 @@ int main(int argc, char **argv) {
       }
       clients[i].acked = true;
       n_ack++;
-      fprintf(stderr, "[worker] ack id=%u (%u/%u)\n", i, n_ack, n_fuzzers);
+      fprintf(stderr, "[analyzer] ack id=%u (%u/%u)\n", i, n_ack, n_fuzzers);
     }
   }
   for (auto &c : clients) {
     if (!send_msg(c.sock, kBootstrapDone, 0, nullptr)) return 1;
     fcntl(c.sock, F_SETFL, O_NONBLOCK);
   }
-  fprintf(stderr, "[worker] BOOTSTRAP_DONE; polling\n");
+  fprintf(stderr, "[analyzer] BOOTSTRAP_DONE; polling\n");
 
   signal(SIGINT, on_stop);
   signal(SIGTERM, on_stop);
@@ -357,10 +377,32 @@ int main(int argc, char **argv) {
       if (c.sock < 0) continue;
       CtrlHdr ch{};
       ssize_t n = recv(c.sock, &ch, sizeof(ch), MSG_DONTWAIT);
+      if (n < 0) {
+        alive++;
+        continue;
+      }
       if (n == 0 || (n == (ssize_t)sizeof(ch) && ch.type == kShutdown)) {
         close(c.sock);
         c.sock = -1;
         continue;
+      }
+      if (n == (ssize_t)sizeof(ch) && ch.type == kCloseBugEdge) {
+        CloseBugBody b{};
+        if (ch.nbytes != sizeof(b) || !recv_all(c.sock, &b, sizeof(b))) {
+          close(c.sock);
+          c.sock = -1;
+          continue;
+        }
+        if (tree.CloseUnexplored((sedbt::NodeRef)b.node, b.dir)) {
+          fprintf(stderr, "[analyzer] close-bug node=%u dir=%u\n", b.node,
+                  b.dir);
+        }
+        alive++;
+        continue;
+      }
+      if (n == (ssize_t)sizeof(ch) && ch.nbytes) {
+        std::string junk(ch.nbytes, '\0');
+        recv_all(c.sock, junk.data(), ch.nbytes);
       }
       alive++;
     }
@@ -379,33 +421,48 @@ int main(int argc, char **argv) {
       rr = i + 1;
       did = true;
       jobs[i] += 1;
-      fprintf(stderr, "[worker] job fuzzer=%u frontier=%u dir=%u\n", i,
+      fprintf(stderr, "[analyzer] job fuzzer=%u frontier=%u dir=%u\n", i,
               job.frontier, job.dir);
       uint32_t clen =
           c.cand->slots[job.cand_idx].len.load(std::memory_order_acquire);
       if (clen == 0 || clen > kCandMax) break;
       const uint8_t *cbuf = c.cand->slots[job.cand_idx].bytes;
-      uint32_t live_child = tree.child((pcbt::NodeRef)job.frontier, job.dir);
-      uint32_t live_skip = tree.skip_for((pcbt::NodeRef)job.frontier, job.dir);
-      if (live_child != pcbt::kUnexplored || live_skip != job.skip_cnt) {
-        fprintf(stderr, "[worker] drop fuzzer=%u frontier=%u dir=%u\n", i,
-                job.frontier, job.dir);
+      auto hit = tree.CheckSuffix((sedbt::NodeRef)job.frontier, job.dir, cbuf,
+                                  clen);
+      if (hit.kind != sedbt::Tree::SuffixKind::Frontier) {
+        fprintf(stderr, "[analyzer] drop fuzzer=%u frontier=%u dir=%u kind=%u\n",
+                i, job.frontier, job.dir, (unsigned)hit.kind);
         break;
       }
-      std::vector<pcbt::Event> ev;
-      if (!run_concolic(&co, concolic, cbuf, clen, job.skip_cnt, &ev)) break;
-      tree.InsertSuffix((pcbt::NodeRef)job.frontier, job.dir, ev, co.labels,
-                        max_label, cbuf, clen);
-      publish_tree(tree_shm, tree);
+      if (hit.frontier != job.frontier || hit.dir != job.dir) {
+        fprintf(stderr,
+                "[analyzer] retarget fuzzer=%u %u/%u -> %u/%u skip=%u\n", i,
+                job.frontier, job.dir, hit.frontier, hit.dir, hit.skip_cnt);
+      }
+      std::vector<sedbt::Event> ev;
+      if (!run_concolic(&co, concolic, cbuf, clen, hit.skip_cnt, &ev)) break;
+      sedbt::NodeRef path_tail = sedbt::kUnexplored;
+      uint8_t tdir = 0;
+      // Path-s binds at hit.(frontier,dir), which may be deeper than
+      // job.(frontier,dir). The closed edge stores that bind site
+      // (term_front/term_fdir) so the fuzzer's later CheckSuffix-to-terminal
+      // can adopt it; the LearnJob fields themselves are not rewritten.
+      tree.InsertSuffix(hit.frontier, hit.dir, ev, co.labels, max_label, cbuf,
+                        clen, &path_tail, &tdir);
       fprintf(stderr,
-              "[worker] suffix fuzzer=%u frontier=%u dir=%u events=%zu "
+              "[analyzer] suffix fuzzer=%u frontier=%u dir=%u events=%zu "
               "nodes=%u\n",
-              i, job.frontier, job.dir, ev.size(), tree.live_nodes());
+              i, hit.frontier, hit.dir, ev.size(), tree.live_nodes());
       break;
     }
     if (!did) __builtin_ia32_pause();
   }
   for (uint32_t i = 0; i < n_fuzzers; ++i)
-    fprintf(stderr, "[worker] jobs fuzzer=%u n=%u\n", i, jobs[i]);
+    fprintf(stderr, "[analyzer] jobs fuzzer=%u n=%u\n", i, jobs[i]);
+  if (const char *dump = getenv("SYMAFL_TREE_DUMP")) {
+    tree.Dump(dump);
+    fprintf(stderr, "[analyzer] tree dump -> %s nodes=%u\n", dump,
+            tree.live_nodes());
+  }
   return 0;
 }

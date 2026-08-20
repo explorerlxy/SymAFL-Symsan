@@ -3959,7 +3959,7 @@ void TaintVisitor::visitIndirectBrInst(IndirectBrInst &IBR) {
   // A tainted indirect-branch target (computed goto / jump table dispatch)
   // means control flow itself depends on the input. Pin it to its observed
   // concrete address via the same equality-constraint trace used for
-  // indirect calls, so the PCBT diverges when a mutated input changes target.
+  // indirect calls, so the SEDBT diverges when a mutated input changes target.
   Value *Target = IBR.getAddress();
   Value *Shadow = TF.getShadow(Target);
   if (TF.TT.isZeroShadow(Shadow)) return;

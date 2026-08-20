@@ -9,176 +9,329 @@
 
 namespace symafl {
 
-void pack_node(const pcbt::Tree &tree, pcbt::NodeRef ref, ShmNode *out) {
-  const pcbt::Node &n = tree.node_at(ref);
-  out->cid = n.cid;
-  out->pred_root = n.pred.root;
-  out->child[0] = n.child[0];
-  out->child[1] = n.child[1];
-  out->depth = n.depth;
-  out->skipCnt = n.skipCnt;
-  out->parent = n.parent;
-  out->rCnt[0] = n.rCnt[0];
-  out->rCnt[1] = n.rCnt[1];
-  out->pred_opaque = n.pred.opaque ? 1 : 0;
-  out->pred_tautology = n.pred.tautology ? 1 : 0;
-  out->pred_fixed_dir = n.pred.fixed_dir;
-  out->constraint = n.constraint ? 1 : 0;
-  out->unstable = n.unstable ? 1 : 0;
-  out->len_related = n.len_related ? 1 : 0;
-  out->rsan_bug_dir = n.rsan_bug_dir;
-  out->trigger_neg = n.closure.trigger_neg;
-}
-
-static void publish_one_closure(SedbtShm *shm, const pcbt::Tree &tree,
-                                uint32_t ref) {
-  const pcbt::Closure &c = tree.closure_of(ref);
-  ShmNode &sn = shm->nodes[ref];
-  if (!c.present || sn.closure_present) return;
-  uint32_t s_n = shm->hdr.n_s.load(std::memory_order_relaxed);
-  uint32_t e_n = shm->hdr.n_e.load(std::memory_order_relaxed);
-  if (s_n + c.s.size() > shm->hdr.s_cap) return;
-  if (e_n + c.e.size() > shm->hdr.e_cap) return;
-  sn.s_off = s_n;
-  sn.s_n = (uint16_t)c.s.size();
-  for (uint32_t i = 0; i < c.s.size(); ++i) shm->s_offs[s_n + i] = c.s[i];
-  sn.e_off = e_n;
-  sn.e_n = (uint16_t)c.e.size();
-  for (uint32_t i = 0; i < c.e.size(); ++i) {
-    shm->e_clauses[e_n + i].pred_root = c.e[i].pred_root;
-    shm->e_clauses[e_n + i].negated = c.e[i].negated;
-  }
-  shm->hdr.n_s.store(s_n + (uint32_t)c.s.size(), std::memory_order_release);
-  shm->hdr.n_e.store(e_n + (uint32_t)c.e.size(), std::memory_order_release);
-  sn.trigger_neg = c.trigger_neg;
-  sn.closure_present = 1;
-}
-
-void publish_tree(SedbtShm *shm, const pcbt::Tree &tree) {
-  const uint32_t old_n = shm->hdr.n_nodes.load(std::memory_order_relaxed);
-  const uint32_t old_p = shm->hdr.n_preds.load(std::memory_order_relaxed);
-  const uint32_t new_n = tree.live_nodes();
-  const uint32_t new_p = tree.live_preds();
-  if (new_n > shm->hdr.node_cap || new_p > shm->hdr.pred_cap) return;
-
-  const pcbt::PNode *preds = tree.pred_data();
-  if (new_p > old_p)
-    memcpy(&shm->preds[old_p], preds + old_p,
-           sizeof(pcbt::PNode) * (new_p - old_p));
-  shm->hdr.n_preds.store(new_p, std::memory_order_release);
-
-  for (uint32_t i = old_n; i < new_n; ++i) {
-    pack_node(tree, i, &shm->nodes[i]);
-  }
-  shm->hdr.n_nodes.store(new_n, std::memory_order_release);
-
-  for (uint32_t i = pcbt::kRoot; i < new_n; ++i)
-    publish_one_closure(shm, tree, i);
-
-  for (uint32_t i = pcbt::kRoot; i < old_n && i < new_n; ++i) {
-    const pcbt::Node &n = tree.node_at(i);
-    for (int d = 0; d < 2; ++d) {
-      uint32_t want = n.child[d];
-      uint32_t have = shm->nodes[i].child[d];
-      if (want != have)
-        __atomic_store_n(&shm->nodes[i].child[d], want, __ATOMIC_RELEASE);
-    }
-  }
-}
-
 static uint32_t skip_for(const ShmNode &parent, uint8_t dir) {
   return parent.skipCnt + (parent.constraint && dir == 1 ? 1 : 0);
 }
 
-static void attach_if_bug_open(const SedbtShm *shm, uint32_t cur,
-                               const ShmNode &n,
-                               std::vector<pcbt::AttachedClosure> *out) {
-  if (n.rsan_bug_dir > 1 || !n.closure_present || !out) return;
-  uint32_t bug = __atomic_load_n(&shm->nodes[cur].child[n.rsan_bug_dir],
-                                 __ATOMIC_ACQUIRE);
-  if (bug != pcbt::kUnexplored) return;
-  pcbt::AttachedClosure a;
-  a.node = cur;
-  a.bug_dir = n.rsan_bug_dir;
-  a.trigger_neg = n.trigger_neg;
-  a.trigger_root = n.pred_root;
-  a.s.assign(shm->s_offs + n.s_off, shm->s_offs + n.s_off + n.s_n);
-  a.e.reserve(n.e_n);
-  for (uint16_t i = 0; i < n.e_n; ++i) {
-    const ShmClause &cl = shm->e_clauses[n.e_off + i];
-    a.e.push_back({cl.pred_root, cl.negated});
-  }
-  out->push_back(std::move(a));
+static void note_rsan(uint32_t cur, const ShmNode &n, WalkResult *r) {
+  if (n.rsan_bug_dir <= 1) r->rsan_nodes.push_back(cur);
 }
 
-WalkResult check_input(const SedbtShm *shm, const uint8_t *input,
-                       uint32_t len) {
+static void fill_terminal(const SedbtShm *shm, uint32_t last, uint8_t dir,
+                          WalkResult *r) {
+  r->learned = kWalkTerminal;
+  r->last_node = last;
+  r->last_dir = dir;
+  const ShmNode &n = shm->nodes[last];
+  r->path_s_ready = 1;
+  r->path_s_off = n.term_s_off[dir];
+  r->path_s_n = n.term_s_n[dir];
+  r->path_s_cons_n = n.term_cons_n[dir];
+  if (n.term_front[dir] >= sedbt::kRoot) {
+    r->frontier = n.term_front[dir];
+    r->dir = n.term_fdir[dir];
+  }
+}
+
+static WalkResult walk_from(const SedbtShm *shm, uint32_t cur,
+                            const uint8_t *input, uint32_t len) {
   WalkResult r{};
-  r.learned = kWalkFail;
+  r.learned = kWalkFailKind;
   const uint32_t n_nodes = shm->hdr.n_nodes.load(std::memory_order_acquire);
   const uint32_t n_preds = shm->hdr.n_preds.load(std::memory_order_acquire);
-  if (n_nodes <= pcbt::kRoot) {
-    r.learned = kUnlearned;
-    r.frontier = pcbt::kRoot;
-    r.dir = 0;
-    r.skip_cnt = 0;
-    return r;
-  }
-  uint32_t cur = __atomic_load_n(&shm->nodes[pcbt::kRoot].child[0],
-                                 __ATOMIC_ACQUIRE);
-  if (cur == pcbt::kUnexplored) {
-    r.learned = kUnlearned;
-    r.frontier = pcbt::kRoot;
-    r.dir = 0;
-    r.skip_cnt = 0;
+  if (cur == sedbt::kTerminal) {
+    r.learned = kWalkTerminal;
     return r;
   }
   while (true) {
-    if (cur == pcbt::kTerminal) {
-      r.learned = kLearned;
+    if (cur == sedbt::kTerminal) {
+      r.learned = kWalkTerminal;
       return r;
     }
-    if (cur < pcbt::kRoot || cur >= n_nodes) {
-      r.learned = kWalkFail;
+    if (cur < sedbt::kRoot || cur >= n_nodes) {
+      r.learned = kWalkFailKind;
       return r;
     }
     const ShmNode &n = shm->nodes[cur];
     if (n.unstable) {
-      r.learned = kWalkFail;
+      r.learned = kWalkFailKind;
       return r;
     }
     uint8_t dir = 0;
     if (n.pred_tautology || n.pred_opaque) {
       dir = n.pred_tautology ? n.pred_fixed_dir : 0;
     } else {
-      pcbt::Predicate pred;
+      sedbt::Predicate pred;
       pred.root = n.pred_root;
       pred.opaque = n.pred_opaque;
       pred.tautology = n.pred_tautology;
       pred.fixed_dir = n.pred_fixed_dir;
       uint64_t v = 0;
-      if (!pcbt::eval_predicate(shm->preds, n_preds, pred, input, len, &v)) {
-        r.learned = kWalkFail;
+      if (!sedbt::eval_predicate(shm->preds, n_preds, pred, input, len, &v)) {
+        r.learned = kWalkFailKind;
         return r;
       }
       dir = v ? 1 : 0;
     }
-    attach_if_bug_open(shm, cur, n, &r.closures);
+    note_rsan(cur, n, &r);
     uint32_t next = __atomic_load_n(&shm->nodes[cur].child[dir],
                                     __ATOMIC_ACQUIRE);
-    if (next == pcbt::kUnexplored) {
-      r.learned = kUnlearned;
+    if (next == sedbt::kUnexplored) {
+      r.learned = kWalkFrontier;
       r.frontier = cur;
       r.dir = dir;
       r.skip_cnt = skip_for(n, dir);
+      r.last_node = cur;
+      r.last_dir = dir;
       return r;
     }
-    if (next == pcbt::kTerminal) {
-      r.learned = kLearned;
+    if (next == sedbt::kTerminal) {
+      fill_terminal(shm, cur, dir, &r);
       return r;
     }
     cur = next;
   }
+}
+
+void dump_shm_tree(const SedbtShm *shm, const char *path) {
+  if (!shm || !path || !*path) return;
+  FILE *f = fopen(path, "w");
+  if (!f) return;
+  const uint32_t n = shm->hdr.n_nodes.load(std::memory_order_acquire);
+  fprintf(f, "# sedbt tree dump v2\n");
+  fprintf(f, "# node cid depth skipCnt constraint unstable len_related "
+             "child0 child1\n");
+  for (uint32_t ref = 0; ref < n && ref < shm->hdr.node_cap; ++ref) {
+    const ShmNode &sn = shm->nodes[ref];
+    const uint32_t c0 =
+        __atomic_load_n(&shm->nodes[ref].child[0], __ATOMIC_ACQUIRE);
+    const uint32_t c1 =
+        __atomic_load_n(&shm->nodes[ref].child[1], __ATOMIC_ACQUIRE);
+    fprintf(f, "%u %u %u %u %u %u %u %u %u\n", ref, sn.cid, sn.depth,
+            sn.skipCnt, sn.constraint ? 1u : 0u, sn.unstable ? 1u : 0u,
+            sn.len_related ? 1u : 0u, c0, c1);
+  }
+  fclose(f);
+}
+
+WalkResult check_input(const SedbtShm *shm, const uint8_t *input,
+                       uint32_t len) {
+  WalkResult r{};
+  r.learned = kWalkFailKind;
+  if (!shm) return r;
+  const uint32_t n_nodes = shm->hdr.n_nodes.load(std::memory_order_acquire);
+  if (n_nodes <= sedbt::kRoot) {
+    r.learned = kWalkFrontier;
+    r.frontier = sedbt::kRoot;
+    r.dir = 0;
+    r.skip_cnt = 0;
+    return r;
+  }
+  uint32_t cur = __atomic_load_n(&shm->nodes[sedbt::kRoot].child[0],
+                                 __ATOMIC_ACQUIRE);
+  if (cur == sedbt::kUnexplored) {
+    r.learned = kWalkFrontier;
+    r.frontier = sedbt::kRoot;
+    r.dir = 0;
+    r.skip_cnt = 0;
+    return r;
+  }
+  if (cur == sedbt::kTerminal) {
+    fill_terminal(shm, sedbt::kRoot, 0, &r);
+    return r;
+  }
+  return walk_from(shm, cur, input, len);
+}
+
+WalkResult check_suffix(const SedbtShm *shm, const uint8_t *input, uint32_t len,
+                        uint32_t frontier, uint8_t dir) {
+  WalkResult r{};
+  r.learned = kWalkFailKind;
+  r.frontier = frontier;
+  r.dir = dir;
+  if (!shm || dir > 1) return r;
+  const uint32_t n_nodes = shm->hdr.n_nodes.load(std::memory_order_acquire);
+  if (frontier == sedbt::kRoot) {
+    return check_input(shm, input, len);
+  }
+  if (frontier < sedbt::kRoot || frontier >= n_nodes) return r;
+  const ShmNode &fn = shm->nodes[frontier];
+  r.skip_cnt = skip_for(fn, dir);
+  uint32_t next =
+      __atomic_load_n(&shm->nodes[frontier].child[dir], __ATOMIC_ACQUIRE);
+  if (next == sedbt::kUnexplored) {
+    r.learned = kWalkFrontier;
+    return r;
+  }
+  if (next == sedbt::kTerminal) {
+    fill_terminal(shm, frontier, dir, &r);
+    return r;
+  }
+  return walk_from(shm, next, input, len);
+}
+
+namespace {
+
+// 0/1 = direction; <0 opaque (-2) or fail/unstable (-1).
+int eval_dir(const SedbtShm *shm, uint32_t n_preds, uint32_t cur,
+             const uint8_t *input, uint32_t len) {
+  const ShmNode &n = shm->nodes[cur];
+  if (n.unstable) return -1;
+  if (n.pred_opaque) return -2;
+  if (n.pred_tautology) return n.pred_fixed_dir ? 1 : 0;
+  sedbt::Predicate pred;
+  pred.root = n.pred_root;
+  pred.opaque = 0;
+  pred.tautology = 0;
+  pred.fixed_dir = n.pred_fixed_dir;
+  uint64_t v = 0;
+  if (!sedbt::eval_predicate(shm->preds, n_preds, pred, input, len, &v))
+    return -1;
+  return v ? 1 : 0;
+}
+
+uint32_t first_child(const SedbtShm *shm, uint32_t frontier, uint8_t dir,
+                     uint32_t n_nodes) {
+  if (frontier == sedbt::kRoot) {
+    return __atomic_load_n(&shm->nodes[sedbt::kRoot].child[0],
+                           __ATOMIC_ACQUIRE);
+  }
+  if (frontier < sedbt::kRoot || frontier >= n_nodes || dir > 1)
+    return sedbt::kUnexplored;
+  return __atomic_load_n(&shm->nodes[frontier].child[dir], __ATOMIC_ACQUIRE);
+}
+
+uint8_t dir_bit(const SuffixScreenCache *c, uint32_t i) {
+  return (c->bits[i >> 3] >> (i & 7)) & 1;
+}
+
+void push_dir_bit(SuffixScreenCache *c, uint8_t d) {
+  if ((c->n & 7) == 0) c->bits.push_back(0);
+  if (d) c->bits[c->n >> 3] |= (uint8_t)(1u << (c->n & 7));
+  c->n += 1;
+}
+
+}  // namespace
+
+void suffix_screen_cache_clear(SuffixScreenCache *c) {
+  if (!c) return;
+  *c = SuffixScreenCache{};
+}
+
+bool suffix_screen_cache_build(SuffixScreenCache *c, const SedbtShm *shm,
+                               uint32_t frontier, uint8_t dir,
+                               const uint8_t *parent, uint32_t plen) {
+  suffix_screen_cache_clear(c);
+  if (!c || !shm || !parent || dir > 1) return false;
+  const uint32_t n_nodes = shm->hdr.n_nodes.load(std::memory_order_acquire);
+  const uint32_t n_preds = shm->hdr.n_preds.load(std::memory_order_acquire);
+  uint32_t cur = first_child(shm, frontier, dir, n_nodes);
+  if (cur == sedbt::kTerminal) {
+    c->frontier = frontier;
+    c->dir = dir;
+    return true;
+  }
+  if (cur == sedbt::kUnexplored || cur < sedbt::kRoot || cur >= n_nodes)
+    return false;
+  uint32_t steps = 0;
+  while (steps++ < n_nodes) {
+    if (cur < sedbt::kRoot || cur >= n_nodes) {
+      suffix_screen_cache_clear(c);
+      return false;
+    }
+    int dp = eval_dir(shm, n_preds, cur, parent, plen);
+    if (dp < 0) {
+      suffix_screen_cache_clear(c);
+      return false;
+    }
+    push_dir_bit(c, (uint8_t)dp);
+    uint32_t next = __atomic_load_n(&shm->nodes[cur].child[(uint8_t)dp],
+                                    __ATOMIC_ACQUIRE);
+    if (next == sedbt::kTerminal) break;
+    if (next == sedbt::kUnexplored) break;
+    cur = next;
+  }
+  c->frontier = frontier;
+  c->dir = dir;
+  return true;
+}
+
+static SuffixCmp suffix_walk_uncached(const SedbtShm *shm, uint32_t frontier,
+                                      uint8_t dir, const uint8_t *parent,
+                                      uint32_t plen, const uint8_t *mut,
+                                      uint32_t mlen, SuffixWalkStats *stats) {
+  const uint32_t n_nodes = shm->hdr.n_nodes.load(std::memory_order_acquire);
+  const uint32_t n_preds = shm->hdr.n_preds.load(std::memory_order_acquire);
+  uint32_t cur = first_child(shm, frontier, dir, n_nodes);
+  if (cur == sedbt::kTerminal) return SuffixCmp::Same;
+  if (cur == sedbt::kUnexplored) return SuffixCmp::Uncertain;
+  uint32_t steps = 0;
+  while (steps++ < n_nodes) {
+    if (cur < sedbt::kRoot || cur >= n_nodes) return SuffixCmp::Uncertain;
+    int dp = eval_dir(shm, n_preds, cur, parent, plen);
+    int dm = eval_dir(shm, n_preds, cur, mut, mlen);
+    if (stats) {
+      stats->steps += 1;
+      stats->evals += 2;
+    }
+    if (dp < 0 || dm < 0) return SuffixCmp::Uncertain;
+    if (dp != dm) {
+      uint32_t taken = __atomic_load_n(&shm->nodes[cur].child[(uint8_t)dm],
+                                       __ATOMIC_ACQUIRE);
+      if (taken == sedbt::kUnexplored) return SuffixCmp::Unexplored;
+      return SuffixCmp::Explored;
+    }
+    uint32_t next = __atomic_load_n(&shm->nodes[cur].child[(uint8_t)dp],
+                                    __ATOMIC_ACQUIRE);
+    if (next == sedbt::kTerminal) return SuffixCmp::Same;
+    if (next == sedbt::kUnexplored) return SuffixCmp::Unexplored;
+    cur = next;
+  }
+  return SuffixCmp::Uncertain;
+}
+
+SuffixCmp suffix_vs_parent(const SedbtShm *shm, uint32_t frontier, uint8_t dir,
+                           const uint8_t *parent, uint32_t plen,
+                           const uint8_t *mut, uint32_t mlen) {
+  if (!shm || !parent || !mut || dir > 1) return SuffixCmp::Uncertain;
+  return suffix_walk_uncached(shm, frontier, dir, parent, plen, mut, mlen,
+                              nullptr);
+}
+
+SuffixCmp suffix_vs_parent_cached(const SedbtShm *shm,
+                                  const SuffixScreenCache *cache,
+                                  const uint8_t *mut, uint32_t mlen,
+                                  SuffixWalkStats *stats) {
+  if (!shm || !cache || !mut || cache->dir > 1) return SuffixCmp::Uncertain;
+  const uint32_t n_nodes = shm->hdr.n_nodes.load(std::memory_order_acquire);
+  const uint32_t n_preds = shm->hdr.n_preds.load(std::memory_order_acquire);
+  uint32_t cur = first_child(shm, cache->frontier, cache->dir, n_nodes);
+  if (cur == sedbt::kTerminal) return SuffixCmp::Same;
+  if (cur == sedbt::kUnexplored) return SuffixCmp::Uncertain;
+  if (cache->n == 0) return SuffixCmp::Uncertain;
+  if (((cache->n + 7) >> 3) > cache->bits.size()) return SuffixCmp::Uncertain;
+  for (uint32_t i = 0; i < cache->n; ++i) {
+    if (cur < sedbt::kRoot || cur >= n_nodes) return SuffixCmp::Uncertain;
+    const uint8_t dp = dir_bit(cache, i);
+    int dm = eval_dir(shm, n_preds, cur, mut, mlen);
+    if (stats) {
+      stats->steps += 1;
+      stats->evals += 1;
+    }
+    if (dm < 0) return SuffixCmp::Uncertain;
+    if (dm != (int)dp) {
+      uint32_t taken = __atomic_load_n(&shm->nodes[cur].child[(uint8_t)dm],
+                                       __ATOMIC_ACQUIRE);
+      if (taken == sedbt::kUnexplored) return SuffixCmp::Unexplored;
+      return SuffixCmp::Explored;
+    }
+    uint32_t next = __atomic_load_n(&shm->nodes[cur].child[dp],
+                                    __ATOMIC_ACQUIRE);
+    if (next == sedbt::kTerminal) return SuffixCmp::Same;
+    if (next == sedbt::kUnexplored) return SuffixCmp::Unexplored;
+    cur = next;
+  }
+  return SuffixCmp::Same;
 }
 
 void *create_shm(const char *name, size_t bytes, int *fd_out) {

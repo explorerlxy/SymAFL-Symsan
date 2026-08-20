@@ -354,7 +354,7 @@ __taint_trace_select(dfsan_label cond_label, dfsan_label true_label,
 
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_indcall(dfsan_label label, uint64_t target, uint32_t cid) {
-  // Not on the PCBT path (fastgen is); keep the signature ABI-consistent with
+  // Not on the SEDBT path (fastgen is); keep the signature ABI-consistent with
   // the instrumentation's three-argument call. target/cid are unused here.
   (void)target;
   (void)cid;

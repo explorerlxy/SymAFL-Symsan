@@ -284,7 +284,7 @@ void __taint_send_cond(dfsan_label label, uint8_t result, uint8_t add_nested,
                        uint8_t loop_flag, uint32_t cid, void *addr);
 
 // Multi-successor single-decision read-count constraint: pin the actual
-// bytes/elements read to (count == ret), result always 1, so the PCBT
+// bytes/elements read to (count == ret), result always 1, so the SEDBT
 // value-fork chain over observed read counts models length divergence at
 // the read site itself — a candidate whose length yields a different read
 // count diverges to a frontier instead of being misrouted by later
@@ -302,7 +302,7 @@ static inline void taint_report_read_constraint(dfsan_label count_label,
                       (void *)__builtin_return_address(0));
 }
 
-// The scalar PCBT converter lowers fstrcmp/fstrcasecmp exactly only when the
+// The scalar SEDBT converter lowers fstrcmp/fstrcasecmp exactly only when the
 // wrappers can capture every compared byte (bounded to 32 bytes per side) OR
 // the string shadow already covers the whole window. A longer or uncapturable
 // comparison emits the event with incomplete capture fields (zeroed); the
@@ -323,7 +323,7 @@ static inline dfsan_label get_label_for(int fd, off_t offset) {
   // if fd is a tainted file, the label should have been pre-allocated
   // Inputs larger than the pre-allocated range (max(init size, taint_max_len))
   // would map to labels without a valid label_info: create them on demand so
-  // downstream shadow inspection (e.g. the PCBT fold classifier) stays valid.
+  // downstream shadow inspection (e.g. the SEDBT fold classifier) stays valid.
   else if ((off_t)offset >= tainted.size)
     return dfsan_create_label((uint64_t)fd, (uint64_t)offset, 1);
   else return (offset + CONST_OFFSET);
@@ -730,7 +730,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
       n = strlen(s2) + 1;  // use concrete side for length
 
     // Small comparisons fit the scalar fmemcmp byte-capture grammar and are
-    // exactly solvable by the PCBT interpreter; larger ones stay on the Z3
+    // exactly solvable by the SEDBT interpreter; larger ones stay on the Z3
     // string-theory op (opaque to the scalar interpreter, admitted).
     uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcmp;
     // Emit event even when uncapturable - converter will mark opaque.
@@ -766,7 +766,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_prefixof(
     // The comparison length is the prefix length (the bytes prefixof matches).
     size_t n = prefix_len;
     // Small comparisons fit the scalar fmemcmp byte-capture grammar and are
-    // exactly solvable by the PCBT interpreter.
+    // exactly solvable by the SEDBT interpreter.
     uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fprefixof;
     dfsan_label cmp = dfsan_union(l1, l2, cmp_op, n,
                                    (uint64_t)str, (uint64_t)prefix);
@@ -892,7 +892,7 @@ __dfsw_strcasecmp(const char *s1, const char *s2, dfsan_label s1_label,
       n = strlen(s2) + 1;
 
     // Small comparisons fit the scalar fmemcmp byte-capture grammar and are
-    // exactly solvable by the PCBT interpreter; larger ones stay on the Z3
+    // exactly solvable by the SEDBT interpreter; larger ones stay on the Z3
     // string-theory op (opaque to the scalar interpreter, admitted).
     uint16_t cmp_op = (n <= 8) ? __dfsan::fmemcmp : __dfsan::fstrcasecmp;
     // Emit event even when uncapturable - converter will mark opaque (strcasecmp).
@@ -2139,7 +2139,7 @@ double __dfsw_strtod(const char *nptr, char **endptr,
   uptr len = (uptr)tmp_endptr - (uptr)nptr;
   // TODO(fp_atof): full float parse model.  Approximate with the integer-parse
   // model (fatoi) so value decisions on strtod/atof stay collected and
-  // input-dependent; the scalar PCBT interpreter keeps fatoi opaque (admit).
+  // input-dependent; the scalar SEDBT interpreter keeps fatoi opaque (admit).
   *ret_label = taint_strtol(nptr, len, sizeof(ret), 10);
   return ret;
 }
@@ -2566,7 +2566,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strstr(char *haystack, char *needle,
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer, OR up to 8 packed concrete needle bytes when the
-    //       needle is concrete and short, so the scalar PCBT interpreter can
+    //       needle is concrete and short, so the scalar SEDBT interpreter can
     //       expand strstr(h, needle) into byte comparisons.  The Z3 string
     //       solver reads a concrete needle from the memcmp cache, not op2.
     // size = haystack length if haystack concrete, else needle length if
@@ -2644,7 +2644,7 @@ SANITIZER_INTERFACE_ATTRIBUTE char *__dfsw_strnstr(char *haystack, char *needle,
     // l2 = real_needle_label (may be symbolic string!)
     // op1 = haystack pointer (for concrete content retrieval)
     // op2 = needle pointer, OR up to 8 packed concrete needle bytes when the
-    //       needle is concrete and short, so the scalar PCBT interpreter can
+    //       needle is concrete and short, so the scalar SEDBT interpreter can
     //       expand strstr(h, needle) into byte comparisons.  The Z3 string
     //       solver reads a concrete needle from the memcmp cache, not op2.
     // size = haystack length if haystack concrete, else needle length if
@@ -4761,7 +4761,7 @@ __dfsw_assume_cond(bool result, uint64_t id, dfsan_label result_label, dfsan_lab
 
 // iconv family: control-flow-relevant black-box conversion. libc iconv is
 // uninstrumented, so the legality decision (does the input contain an
-// invalid encoding unit?) is invisible to the PCBT. We expand it into
+// invalid encoding unit?) is invisible to the SEDBT. We expand it into
 // per-unit ORDINARY symbolic decisions, the same way strcmp is lowered
 // byte-wise: for each complete input unit (UCS-4 = 4 bytes) the wrapper
 // emits three ICmp events (cp < 0x80000000, cp >= 0xD800, cp <= 0xDFFF)

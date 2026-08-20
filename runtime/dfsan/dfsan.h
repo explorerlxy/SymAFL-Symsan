@@ -61,11 +61,11 @@ struct dfsan_label_info {
   uint32_t hash;
 } __attribute__((aligned (8), packed));
 
-// Shared trace-control protocol used by SymAFL's PCBT concolic phase.
+// Shared trace-control protocol used by SymAFL's SEDBT concolic phase.
 // The custom mutator selects one transport for each forkserver child:
 // full pipe during bootstrap, bounded SHM for normal suffix capture, or a
 // suffix-only pipe replay after an SHM overflow. `skip_depth` is the number
-// of symbolic condition events already represented by the PCBT prefix.
+// of symbolic condition events already represented by the SEDBT prefix.
 #define SYMAFL_SINGLE_PASS_MAGIC 0x53504331U  // "SPC1"
 #define SYMAFL_SINGLE_PASS_VERSION 3U
 
@@ -167,7 +167,7 @@ dfsan_label taint_find_string_op_source(dfsan_label label);
 dfsan_label taint_get_base_input_label(dfsan_label label);
 // True when a branch condition is path-local heap layout (pointer/pointer-diff
 // compares, optionally mixed with input lengths). Such conditions must not
-// enter the PCBT stream: different heap shapes produce different sites at the
+// enter the SEDBT stream: different heap shapes produce different sites at the
 // same logical depth (libxml2 dict.c pool vs hash-chain cid pairs).
 int taint_is_heap_layout_cond(dfsan_label label);
 
@@ -176,7 +176,7 @@ off_t get_utmp_offset(void);
 void set_utmp_offset(off_t offset);
 int is_utmp_taint(void);
 
-// Flushes any pending PCBT fold frames (fold_type pipe msgs / SHM fold
+// Flushes any pending SEDBT fold frames (fold_type pipe msgs / SHM fold
 // events). Called by dfsan_fini at child exit so the tail of a foldable
 // event sequence is not lost. Defined in solver_common.cpp.
 void __dfsan_flush_trace_fold();
@@ -481,7 +481,7 @@ enum pipe_msg_type {
   event_type,
   gv_type,
   minimize_type,
-  // SymAFL PCBT: a fold frame stands for `count` consecutive condition
+  // SymAFL SEDBT: a fold frame stands for `count` consecutive condition
   // events that share cid/result and a byte-advancing Read-family shape.
   fold_type,
 };
@@ -492,10 +492,11 @@ static const uint8_t TrueBranchLoopExit = 0x2;
 static const uint8_t FalseBranchLoopExit = 0x1;
 static const uint8_t LoopFlagMask = 0xF;
 static const uint8_t UndefinedCheck = 0x10;
-// Constraint events (tainted GEP index / indcall target pinned to their
-// observed concrete value): the recorded result is always 1; replay skips
-// direction validation for them (they are screening semantics, not real
+// Constraint events (tainted GEP index / indcall target / read-length pinned
+// to their observed concrete value): the recorded result is always 1; replay
+// skips direction validation for them (they are screening semantics, not real
 // branches). Must be above LoopFlagMask so send_cond's loop switch ignores it.
+// GEP identity is F_GEP_PIN on the pipe, not another loop_flag bit.
 static const uint8_t ConstraintFlag = 0x20;
 // RSan/swiftsan bounds-check cond (ADR 0010 W3). RsanBugDirFlag means the
 // bug-trigger direction is 1 (true); clear means 0 (false).
@@ -508,7 +509,7 @@ static const uint8_t RsanBugDirFlag = 0x80;
 // Instrumented branch cids are djbHash("file:line:col") values in the high
 // range; the low values below are reserved for runtime-reported events.
 // A candidate's read count is pinned with (read_count == N), result always
-// 1, so the PCBT builds the value-fork chain over observed read counts and
+// 1, so the SEDBT builds the value-fork chain over observed read counts and
 // length divergence is modeled at the read site itself.
 static constexpr uint32_t kFreadConstraintCid = 1;    // fread/fread_unlocked
 static constexpr uint32_t kReadConstraintCid = 2;     // read/pread/pread64
@@ -558,6 +559,9 @@ enum undefined_check_ids {
 #define F_CONSTRAINT 0x8
 #define F_RSAN_CHECK 0x10
 #define F_RSAN_BUG_DIR 0x20
+// Tainted GEP-index pin (with F_CONSTRAINT). Indcall/read-length pins are
+// F_CONSTRAINT only. CONS_SAN skips fsrv_cov only for GEP pins.
+#define F_GEP_PIN 0x40
 
 #define F_MEMERR_UAF  0x1
 #define F_MEMERR_OLB  0x2

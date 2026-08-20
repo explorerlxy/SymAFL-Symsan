@@ -212,7 +212,7 @@ __taint_trace_indcall(dfsan_label label, uint64_t target, uint32_t cid) {
        label, (unsigned long long)target, cid);
 
   // SymAFL v2: pin the tainted jump target to its observed concrete address
-  // so the PCBT diverges when a mutated input reaches a different target.
+  // so the SEDBT diverges when a mutated input reaches a different target.
   if (flags().taint_trace_addr_cond) {
     dfsan_label eq =
         dfsan_union(label, 0, (bveq << 8) | ICmp, 64, target, target);
@@ -247,7 +247,7 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
   }
 
   // SymAFL v2: pin the tainted index to its observed concrete value so the
-  // PCBT diverges when a mutated input selects a different array element.
+  // SEDBT diverges when a mutated input selects a different array element.
   // Reuses cond_type + PKind::equal (bveq); result is always 1 for the
   // traced run. Multiple GEPs (multi-index or load+store of a[i]+=f(a[i]))
   // correctly produce multiple constraint nodes: each access is a symbolic
@@ -261,8 +261,10 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
                        : ((uint64_t)index & ((1ULL << width) - 1));
       dfsan_label eq =
           dfsan_union(index_label, 0, (bveq << 8) | ICmp, width, k, k);
-      if (eq != 0 && eq != kInitializingLabel)
+      if (eq != 0 && eq != kInitializingLabel) {
+        __taint_mark_next_cond_gep_pin();
         __taint_send_cond(eq, 1, 0, ConstraintFlag, cid, addr);
+      }
     }
   }
 

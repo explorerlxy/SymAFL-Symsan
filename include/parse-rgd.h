@@ -28,7 +28,7 @@ public:
 
   int add_constraints(dfsan_label label, uint64_t result) override;
 
-  // SymAFL v2: expose predicate materialization for PCBT insertion
+  // SymAFL v2: expose predicate materialization for SEDBT insertion
   // (get_root_expr itself stays private).
   std::shared_ptr<rgd::AstNode> materialize(dfsan_label label) {
     return get_root_expr(label);
