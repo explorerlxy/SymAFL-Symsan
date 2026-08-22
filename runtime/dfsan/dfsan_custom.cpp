@@ -1049,6 +1049,7 @@ void *__dfsw_memcpy(void *dest, const void *src, size_t n,
   if (n_label) {
     __taint_solve_bounds(src_label, (uint64_t)src, n_label, n, 0, 1, 0, 0);
     __taint_solve_bounds(dest_label, (uint64_t)dest, n_label, n, 0, 1, 0, 0);
+    __taint_trace_copy_len(n_label, n, kMemcpyConstraintCid);
   }
   // Propagate string content label from src to dest
   dfsan_label str_label = taint_get_str_content_label(src);
@@ -1068,6 +1069,7 @@ void *__dfsw_memmove(void *dest, const void *src, size_t n,
   if (n_label) {
     __taint_solve_bounds(src_label, (uint64_t)src, n_label, n, 0, 1, 0, 0);
     __taint_solve_bounds(dest_label, (uint64_t)dest, n_label, n, 0, 1, 0, 0);
+    __taint_trace_copy_len(n_label, n, kMemmoveConstraintCid);
   }
   // Propagate string content label from src to dest
   dfsan_label str_label = taint_get_str_content_label(src);
@@ -1089,8 +1091,10 @@ void *__dfsw_memset(void *s, int c, size_t n,
                     dfsan_label s_label, dfsan_label c_label,
                     dfsan_label n_label, dfsan_label *ret_label) {
   __taint_check_bounds(s_label, (uptr)s, n_label, n);
-  if (n_label)
+  if (n_label) {
     __taint_solve_bounds(s_label, (uint64_t)s, n_label, n, 0, 1, 0, 0);
+    __taint_trace_copy_len(n_label, n, kMemsetConstraintCid);
+  }
   dfsan_memset(s, c, c_label, n);
   *ret_label = s_label;
   return s;
@@ -1605,8 +1609,10 @@ __dfsw_strncpy(char *s1, const char *s2, size_t n, dfsan_label s1_label,
   size_t len = strlen(s2);
   size_t copy_len = len < n ? len : n;
 
-  if (n_label)
+  if (n_label) {
     __taint_solve_bounds(s1_label, (uint64_t)s1, n_label, n, 0, 1, 0, 0);
+    __taint_trace_copy_len(n_label, n, kStrncpyConstraintCid);
+  }
 
   // Check if n_label derives from a string op (e.g., strchr index)
   dfsan_label str_op_label = n_label ? taint_find_string_op_source(n_label) : 0;

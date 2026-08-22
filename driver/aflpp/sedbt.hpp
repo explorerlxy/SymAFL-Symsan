@@ -2,7 +2,7 @@
 //
 // A binary decision trie over symbolic-branch outcomes. Nodes live only in
 // the process-wide SedbtShm. Tree is a writer: unpublished suffix chains are
-// packed into that mapping, then the frontier child is store-released.
+// packed into that mapping, then commit_publish writes the frontier child.
 #pragma once
 
 #include <array>
@@ -25,15 +25,31 @@ constexpr NodeRef kTerminal = 1;
 constexpr NodeRef kRoot = 2;
 
 // Event.constraint / ShmNode.constraint: 0 = ordinary branch,
-// 1 = value pin (indcall target / read-length), 2 = tainted GEP index.
-// Topology (skipCnt / value-fork) uses any non-zero; CONS_SAN binds only 2.
+// 1 = value pin (indcall target / fread-style read-length),
+// 2 = tainted GEP index, 3 = memcpy-family copy-size.
+// Topology (skipCnt / value-fork) uses any non-zero; CONS_SAN binds 2 and 3.
 constexpr uint8_t kConstraintNone = 0;
 constexpr uint8_t kConstraintPin = 1;
 constexpr uint8_t kConstraintGep = 2;
+constexpr uint8_t kConstraintMemlen = 3;
+
+inline bool is_cons_san_kind(uint8_t c) {
+  return c == kConstraintGep || c == kConstraintMemlen;
+}
 
 // SYMAFL_MUT_PATH_S: 0/off = skip path-s; unset/1/suffix = suffix taint
 // (LearnJob chain only); full/2 = full-path taint (root→terminal).
 enum class PathSMode : uint8_t { Off = 0, Suffix = 1, Full = 2 };
+
+// SYMAFL_ANALYZER: unset/1/on = analyzer required (ADR 0010 default);
+// 0/off/no = split fsrv_cov→fsrv_san only, no SEDBT/LearnJob.
+inline bool parse_analyzer_env(const char *e) {
+  if (!e || !*e) return true;
+  if ((e[0] == '0' && e[1] == '\0') || std::strcmp(e, "off") == 0 ||
+      std::strcmp(e, "no") == 0 || std::strcmp(e, "false") == 0)
+    return false;
+  return true;
+}
 
 inline PathSMode parse_mut_path_s_env(const char *e) {
   if (!e || !*e) return PathSMode::Suffix;
@@ -83,10 +99,12 @@ struct Node {
   // describes only the pinned value's behavior; dir-0 is the value-fork
   // chain for candidates that pin a different value.
   bool constraint = false;
-  // Tainted GEP-index pin (ShmNode.constraint == kConstraintGep). Indcall
-  // and read-length pins are constraint but not gep_pin; CONS_SAN binds
-  // only gep_pin offsets.
+  // Tainted GEP-index pin (ShmNode.constraint == kConstraintGep).
   bool gep_pin = false;
+  // memcpy/memmove/strncpy/memset size pin (kConstraintMemlen). CONS_SAN
+  // binds gep_pin and memlen_pin. Indcall / fread-style read-length stay
+  // constraint topology only (kConstraintPin).
+  bool memlen_pin = false;
   // Prefix validation found incompatible symbolic event streams at this node.
   // Descendants are not safe terminal proofs while this flag is set.
   bool unstable = false;
@@ -136,9 +154,9 @@ struct Event {
   uint32_t cid;
   uint32_t label;  // AST label in the *current* union table (per-run)
   uint8_t result;  // concrete branch outcome (0/1)
-  // Constraint events (tainted GEP index / indcall target / read-length ==
+  // Constraint events (GEP index / copy-size / indcall / read-length ==
   // concrete) have result always 1 and skip direction validation during
-  // replay. 0 = ordinary, 1 = non-GEP pin, 2 = GEP index pin.
+  // replay. 0 = ordinary, 1 = non-CONS_SAN pin, 2 = GEP, 3 = copy-size.
   uint8_t constraint = 0;
   // Fold frame: this event stands for `count` consecutive conditions that
   // share cid/result and a byte-advancing Read-family shape (getc loops,
@@ -411,10 +429,10 @@ class Tree {
 
  private:
   symafl::ShmNode &at(NodeRef ref) {
-    return ((symafl::SedbtShm *)shm_)->nodes[ref];
+    return symafl::shm_nodes((symafl::SedbtShm *)shm_)[ref];
   }
   const symafl::ShmNode &at(NodeRef ref) const {
-    return ((const symafl::SedbtShm *)shm_)->nodes[ref];
+    return symafl::shm_nodes((const symafl::SedbtShm *)shm_)[ref];
   }
   symafl::SedbtShm *shmp() { return (symafl::SedbtShm *)shm_; }
   const symafl::SedbtShm *shmp() const { return (const symafl::SedbtShm *)shm_; }
@@ -423,16 +441,16 @@ class Tree {
   void finalize_closures(NodeRef tail, uint8_t tail_dir);
   void compute_closure(NodeRef n, const std::vector<std::pair<NodeRef, uint8_t>> &path);
   void commit_publish(NodeRef attach, uint8_t attach_dir, NodeRef first);
-  // Suffix: mutation symbols after `frontier` (exclusive of frontier,
-  // inclusive of tail). Full: walk tail→parent until kRoot.
-  // Off: no mutation symbols; still bind root→terminal GEP-index offsets
-  // as the whole slice (term_cons_n == term_s_n) so havoc CONS_SAN can
-  // see a prefix GEP. Indcall/read-length pins stay out of term_cons_n.
+  // Suffix: mutation symbols + CONS_SAN after `frontier` (exclusive).
+  // Full: mutation symbols and CONS_SAN are root→terminal.
+  // Off: no mutation symbols; CONS_SAN still root→terminal.
+  // Indcall / fread-length stay out of term_cons_n.
   // Empty suffix has tail==frontier.
   void bind_path_s(NodeRef tail, uint8_t tdir, NodeRef frontier, uint8_t fdir);
   void publish_one_closure(const Closure &c, NodeRef ref);
   void finish_publish(NodeRef frontier, uint8_t fdir, NodeRef chain_first,
-                      NodeRef tail, uint8_t tdir, bool close_term);
+                      NodeRef tail, uint8_t tdir, bool close_term,
+                      uint32_t parent_len);
   void init_empty();
   bool IsSaturated(NodeRef ref, uint8_t rlimit, uint8_t len_rlimit) const;
   bool debug_ = false;
@@ -449,6 +467,7 @@ class Tree {
 
   void *shm_ = nullptr;  // symafl::SedbtShm*
   bool owns_shm_ = false;
+  uint64_t shm_map_bytes_ = 0;
   uint32_t live_n_ = kRoot + 1;
   uint32_t published_n_ = kRoot + 1;
   PredArena pred_arena_;

@@ -57,7 +57,11 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
 
 // Mark the next __taint_send_cond as a tainted-GEP-index pin (F_GEP_PIN).
 // Call immediately before the GEP equality send_cond; the flag is consumed
-// once. Indcall / read-length ConstraintFlag events must not set this.
+// once. Indcall / fread-style read-length ConstraintFlag events must not set
+// this. memcpy-family size uses __taint_mark_next_cond_memlen_pin.
 extern "C" void __taint_mark_next_cond_gep_pin();
+extern "C" void __taint_mark_next_cond_memlen_pin();
+extern "C" void __taint_trace_copy_len(dfsan_label len_label, uint64_t len,
+                                       uint32_t cid);
 
 #endif // SOLVER_COMMON_H

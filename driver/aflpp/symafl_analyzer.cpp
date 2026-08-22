@@ -2,6 +2,7 @@
 #include "sedbt.hpp"
 #include "shm_sedbt.hpp"
 #include "analyzer_ipc.hpp"
+#include "suffix_screen.hpp"
 
 #include "dfsan/dfsan.h"
 
@@ -15,8 +16,10 @@
 #include <sys/stat.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
+#include <climits>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -76,6 +79,8 @@ static bool decode_full_stream(const uint8_t *wire, size_t wire_size,
         cons = sedbt::kConstraintPin;
         if (msg.flags & F_GEP_PIN) {
           cons = sedbt::kConstraintGep;
+        } else if (msg.flags & F_MEMLEN_PIN) {
+          cons = sedbt::kConstraintMemlen;
         } else if (wire_size - offset >= sizeof(pipe_msg)) {
           // Old Fastgen runtimes (build16 dual) emit GEP pins as
           // F_CONSTRAINT only; the GEP metadata record follows immediately.
@@ -158,9 +163,23 @@ static bool concolic_init(Concolic *c) {
   return c->labels != MAP_FAILED;
 }
 
+static int remaining_ms(const struct timespec &t0, uint32_t timeout_ms) {
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  int64_t elapsed = (now.tv_sec - t0.tv_sec) * 1000 +
+                    (now.tv_nsec - t0.tv_nsec) / 1000000;
+  int64_t left = (int64_t)timeout_ms - elapsed;
+  if (left < 0) return 0;
+  if (left > INT32_MAX) return INT32_MAX;
+  return (int)left;
+}
+
+// timeout_ms=0 → 5s (bootstrap). Kill the process group on deadline so a
+// hung concolic child cannot stall every fuzzer's LearnJob ring.
 static bool run_concolic(Concolic *c, const char *bin, const uint8_t *buf,
-                         uint32_t len, uint32_t skip,
+                         uint32_t len, uint32_t skip, uint32_t timeout_ms,
                          std::vector<sedbt::Event> *events) {
+  if (!timeout_ms) timeout_ms = 5000;
   FILE *tf = fopen(c->cur_path, "wb");
   if (!tf) return false;
   if (len && fwrite(buf, 1, len, tf) != len) {
@@ -178,6 +197,7 @@ static bool run_concolic(Concolic *c, const char *bin, const uint8_t *buf,
   }
   if (pid == 0) {
     close(pipefd[0]);
+    setpgid(0, 0);
     char opt[1024];
     snprintf(opt, sizeof(opt),
              "taint_file=%s:taint_max_len=65536:exit_on_memerror=false:"
@@ -189,18 +209,47 @@ static bool run_concolic(Concolic *c, const char *bin, const uint8_t *buf,
     execl(bin, bin, c->cur_path, (char *)nullptr);
     _exit(127);
   }
+  setpgid(pid, pid);
   close(pipefd[1]);
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
   std::vector<uint8_t> wire;
   uint8_t tmp[4096];
+  bool timed_out = false;
   while (true) {
+    int left = remaining_ms(t0, timeout_ms);
+    if (left == 0) {
+      timed_out = true;
+      break;
+    }
+    pollfd pfd{};
+    pfd.fd = pipefd[0];
+    pfd.events = POLLIN;
+    int pr = poll(&pfd, 1, left);
+    if (pr < 0) {
+      if (errno == EINTR) continue;
+      break;
+    }
+    if (pr == 0) {
+      timed_out = true;
+      break;
+    }
     ssize_t n = read(pipefd[0], tmp, sizeof(tmp));
     if (n > 0) wire.insert(wire.end(), tmp, tmp + n);
     else break;
   }
   close(pipefd[0]);
+  if (timed_out) {
+    kill(-pid, SIGKILL);
+    kill(pid, SIGKILL);
+  }
   int st = 0;
   waitpid(pid, &st, 0);
   events->clear();
+  if (timed_out) {
+    fprintf(stderr, "[analyzer] concolic timeout %ums\n", timeout_ms);
+    return false;
+  }
   return decode_full_stream(wire.data(), wire.size(), events);
 }
 
@@ -225,28 +274,41 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  char tree_name[kNameMax];
-  snprintf(tree_name, sizeof(tree_name), "/symafl-tree-%d", getpid());
+  uint64_t tree_bytes = kTreeMapBytes;
   int tfd = -1;
-  auto *tree_shm = (SedbtShm *)create_shm(tree_name, sizeof(SedbtShm), &tfd);
+  auto *tree_shm = (SedbtShm *)create_tree_shm(tree_bytes, &tfd);
+  if (!tree_shm) {
+    tree_bytes = 64ull << 30;
+    tree_shm = (SedbtShm *)create_tree_shm(tree_bytes, &tfd);
+  }
+  if (!tree_shm) {
+    tree_bytes = 8ull << 30;
+    tree_shm = (SedbtShm *)create_tree_shm(tree_bytes, &tfd);
+  }
   if (!tree_shm) {
     fprintf(stderr, "[analyzer] tree shm create failed\n");
     return 1;
   }
+  memset(tree_shm, 0, 4096);
+  if (!sedbt_layout(&tree_shm->hdr, tree_bytes)) {
+    fprintf(stderr, "[analyzer] tree layout failed bytes=%llu\n",
+            (unsigned long long)tree_bytes);
+    return 1;
+  }
   tree_shm->hdr.magic = kIpcMagic;
   tree_shm->hdr.version = kIpcVersion;
-  tree_shm->hdr.node_cap = kNodeCap;
-  tree_shm->hdr.pred_cap = kPredCap;
-  tree_shm->hdr.s_cap = kSCap;
-  tree_shm->hdr.e_cap = kECap;
-  tree_shm->hdr.clos_cap = kClosCap;
+  fprintf(stderr,
+          "[analyzer] tree map=%lluB nodes=%u preds=%u tab=%u (lazy pages)\n",
+          (unsigned long long)tree_bytes, tree_shm->hdr.node_cap,
+          tree_shm->hdr.pred_cap, tree_shm->hdr.tab_cap);
 
   sedbt::Tree tree(nullptr);
   tree.attach(tree_shm);
   tree.apply_mut_compute_env();
   fprintf(stderr, "[analyzer] compute path_s=%s closure=%s "
-          "(SYMAFL_MUT_PATH_S=0/off binds constraint offsets root→terminal; "
-          "suffix|full also bind mutation symbols; CLOSURE 0 skips)\n",
+          "(off: CONS_SAN root→terminal, no explore symbols; "
+          "suffix: suffix CONS_SAN+symbols, screen on; "
+          "full: CONS_SAN+symbols root→terminal, screen off)\n",
           sedbt::path_s_mode_name(tree.path_s_mode()),
           tree.compute_closures() ? "on" : "off");
 
@@ -297,9 +359,14 @@ int main(int argc, char **argv) {
     }
     HelloOkBody ok{};
     ok.fuzzer_id = i;
-    snprintf(ok.tree_name, sizeof(ok.tree_name), "%s", tree_name);
+    ok.tree_bytes = tree_bytes;
+    snprintf(ok.tree_name, sizeof(ok.tree_name), "%s", "memfd");
     snprintf(ok.ring_name, sizeof(ok.ring_name), "%s", c.ring_name);
     if (!send_msg(fsock, kHelloOk, sizeof(ok), &ok)) return 1;
+    if (!send_fd(fsock, tfd)) {
+      fprintf(stderr, "[analyzer] send tree fd failed id=%u\n", i);
+      return 1;
+    }
     fprintf(stderr, "[analyzer] hello id=%u cand=%s ring=%s\n", i, hello.cand_name,
             c.ring_name);
   }
@@ -314,7 +381,7 @@ int main(int argc, char **argv) {
     std::vector<uint8_t> buf;
     if (!read_file(sp.c_str(), &buf)) continue;
     std::vector<sedbt::Event> ev;
-    if (!run_concolic(&co, concolic, buf.data(), (uint32_t)buf.size(), 0,
+    if (!run_concolic(&co, concolic, buf.data(), (uint32_t)buf.size(), 0, 0,
                       &ev)) {
       fprintf(stderr, "[analyzer] concolic fail %s\n", sp.c_str());
       continue;
@@ -386,20 +453,6 @@ int main(int argc, char **argv) {
         c.sock = -1;
         continue;
       }
-      if (n == (ssize_t)sizeof(ch) && ch.type == kCloseBugEdge) {
-        CloseBugBody b{};
-        if (ch.nbytes != sizeof(b) || !recv_all(c.sock, &b, sizeof(b))) {
-          close(c.sock);
-          c.sock = -1;
-          continue;
-        }
-        if (tree.CloseUnexplored((sedbt::NodeRef)b.node, b.dir)) {
-          fprintf(stderr, "[analyzer] close-bug node=%u dir=%u\n", b.node,
-                  b.dir);
-        }
-        alive++;
-        continue;
-      }
       if (n == (ssize_t)sizeof(ch) && ch.nbytes) {
         std::string junk(ch.nbytes, '\0');
         recv_all(c.sock, junk.data(), ch.nbytes);
@@ -417,21 +470,38 @@ int main(int argc, char **argv) {
       uint64_t tail = c.ring->tail.v.load(std::memory_order_acquire);
       if (head == tail) continue;
       LearnJob job = c.ring->slots[head % kRingCap];
-      c.ring->head.v.store(head + 1, std::memory_order_release);
       rr = i + 1;
       did = true;
-      jobs[i] += 1;
-      fprintf(stderr, "[analyzer] job fuzzer=%u frontier=%u dir=%u\n", i,
-              job.frontier, job.dir);
+      fprintf(stderr, "[analyzer] job fuzzer=%u kind=%u frontier=%u dir=%u\n", i,
+              job.kind, job.frontier, job.dir);
+      if (job.kind == kJobCloseBug) {
+        if (tree.CloseUnexplored((sedbt::NodeRef)job.frontier, job.dir)) {
+          fprintf(stderr, "[analyzer] close-bug node=%u dir=%u\n", job.frontier,
+                  job.dir);
+        }
+        c.ring->head.v.store(head + 1, std::memory_order_release);
+        jobs[i] += 1;
+        break;
+      }
       uint32_t clen =
           c.cand->slots[job.cand_idx].len.load(std::memory_order_acquire);
-      if (clen == 0 || clen > kCandMax) break;
+      if (clen == 0 || clen > kCandMax) {
+        fprintf(stderr, "[analyzer] drop bad cand fuzzer=%u clen=%u\n", i,
+                clen);
+        c.ring->head.v.store(head + 1, std::memory_order_release);
+        jobs[i] += 1;
+        break;
+      }
+      // Hold head until this LearnJob is done so the fuzzer cannot reuse
+      // cand[idx] / ring[idx]. Read the slot in place (no private copy).
       const uint8_t *cbuf = c.cand->slots[job.cand_idx].bytes;
       auto hit = tree.CheckSuffix((sedbt::NodeRef)job.frontier, job.dir, cbuf,
                                   clen);
       if (hit.kind != sedbt::Tree::SuffixKind::Frontier) {
         fprintf(stderr, "[analyzer] drop fuzzer=%u frontier=%u dir=%u kind=%u\n",
                 i, job.frontier, job.dir, (unsigned)hit.kind);
+        c.ring->head.v.store(head + 1, std::memory_order_release);
+        jobs[i] += 1;
         break;
       }
       if (hit.frontier != job.frontier || hit.dir != job.dir) {
@@ -440,7 +510,13 @@ int main(int argc, char **argv) {
                 job.frontier, job.dir, hit.frontier, hit.dir, hit.skip_cnt);
       }
       std::vector<sedbt::Event> ev;
-      if (!run_concolic(&co, concolic, cbuf, clen, hit.skip_cnt, &ev)) break;
+      if (!run_concolic(&co, concolic, cbuf, clen, hit.skip_cnt, job.timeout_ms,
+                        &ev)) {
+        fprintf(stderr,
+                "[analyzer] concolic fail fuzzer=%u frontier=%u (slot held)\n",
+                i, job.frontier);
+        break;
+      }
       sedbt::NodeRef path_tail = sedbt::kUnexplored;
       uint8_t tdir = 0;
       // Path-s binds at hit.(frontier,dir), which may be deeper than
@@ -449,6 +525,8 @@ int main(int argc, char **argv) {
       // can adopt it; the LearnJob fields themselves are not rewritten.
       tree.InsertSuffix(hit.frontier, hit.dir, ev, co.labels, max_label, cbuf,
                         clen, &path_tail, &tdir);
+      c.ring->head.v.store(head + 1, std::memory_order_release);
+      jobs[i] += 1;
       fprintf(stderr,
               "[analyzer] suffix fuzzer=%u frontier=%u dir=%u events=%zu "
               "nodes=%u\n",
@@ -464,5 +542,6 @@ int main(int argc, char **argv) {
     fprintf(stderr, "[analyzer] tree dump -> %s nodes=%u\n", dump,
             tree.live_nodes());
   }
+  symafl::suffix_screen_dump_stats();
   return 0;
 }

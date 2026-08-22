@@ -307,6 +307,26 @@ __taint_trace_gep(dfsan_label ptr_label, uint64_t ptr,
   return;
 }
 
+// Pin a tainted memcpy-family size to its observed concrete value so CONS_SAN
+// can skip fsrv_cov when that size changes. Same send_cond shape as GEP
+// (ConstraintFlag + F_MEMLEN_PIN). No gep_type metadata record.
+extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
+__taint_trace_copy_len(dfsan_label len_label, uint64_t len, uint32_t cid) {
+  if (len_label == 0 || len_label == kInitializingLabel) return;
+  if (!flags().taint_trace_addr_cond) return;
+  dfsan_label_info *info = get_label_info(len_label);
+  uint16_t width = info->size;
+  if (width == 0 || width > 64) width = 64;
+  uint64_t k =
+      (width == 64) ? len : (len & ((1ULL << width) - 1));
+  dfsan_label eq =
+      dfsan_union(len_label, 0, (bveq << 8) | ICmp, width, k, k);
+  if (eq == 0 || eq == kInitializingLabel) return;
+  __taint_mark_next_cond_memlen_pin();
+  __taint_send_cond(eq, 1, 0, ConstraintFlag, cid,
+                    __builtin_return_address(0));
+}
+
 extern "C" SANITIZER_INTERFACE_ATTRIBUTE void
 __taint_trace_offset(dfsan_label offset_label, s64 offset, unsigned size) {
   // use add_constraint_type to send offset constraints

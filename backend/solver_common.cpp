@@ -33,12 +33,22 @@ int __control_pipe_fd;
 static uint64_t __taint_symbolic_depth;
 static symafl_single_pass_control *__single_pass;
 static THREADLOCAL uint8_t t_next_cond_gep_pin;
+static THREADLOCAL uint8_t t_next_cond_memlen_pin;
 
 extern "C" void __taint_mark_next_cond_gep_pin() { t_next_cond_gep_pin = 1; }
+extern "C" void __taint_mark_next_cond_memlen_pin() {
+  t_next_cond_memlen_pin = 1;
+}
 
 static uint8_t consume_gep_pin() {
   uint8_t v = t_next_cond_gep_pin;
   t_next_cond_gep_pin = 0;
+  return v;
+}
+
+static uint8_t consume_memlen_pin() {
+  uint8_t v = t_next_cond_memlen_pin;
+  t_next_cond_memlen_pin = 0;
   return v;
 }
 
@@ -364,6 +374,7 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
   // Consume even on early return so a skipped GEP pin cannot leak onto the
   // next ordinary branch.
   const uint8_t gep = consume_gep_pin();
+  const uint8_t memlen = consume_memlen_pin();
   // Only input-dependent, initialized labels are symbolic SEDBT events. Keep
   // this guard at the transport boundary as well as in fastgen.cpp because
   // runtime custom hooks also call __taint_send_cond directly.
@@ -406,7 +417,7 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
     }
     uint8_t constraint = 0;
     if (loop_flag & ConstraintFlag)
-      constraint = gep ? 2 : 1;
+      constraint = gep ? 2 : (memlen ? 3 : 1);
     uint8_t rsan_bug = (loop_flag & RsanCheckFlag)
         ? (uint8_t)((loop_flag & RsanBugDirFlag) ? 1 : 0)
         : 0xff;
@@ -446,6 +457,7 @@ extern "C" void __taint_send_cond(dfsan_label label, uint8_t result,
   if (loop_flag & ConstraintFlag) {
     flags |= F_CONSTRAINT;
     if (gep) flags |= F_GEP_PIN;
+    else if (memlen) flags |= F_MEMLEN_PIN;
   }
   if (loop_flag & RsanCheckFlag) {
     flags |= F_RSAN_CHECK;

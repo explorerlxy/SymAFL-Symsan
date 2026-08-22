@@ -482,6 +482,7 @@ class Taint {
   FunctionType *TaintTraceSelectFnTy;
   FunctionType *TaintTraceIndirectCallFnTy;
   FunctionType *TaintTraceGEPFnTy;
+  FunctionType *TaintTraceCopyLenFnTy;
   FunctionType *TaintPushStackFrameFnTy;
   FunctionType *TaintPopStackFrameFnTy;
   FunctionType *TaintTraceAllocaFnTy;
@@ -515,6 +516,7 @@ class Taint {
   FunctionCallee TaintTraceSelectFn;
   FunctionCallee TaintTraceIndirectCallFn;
   FunctionCallee TaintTraceGEPFn;
+  FunctionCallee TaintTraceCopyLenFn;
   FunctionCallee TaintPushStackFrameFn;
   FunctionCallee TaintPopStackFrameFn;
   FunctionCallee TaintTraceAllocaFn;
@@ -1140,6 +1142,9 @@ bool Taint::initializeModule(Module &M) {
       Int64Ty, Int64Ty, Int64Ty, Int64Ty, Int32Ty };
   TaintTraceGEPFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), TaintTraceGEPArgs, false);
+  TaintTraceCopyLenFnTy = FunctionType::get(
+      Type::getVoidTy(*Ctx),
+      { PrimitiveShadowTy, Int64Ty, Int32Ty }, false);
   TaintPushStackFrameFnTy = FunctionType::get(
       Type::getVoidTy(*Ctx), {}, false);
   TaintPopStackFrameFnTy = FunctionType::get(
@@ -1482,6 +1487,15 @@ void Taint::initializeCallbackFunctions(Module &M) {
   {
     AttributeList AL;
     AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoMerge);
+    AL = AL.addParamAttribute(M.getContext(), 0, Attribute::ZExt);
+    TaintTraceCopyLenFn =
+        Mod->getOrInsertFunction("__taint_trace_copy_len", TaintTraceCopyLenFnTy,
+                                 AL);
+  }
+  {
+    AttributeList AL;
+    AL = AL.addFnAttribute(M.getContext(), Attribute::NoUnwind);
     TaintPushStackFrameFn =
         Mod->getOrInsertFunction("__taint_push_stack_frame", TaintPushStackFrameFnTy, AL);
   }
@@ -1558,6 +1572,8 @@ void Taint::initializeCallbackFunctions(Module &M) {
       TaintTraceIndirectCallFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintTraceGEPFn.getCallee()->stripPointerCasts());
+  TaintRuntimeFunctions.insert(
+      TaintTraceCopyLenFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
       TaintPushStackFrameFn.getCallee()->stripPointerCasts());
   TaintRuntimeFunctions.insert(
@@ -4309,6 +4325,17 @@ void TaintVisitor::visitSelectInst(SelectInst &I) {
 }
 
 void TaintVisitor::visitMemSetInst(MemSetInst &I) {
+  {
+    Value *Len = I.getLength();
+    Value *LenShadow = TF.getShadow(Len);
+    if (!TF.TT.isZeroShadow(LenShadow) && ClTraceGEPOffset) {
+      IRBuilder<> PinIRB(&I);
+      Value *Len64 = PinIRB.CreateZExtOrTrunc(Len, TF.TT.Int64Ty);
+      ConstantInt *CID =
+          ConstantInt::get(TF.TT.Int32Ty, TF.TT.getInstructionId(&I));
+      PinIRB.CreateCall(TF.TT.TaintTraceCopyLenFn, {LenShadow, Len64, CID});
+    }
+  }
   // check bounds before memset
   if (ClTraceBound) {
     TF.checkBounds(I.getDest(), I.getLength(), &I);
@@ -4326,6 +4353,18 @@ void TaintVisitor::visitMemSetInst(MemSetInst &I) {
 }
 
 void TaintVisitor::visitMemTransferInst(MemTransferInst &I) {
+  // Pin a tainted copy size (llvm.memcpy/memmove) for CONS_SAN.
+  {
+    Value *Len = I.getLength();
+    Value *LenShadow = TF.getShadow(Len);
+    if (!TF.TT.isZeroShadow(LenShadow) && ClTraceGEPOffset) {
+      IRBuilder<> PinIRB(&I);
+      Value *Len64 = PinIRB.CreateZExtOrTrunc(Len, TF.TT.Int64Ty);
+      ConstantInt *CID =
+          ConstantInt::get(TF.TT.Int32Ty, TF.TT.getInstructionId(&I));
+      PinIRB.CreateCall(TF.TT.TaintTraceCopyLenFn, {LenShadow, Len64, CID});
+    }
+  }
   // check bounds before memcpy
   if (ClTraceBound) {
     TF.checkBounds(I.getDest(), I.getLength(), &I);

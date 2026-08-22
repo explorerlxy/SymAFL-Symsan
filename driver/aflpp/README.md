@@ -29,11 +29,13 @@ Production default does not globally veto concrete (ADR 0009). Path-s
 mutants skip concrete on parent-suffix replay or a filled first disagreement
 (`SYMAFL_PATH_S_SCREEN`). `SYMAFL_MUT_PATH_S=0`/`off` skips path-s;
 unset/`1`/`suffix` is suffix taint; `full` is root→terminal taint. An
-explore mutant that changed a tainted GEP-index pin skips `fsrv_cov` and
+explore mutant that changed a CONS_SAN pin (GEP-index or memcpy-family size) skips `fsrv_cov` and
 runs `fsrv_san` (`SYMAFL_PATH_S_CONS_SAN`, once per GEP value; independent
-of screen). Indcall/read-length pins go through cov. A
-sanitizer crash peeks `fsrv_cov`; `fsrv_cov_miss` counts unique con_san
-crashes whose simplify_trace was already seen on coverage. Canonical
+of screen). Indcall/read-length pins go through cov. A `con_san` / focused
+sanitizer crash peeks `fsrv_cov` (not `fsrv_cov_crash`); `fsrv_cov_miss`
+counts unique con_san crashes whose peek neither crashed nor produced a
+new simplify_trace. Mutator `fsrv_cov` crashes never enter `fsrv_san`.
+Canonical
 counters are `[sedbt-mce]`. Focused mutation uses RSan closures from the live
 tree SHM. `SYMAFL_MUT_CLOSURE=0` skips that side's
 analyzer compute and fuzzer stats/mutation. `learned=1` uses stacked

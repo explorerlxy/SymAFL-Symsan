@@ -492,11 +492,11 @@ static const uint8_t TrueBranchLoopExit = 0x2;
 static const uint8_t FalseBranchLoopExit = 0x1;
 static const uint8_t LoopFlagMask = 0xF;
 static const uint8_t UndefinedCheck = 0x10;
-// Constraint events (tainted GEP index / indcall target / read-length pinned
-// to their observed concrete value): the recorded result is always 1; replay
-// skips direction validation for them (they are screening semantics, not real
-// branches). Must be above LoopFlagMask so send_cond's loop switch ignores it.
-// GEP identity is F_GEP_PIN on the pipe, not another loop_flag bit.
+// Constraint events (tainted GEP index / copy-size / indcall / read-length
+// pinned to their observed concrete value): the recorded result is always 1;
+// replay skips direction validation for them (they are screening semantics,
+// not real branches). Must be above LoopFlagMask so send_cond's loop switch
+// ignores it. CONS_SAN identity is F_GEP_PIN / F_MEMLEN_PIN on the pipe.
 static const uint8_t ConstraintFlag = 0x20;
 // RSan/swiftsan bounds-check cond (ADR 0010 W3). RsanBugDirFlag means the
 // bug-trigger direction is 1 (true); clear means 0 (false).
@@ -529,6 +529,12 @@ static constexpr uint32_t kIconvSurrogateHiCid = 7;   // cp <= 0xDFFF
 // boundaries respected, or a truncated sequence that fails). Emitted once
 // per byte after the nine class checks; stream position distinguishes bytes.
 static constexpr uint32_t kIconvUtf8SeqValidCid = 17;
+// memcpy-family copy-size CONS_SAN pins (libc wrappers; LLVM memcpy uses
+// per-instruction djbHash cids via __taint_trace_copy_len).
+static constexpr uint32_t kMemcpyConstraintCid = 18;
+static constexpr uint32_t kMemmoveConstraintCid = 19;
+static constexpr uint32_t kMemsetConstraintCid = 20;
+static constexpr uint32_t kStrncpyConstraintCid = 21;
 
 enum undefined_check_ids {
   ub_integer_overflow = 1,
@@ -552,16 +558,21 @@ enum undefined_check_ids {
 #define F_ADD_CONS   0x1
 #define F_LOOP_EXIT  0x2
 #define F_LOOP_LATCH 0x4
-// Constraint events (tainted GEP index == concrete, tainted indcall target
+// Constraint events (tainted GEP index / copy-size / indcall / read-length
 // == concrete): the recorded result is always 1 (the constraint held for the
 // traced run). They are screening semantics, not real branches: replay must
 // skip direction validation for them.
 #define F_CONSTRAINT 0x8
 #define F_RSAN_CHECK 0x10
 #define F_RSAN_BUG_DIR 0x20
-// Tainted GEP-index pin (with F_CONSTRAINT). Indcall/read-length pins are
-// F_CONSTRAINT only. CONS_SAN skips fsrv_cov only for GEP pins.
+// Tainted GEP-index pin (with F_CONSTRAINT). CONS_SAN binds GEP and copy-size.
 #define F_GEP_PIN 0x40
+// memcpy/memmove/strncpy/memset tainted size pin (with F_CONSTRAINT).
+// Indcall / fread-style read-length stay F_CONSTRAINT only.
+#define F_MEMLEN_PIN 0x80
+
+extern "C" void __taint_trace_copy_len(dfsan_label len_label, uint64_t len,
+                                       uint32_t cid);
 
 #define F_MEMERR_UAF  0x1
 #define F_MEMERR_OLB  0x2

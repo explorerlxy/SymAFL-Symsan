@@ -74,12 +74,13 @@ bool analyzer_connect(AnalyzerClient *c, const char *sock_path) {
   symafl::HelloOkBody ok{};
   if (!recv_all(c->sock, &ok, sizeof(ok))) return false;
   c->fuzzer_id = ok.fuzzer_id;
-  int fd = -1;
-  c->tree = (symafl::SedbtShm *)symafl::open_shm(ok.tree_name,
-                                                sizeof(symafl::SedbtShm), &fd);
+  int tfd = symafl::recv_fd(c->sock);
+  c->tree = (symafl::SedbtShm *)symafl::map_tree_fd(tfd, ok.tree_bytes);
+  if (tfd >= 0) close(tfd);
+  int rfd = -1;
   c->ring = (symafl::FuzzerRing *)symafl::open_shm(ok.ring_name,
                                                   sizeof(symafl::FuzzerRing),
-                                                  &fd);
+                                                  &rfd);
   fprintf(stderr, "[sedbt] analyzer hello-ok id=%u tree=%s ring=%s cand=%s\n",
           c->fuzzer_id, ok.tree_name, ok.ring_name, c->cand_name);
   if (!c->tree || !c->ring || !c->cand) return false;
@@ -122,24 +123,38 @@ bool analyzer_wait_done(AnalyzerClient *c) {
 }
 
 bool analyzer_submit(AnalyzerClient *c, uint32_t frontier, uint8_t dir,
-                   uint32_t skip_cnt, const uint8_t *buf, uint32_t len) {
-  if (!c || !c->ring || !c->cand || len > symafl::kCandMax) return false;
+                   uint32_t skip_cnt, const uint8_t *buf, uint32_t len,
+                   uint32_t timeout_ms, uint8_t kind) {
+  if (!c || !c->ring || !c->cand) return false;
+  if (kind == symafl::kJobLearn &&
+      (!buf || len == 0 || len > symafl::kCandMax))
+    return false;
   uint64_t head = c->ring->head.v.load(std::memory_order_acquire);
   uint64_t tail = c->ring->tail.v.load(std::memory_order_relaxed);
   if (tail - head >= symafl::kRingCap) return false;
   uint32_t idx = (uint32_t)(tail % symafl::kRingCap);
-  memcpy(c->cand->slots[idx].bytes, buf, len);
-  c->cand->slots[idx].len.store(len, std::memory_order_release);
+  if (kind == symafl::kJobLearn) {
+    memcpy(c->cand->slots[idx].bytes, buf, len);
+    c->cand->slots[idx].len.store(len, std::memory_order_release);
+  } else {
+    c->cand->slots[idx].len.store(0, std::memory_order_release);
+  }
   symafl::LearnJob job{};
   job.job_id = c->next_job++;
   job.fuzzer_id = c->fuzzer_id;
   job.cand_idx = idx;
   job.frontier = frontier;
   job.skip_cnt = skip_cnt;
+  job.timeout_ms = timeout_ms;
   job.dir = dir;
+  job.kind = kind;
   c->ring->slots[idx] = job;
   c->ring->tail.v.store(tail + 1, std::memory_order_release);
   return true;
+}
+
+bool analyzer_submit_close(AnalyzerClient *c, uint32_t node, uint8_t dir) {
+  return analyzer_submit(c, node, dir, 0, nullptr, 0, 0, symafl::kJobCloseBug);
 }
 
 symafl::WalkResult analyzer_check(AnalyzerClient *c, const uint8_t *buf,
@@ -161,14 +176,6 @@ symafl::WalkResult analyzer_check_suffix(AnalyzerClient *c, const uint8_t *buf,
     return r;
   }
   return symafl::check_suffix(c->tree, buf, len, frontier, dir);
-}
-
-bool analyzer_close_bug_edge(AnalyzerClient *c, uint32_t node, uint8_t dir) {
-  if (!c || c->sock < 0 || dir > 1) return false;
-  symafl::CloseBugBody b{};
-  b.node = node;
-  b.dir = dir;
-  return send_hdr(c->sock, symafl::kCloseBugEdge, sizeof(b), &b);
 }
 
 void analyzer_close(AnalyzerClient *c) {

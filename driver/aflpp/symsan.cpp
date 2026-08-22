@@ -9,9 +9,10 @@
   insert live in symafl-analyzer. CheckInput is a learn-gate (ADR 0009).
   Path-s mutants that replay the parent seed's LearnJob suffix skip concrete
   (SYMAFL_PATH_S_SCREEN); havoc never skips. An explore mutant that
-  changed a tainted GEP-index pin (not indcall/read-length) skips fsrv_cov
-  and runs fsrv_san (SYMAFL_PATH_S_CONS_SAN) once per distinct GEP-byte
-  tuple; later mutants with the same GEP value go through cov.
+  changed a tainted GEP-index or memcpy-family size pin (not indcall /
+  fread-length) skips fsrv_cov and runs fsrv_san (SYMAFL_PATH_S_CONS_SAN)
+  once per distinct pin-byte tuple; later mutants with the same value go
+  through cov. SYMAFL_ANALYZER=0 skips the analyzer (split cov→san only).
   Coverage gainers submit
   LearnJobs (including havoc sanitizer crashes: the path may still have
   unexplored RSan bug edges). A focused sanitizer crash closes that RSan bug
@@ -22,6 +23,7 @@
 
 #include "sedbt.hpp"
 #include "analyzer_client.hpp"
+#include "suffix_screen.hpp"
 
 extern "C" {
 #include "afl-fuzz.h"
@@ -87,6 +89,7 @@ struct SeedLearn {
   uint16_t path_s_cons_n = 0;
   uint8_t path_s_ready = 0;
   uint8_t have_frontier = 0;  // 1 = LearnJob edge is this seed's suffix start
+  uint32_t stall_rounds = 0;  // consecutive fuzz rounds with no new coverage
   std::vector<uint32_t> rsan_nodes;
 };
 
@@ -146,9 +149,6 @@ struct my_mutator_t {
   std::unordered_set<std::string> traced_entries;
   bool bootstrap_done = false;
 
-  // screening gates LearnJobs (bootstrap flush + gain-gated insert).
-  // Concrete never skips: CheckInput is a learn-gate only (ADR 0009).
-  bool screening = true;
   uint8_t rlimit = 16;
   uint8_t len_rlimit = 16;
   sedbt::NodeRef last_node = sedbt::kUnexplored;
@@ -232,6 +232,9 @@ struct my_mutator_t {
   uint8_t current_dir = 0;
   uint8_t current_have_frontier = 0;
   uint8_t current_learned = symafl::kWalkFail;
+  std::string last_queue_name;
+  bool round_found_cov = false;
+  uint64_t path_s_refresh_cnt = 0;
   uint32_t explore_n = 0;
   uint32_t mut_i = 0;
   uint32_t explore_pct = 50;
@@ -241,7 +244,6 @@ struct my_mutator_t {
   bool mut_closure = true;   // SYMAFL_MUT_CLOSURE, default on
   bool path_s_screen = true; // SYMAFL_PATH_S_SCREEN: parent-suffix skip cov
   bool path_s_cons_san = true; // SYMAFL_PATH_S_CONS_SAN: GEP-index → fsrv_san
-  symafl::SuffixScreenCache screen_cache;
   std::unordered_set<uint64_t> gep_skip_keys;  // one CONS_SAN skip per GEP value
   // Canonical MCE counters (docs/evaluation.md). Aliases below keep deinit
   // greps working: path_s_exec, path_s_san_exec, path_s_screened, …
@@ -253,11 +255,16 @@ struct my_mutator_t {
   uint64_t con_san_cnt = 0;        // skip cov → fsrv_san (constraint symbol)
   uint64_t exp_tgt_mta_cnt = 0;    // path-s explore-targeting mutations
   uint64_t exp_tgt_mta_admit_cnt = 0;  // those that passed suffix screen
-  uint64_t suffix_screen_ns = 0;   // time in suffix_vs_parent only
-  uint64_t suffix_screen_steps = 0;  // nodes visited
-  uint64_t suffix_screen_evals = 0;  // mutant eval_dir (parent dirs are cached)
+  uint64_t suffix_screen_ns = 0;
+  uint64_t suffix_screen_steps = 0;  // interpreter miss: nodes visited
+  uint64_t suffix_screen_evals = 0;  // interpreter miss: parent+mutant eval_dir
+  uint64_t suffix_screen_hit = 0;
+  uint64_t suffix_screen_miss = 0;
+  uint64_t mut_cnt = 0;            // mutants after TREE_READY+ACK+DONE
+  uint64_t bootstrap_ns = 0;       // CLOCK_MONOTONIC at analyzer-fuzzer sync
   uint64_t fsrv_san_crash = 0;     // unique fsrv_san crashes (sig+pattern)
-  uint64_t fsrv_cov_miss = 0;      // unique con_san crash, peek pattern seen
+  uint64_t fsrv_cov_crash = 0;     // unique mutator fsrv_cov crashes (sig+pattern)
+  uint64_t fsrv_cov_miss = 0;      // unique con_san crash: peek no crash + seen
   uint64_t path_s_exec = 0;        // alias: admitted explore that ran fsrv_cov
   uint64_t path_s_san_exec = 0;    // alias: con_san_cnt
   uint64_t path_s_san_crash = 0;   // con_san crash events (not unique)
@@ -268,8 +275,10 @@ struct my_mutator_t {
   uint64_t default_exec = 0;      // AFL det/havoc (and other non-custom) concrete
   uint64_t vuln_ns = 0;           // mutate+screen + fsrv_san for vuln only
   std::unordered_set<uint32_t> seen_simplify;
-  std::unordered_set<uint64_t> san_crash_keys;  // (sig<<32)|peek_hash
+  std::unordered_set<uint64_t> san_crash_keys;  // (sig<<32)|cov_simplify_hash
+  std::unordered_set<uint64_t> cov_crash_keys;  // (sig<<32)|cov_simplify_hash
   bool last_cov_candidate = false;  // next fsrv_cov is a mutant (not cal)
+  uint32_t last_cov_hash = 0;       // simplify hash of that mutator fsrv_cov run
   std::vector<u8> last_cov_buf;
   std::vector<u8> focused_scratch;
   uint32_t focused_rr = 0;
@@ -482,7 +491,7 @@ static void write_progress(my_mutator_t *data, bool force) {
   fprintf(data->progress_log, "%llu\t%llu\t%llu\t%llu\t%d\n",
           (unsigned long long)now, (unsigned long long)data->screened,
           (unsigned long long)data->admitted,
-          (unsigned long long)data->vetoed, data->screening ? 1 : 0);
+          (unsigned long long)data->vetoed, 1);
   fflush(data->progress_log);
 }
 
@@ -539,24 +548,16 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   }
   data->focused_rng = seed ? seed : 1u;
 
-  // ADR 0010: the CLI target is the concrete binary. Concolic belongs to
-  // symafl-analyzer (SYMAFL_ANALYZER_SOCK required). Optional sanitizer
-  // forkserver is spawned by AFL++ after this init returns.
+  // SYMAFL_ANALYZER=0: split fsrv_cov→fsrv_san only (RQ1 cell B). No
+  // SEDBT, LearnJob, path-s, or CONS_SAN. SOCK / CONCOLIC_TARGET unused.
+  const bool want_analyzer = sedbt::parse_analyzer_env(getenv("SYMAFL_ANALYZER"));
   const char *concolic = getenv("SYMAFL_CONCOLIC_TARGET");
-  if (!concolic || !*concolic) {
-    FATAL("SEDBT mode requires SYMAFL_CONCOLIC_TARGET (CLI target is the "
-          "concrete binary)");
-  }
-  if (access(concolic, X_OK)) {
-    PFATAL("SEDBT concolic target is not executable");
-  }
   const char *san = getenv("SYMAFL_SANITIZER_TARGET");
   if (san && *san && access(san, X_OK)) {
     PFATAL("SEDBT sanitizer target is not executable");
   }
-  data->afl->sedbt_mode = 1;
-  data->concolic_target = (char *)ck_strdup((u8 *)concolic);
   if (san && *san) data->sanitizer_target = (char *)ck_strdup((u8 *)san);
+  data->afl->sedbt_mode = 1;
 
   if (const char *mode = getenv("SYMAFL_TRACE_MODE")) {
     WARNF("SYMAFL_TRACE_MODE=%s is ignored: SEDBT transport is selected "
@@ -567,16 +568,49 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     FATAL("SYMAFL_WORKER_SOCK was renamed to SYMAFL_ANALYZER_SOCK; "
           "SYMAFL_PCBT_DEBUG was renamed to SYMAFL_SEDBT_DEBUG");
   }
-  const char *wsock = getenv("SYMAFL_ANALYZER_SOCK");
-  if (!wsock || !*wsock) {
-    FATAL("SEDBT mode requires SYMAFL_ANALYZER_SOCK "
-          "(concolic is symafl-analyzer; ADR 0010)");
+
+  if (!want_analyzer) {
+    if (!san || !*san) {
+      FATAL("SYMAFL_ANALYZER=0 requires SYMAFL_SANITIZER_TARGET "
+            "(split fsrv_cov→fsrv_san)");
+    }
+    data->analyzer_mode = false;
+    data->mut_path_s = false;
+    data->mut_closure = false;
+    data->path_s_screen = false;
+    data->path_s_cons_san = false;
+    if (concolic && *concolic)
+      WARNF("SYMAFL_ANALYZER=0: ignoring SYMAFL_CONCOLIC_TARGET\n");
+    if (getenv("SYMAFL_ANALYZER_SOCK"))
+      WARNF("SYMAFL_ANALYZER=0: ignoring SYMAFL_ANALYZER_SOCK\n");
+    fprintf(stderr, "[sedbt] analyzer=off (split fsrv_cov→fsrv_san; "
+                    "no SEDBT/LearnJob)\n");
+  } else {
+    if (!concolic || !*concolic) {
+      FATAL("SEDBT mode requires SYMAFL_CONCOLIC_TARGET (CLI target is the "
+            "concrete binary)");
+    }
+    if (access(concolic, X_OK)) {
+      PFATAL("SEDBT concolic target is not executable");
+    }
+    data->concolic_target = (char *)ck_strdup((u8 *)concolic);
+    const char *wsock = getenv("SYMAFL_ANALYZER_SOCK");
+    if (!wsock || !*wsock) {
+      FATAL("SEDBT mode requires SYMAFL_ANALYZER_SOCK "
+            "(concolic is symafl-analyzer; ADR 0010); "
+            "set SYMAFL_ANALYZER=0 for split-only (no analyzer)");
+    }
+    data->analyzer_mode = true;
+    if (!afl->disable_trim) {
+      FATAL("SEDBT analyzer mode requires AFL_DISABLE_TRIM=1 "
+            "(trim rewrites queue files after bootstrap InsertTrace / "
+            "LearnJob; the learned bytes must match the saved queue entry)");
+    }
+    if (!analyzer_connect(&data->analyzer, wsock)) {
+      FATAL("SYMAFL_ANALYZER_SOCK connect failed: %s", wsock);
+    }
+    fprintf(stderr, "[sedbt] analyzer client connected (%s)\n", wsock);
   }
-  data->analyzer_mode = true;
-  if (!analyzer_connect(&data->analyzer, wsock)) {
-    FATAL("SYMAFL_ANALYZER_SOCK connect failed: %s", wsock);
-  }
-  fprintf(stderr, "[sedbt] analyzer client connected (%s)\n", wsock);
 
   if (const char *forensics = getenv("SYMAFL_FORENSICS_DIR")) {
     if (!*forensics) FATAL("SYMAFL_FORENSICS_DIR must not be empty");
@@ -696,40 +730,47 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->havoc_pct = (uint32_t)v;
   }
   {
-    if (const char *e = getenv("SYMAFL_MUT_PATH_S")) {
-      data->path_s_mode = sedbt::parse_mut_path_s_env(e);
-      data->mut_path_s = data->path_s_mode != sedbt::PathSMode::Off;
+    if (data->analyzer_mode) {
+      if (const char *e = getenv("SYMAFL_MUT_PATH_S")) {
+        data->path_s_mode = sedbt::parse_mut_path_s_env(e);
+        data->mut_path_s = data->path_s_mode != sedbt::PathSMode::Off;
+      }
+      if (const char *e = getenv("SYMAFL_MUT_CLOSURE"))
+        data->mut_closure = strcmp(e, "0") != 0;
+      if (const char *e = getenv("SYMAFL_PATH_S_SCREEN"))
+        data->path_s_screen = strcmp(e, "0") != 0;
+      if (data->path_s_mode != sedbt::PathSMode::Suffix)
+        data->path_s_screen = false;
+      if (const char *e = getenv("SYMAFL_PATH_S_CONS_SAN"))
+        data->path_s_cons_san = strcmp(e, "0") != 0;
+      data->tree.set_path_s_mode(data->path_s_mode);
+      data->tree.set_compute_closures(data->mut_closure);
     }
-    if (const char *e = getenv("SYMAFL_MUT_CLOSURE"))
-      data->mut_closure = strcmp(e, "0") != 0;
-    if (const char *e = getenv("SYMAFL_PATH_S_SCREEN"))
-      data->path_s_screen = strcmp(e, "0") != 0;
-    if (const char *e = getenv("SYMAFL_PATH_S_CONS_SAN"))
-      data->path_s_cons_san = strcmp(e, "0") != 0;
-    data->tree.set_path_s_mode(data->path_s_mode);
-    data->tree.set_compute_closures(data->mut_closure);
     fprintf(stderr, "[sedbt] mutate path_s=%s closure=%s havoc_pct=%u "
-            "path_s_screen=%s path_s_cons_san=%s (0 disables that side / "
-            "AFL havoc tail / parent-suffix skip / GEP-index→fsrv_san)\n",
+            "path_s_screen=%s path_s_cons_san=%s analyzer=%s (0 disables that side / "
+            "AFL havoc tail / parent-suffix skip / CONS_SAN pin→fsrv_san)\n",
             sedbt::path_s_mode_name(data->path_s_mode),
             data->mut_closure ? "on" : "off", data->havoc_pct,
             data->path_s_screen ? "on" : "off",
-            data->path_s_cons_san ? "on" : "off");
+            data->path_s_cons_san ? "on" : "off",
+            data->analyzer_mode ? "on" : "off");
   }
   if (getenv("SYMAFL_VETO") || getenv("SYMAFL_NO_VETO") ||
       getenv("SYMAFL_VETO_PROBE_EVERY")) {
     FATAL("SYMAFL_VETO / SYMAFL_NO_VETO / SYMAFL_VETO_PROBE_EVERY are removed. "
           "Concrete always admits; CheckInput is a learn-gate (ADR 0009)");
   }
-  fprintf(stderr,
-          "[sedbt] CheckInput is a learn-gate (ADR 0009). "
-          "Path-s parent-suffix screen may skip concrete "
-          "(SYMAFL_PATH_S_SCREEN); tainted GEP-index mutants "
-          "skip cov once per GEP value and run fsrv_san "
-          "(SYMAFL_PATH_S_CONS_SAN); havoc never skips.\n");
   if (getenv("SYMAFL_NO_SCREEN")) {
-    data->screening = false;
-    fprintf(stderr, "[sedbt] SYMAFL_NO_SCREEN: no LearnJobs, no concolic insert\n");
+    FATAL("SYMAFL_NO_SCREEN is removed; use SYMAFL_ANALYZER=0 for split-only "
+          "(no LearnJobs / no analyzer)");
+  }
+  if (data->analyzer_mode) {
+    fprintf(stderr,
+            "[sedbt] CheckInput is a learn-gate (ADR 0009). "
+            "Path-s parent-suffix screen may skip concrete "
+            "(SYMAFL_PATH_S_SCREEN); tainted GEP-index / copy-size mutants "
+            "skip cov once per pin value and run fsrv_san "
+            "(SYMAFL_PATH_S_CONS_SAN); havoc never skips.\n");
   }
   if (const char *root_shm = getenv("SYMAFL_ROOT_SHM")) {
     data->root_shm_enabled = strcmp(root_shm, "0") != 0;
@@ -998,7 +1039,7 @@ static const symafl::ShmClosure *shm_clos(const symafl::SedbtShm *shm,
   uint32_t i = n.clos_i - 1;
   uint32_t nc = shm->hdr.n_clos.load(std::memory_order_acquire);
   if (i >= nc || i >= shm->hdr.clos_cap) return nullptr;
-  return &shm->clos[i];
+  return &symafl::shm_clos_tab(shm)[i];
 }
 
 static bool load_shm_closure(const symafl::SedbtShm *shm, uint32_t ref,
@@ -1006,18 +1047,19 @@ static bool load_shm_closure(const symafl::SedbtShm *shm, uint32_t ref,
   if (!shm || !out || ref < sedbt::kRoot) return false;
   uint32_t nn = shm->hdr.n_nodes.load(std::memory_order_acquire);
   if (ref >= nn) return false;
-  const symafl::ShmNode &n = shm->nodes[ref];
+  const symafl::ShmNode &n = symafl::shm_nodes(shm)[ref];
   const symafl::ShmClosure *c = shm_clos(shm, n);
   if (!c || n.rsan_bug_dir > 1) return false;
   out->node = ref;
   out->bug_dir = n.rsan_bug_dir;
   out->trigger_neg = c->trigger_neg;
   out->trigger_root = n.pred_root;
-  out->s.assign(shm->s_offs + c->s_off, shm->s_offs + c->s_off + c->s_n);
+  out->s.assign(symafl::shm_s_offs(shm) + c->s_off,
+                symafl::shm_s_offs(shm) + c->s_off + c->s_n);
   out->e.clear();
   out->e.reserve(c->e_n);
   for (uint16_t i = 0; i < c->e_n; ++i) {
-    const symafl::ShmClause &cl = shm->e_clauses[c->e_off + i];
+    const symafl::ShmClause &cl = symafl::shm_e_clauses(shm)[c->e_off + i];
     out->e.push_back({cl.pred_root, cl.negated});
   }
   return !out->s.empty();
@@ -1027,9 +1069,9 @@ static bool rsan_bug_open(const symafl::SedbtShm *shm, uint32_t ref) {
   if (!shm || ref < sedbt::kRoot) return false;
   uint32_t nn = shm->hdr.n_nodes.load(std::memory_order_acquire);
   if (ref >= nn) return false;
-  const symafl::ShmNode &n = shm->nodes[ref];
+  const symafl::ShmNode &n = symafl::shm_nodes(shm)[ref];
   if (n.rsan_bug_dir > 1 || !n.clos_i) return false;
-  uint32_t bug = __atomic_load_n(&shm->nodes[ref].child[n.rsan_bug_dir],
+  uint32_t bug = __atomic_load_n(&symafl::shm_nodes(shm)[ref].child[n.rsan_bug_dir],
                                  __ATOMIC_ACQUIRE);
   return bug == sedbt::kUnexplored;
 }
@@ -1044,7 +1086,8 @@ static bool eval_focused(my_mutator_t *data, const sedbt::AttachedClosure &c,
   if (data->analyzer_mode && data->analyzer.tree) {
     uint32_t np =
         data->analyzer.tree->hdr.n_preds.load(std::memory_order_acquire);
-    return sedbt::eval_e_use(data->analyzer.tree->preds, np, c, buf, len);
+    return sedbt::eval_e_use(symafl::shm_preds(data->analyzer.tree), np, c, buf,
+                             len);
   }
   return data->tree.eval_attached(c, buf, len);
 }
@@ -1057,7 +1100,7 @@ static bool cons_offsets_changed(my_mutator_t *data, const u8 *parent,
   if (data->current_path_s_off + data->current_path_s_cons_n > n_s)
     return false;
   const uint32_t *offs =
-      data->analyzer.tree->s_offs + data->current_path_s_off;
+      symafl::shm_s_offs(data->analyzer.tree) + data->current_path_s_off;
   for (uint16_t i = 0; i < data->current_path_s_cons_n; ++i) {
     uint32_t o = offs[i];
     if (o >= plen) continue;
@@ -1069,7 +1112,7 @@ static bool cons_offsets_changed(my_mutator_t *data, const u8 *parent,
 static uint64_t gep_value_key(my_mutator_t *data, const u8 *buf, size_t len) {
   uint64_t h = 14695981039346656037ull;
   const uint32_t *offs =
-      data->analyzer.tree->s_offs + data->current_path_s_off;
+      symafl::shm_s_offs(data->analyzer.tree) + data->current_path_s_off;
   for (uint16_t i = 0; i < data->current_path_s_cons_n; ++i) {
     uint32_t o = offs[i];
     uint8_t b = (o < len) ? buf[o] : 0xff;
@@ -1081,8 +1124,9 @@ static uint64_t gep_value_key(my_mutator_t *data, const u8 *buf, size_t len) {
   return h;
 }
 
-// Skip fsrv_cov only for a new GEP-index byte tuple. Repeat values, and
-// indcall/read-length pins (not in term_cons_n), run coverage.
+// Skip fsrv_cov only for a new CONS_SAN pin-byte tuple (GEP index or
+// memcpy-family size). Repeat values, and indcall/fread-length pins
+// (not in term_cons_n), run coverage.
 static bool cons_san_should_skip(my_mutator_t *data, const u8 *parent,
                                  size_t plen, const u8 *mut, size_t mlen) {
   if (!cons_offsets_changed(data, parent, plen, mut, mlen)) return false;
@@ -1120,21 +1164,58 @@ static uint32_t simplify_hash_bits(const u8 *bits, u32 map_size) {
   return bits_hash32(tmp.data(), n);
 }
 
+static uint64_t crash_uniq_key(int sig, uint32_t h) {
+  return ((uint64_t)(uint32_t)sig << 32) | (uint64_t)h;
+}
+
+static bool fsrv_was_crash(const afl_forkserver_t *fsrv) {
+  if (fsrv->last_run_timed_out) return false;
+  if (WIFSIGNALED(fsrv->child_status)) return true;
+  if (fsrv->uses_asan) {
+    int st = WEXITSTATUS(fsrv->child_status);
+    if (st == MSAN_ERROR || st == LSAN_ERROR) return true;
+  }
+  if (fsrv->uses_crash_exitcode &&
+      WEXITSTATUS(fsrv->child_status) == fsrv->crash_exitcode)
+    return true;
+  return false;
+}
+
+static int fsrv_crash_sig(const afl_forkserver_t *fsrv) {
+  if (WIFSIGNALED(fsrv->child_status)) return WTERMSIG(fsrv->child_status);
+  return (int)fsrv->last_kill_signal;
+}
+
+static uint32_t cov_simplify_now(my_mutator_t *data) {
+  afl_forkserver_t *fsrv = &data->afl->fsrv;
+  u32 n = fsrv->real_map_size ? fsrv->real_map_size : fsrv->map_size;
+  if (n > fsrv->map_size) n = fsrv->map_size;
+  return simplify_hash_bits(fsrv->trace_bits, n);
+}
+
+// Unique mutator-driven fsrv_cov crash. Same key shape as fsrv_san_crash:
+// (signal, simplify hash) of this coverage execution. Peeks never call this.
+static void note_cov_crash(my_mutator_t *data) {
+  afl_forkserver_t *fsrv = &data->afl->fsrv;
+  if (!fsrv_was_crash(fsrv)) return;
+  const uint64_t key =
+      crash_uniq_key(fsrv_crash_sig(fsrv), cov_simplify_now(data));
+  if (!data->cov_crash_keys.insert(key).second) return;
+  data->fsrv_cov_crash += 1;
+}
+
+// Diagnostic fsrv_cov run for a skipped-cov sanitizer crash. Not a
+// fsrv_cov_exec and never increments fsrv_cov_crash.
 static uint32_t peek_cov_simplify(my_mutator_t *data, const u8 *buf, size_t len,
                                   bool *out_cov_crash) {
   if (out_cov_crash) *out_cov_crash = false;
   afl_forkserver_t *fsrv = &data->afl->fsrv;
   if (fsrv->fsrv_pid <= 0 || !buf || len == 0) return 0;
   afl_fsrv_write_to_testcase(fsrv, const_cast<u8 *>(buf), len);
-  fsrv_run_result_t r =
-      afl_fsrv_run_target(fsrv, fsrv->exec_tmout, &data->afl->stop_soon);
-  if (r == FSRV_RUN_CRASH) {
-    if (out_cov_crash) *out_cov_crash = true;
-    return 0;
-  }
-  u32 n = fsrv->real_map_size ? fsrv->real_map_size : fsrv->map_size;
-  if (n > fsrv->map_size) n = fsrv->map_size;
-  return simplify_hash_bits(fsrv->trace_bits, n);
+  (void)afl_fsrv_run_target(fsrv, fsrv->exec_tmout, &data->afl->stop_soon);
+  const uint32_t h = cov_simplify_now(data);
+  if (out_cov_crash) *out_cov_crash = fsrv_was_crash(fsrv);
+  return h;
 }
 
 static bool run_sanitizer_on(my_mutator_t *data, const u8 *buf, size_t len,
@@ -1151,6 +1232,10 @@ extern "C" size_t afl_custom_fuzz(my_mutator_t *data, u8 *buf, size_t buf_size,
   (void)add_buf;
   (void)add_buf_size;
   (void)max_size;
+  if (!data->analyzer_mode) {
+    *out_buf = buf;
+    return 0;
+  }
   data->focused_pending = false;
   data->path_s_pending = false;
   data->path_s_san_pending = false;
@@ -1189,6 +1274,7 @@ extern "C" size_t afl_custom_fuzz(my_mutator_t *data, u8 *buf, size_t buf_size,
                    sn)) {
         break;
       }
+      if (data->bootstrap_ns) data->mut_cnt += 1;
       if (!eval_focused(data, c, data->focused_scratch.data(),
                         (uint32_t)buf_size)) {
         data->closure_screened += 1;
@@ -1208,10 +1294,11 @@ extern "C" size_t afl_custom_fuzz(my_mutator_t *data, u8 *buf, size_t buf_size,
   if (data->mut_path_s && data->current_path_s_n && data->analyzer.tree) {
     uint32_t n_s = data->analyzer.tree->hdr.n_s.load(std::memory_order_acquire);
     const uint32_t *offs =
-        data->analyzer.tree->s_offs + data->current_path_s_off;
+        symafl::shm_s_offs(data->analyzer.tree) + data->current_path_s_off;
     if (data->current_path_s_off + data->current_path_s_n <= n_s &&
         s_havoc(data, data->focused_scratch.data(), buf_size, offs,
                 data->current_path_s_n)) {
+      if (data->bootstrap_ns) data->mut_cnt += 1;
       data->exp_tgt_mta_cnt += 1;
       if (data->path_s_screen && data->current_have_frontier) {
         uint32_t sc_front = data->current_frontier;
@@ -1223,16 +1310,19 @@ extern "C" size_t afl_custom_fuzz(my_mutator_t *data, u8 *buf, size_t buf_size,
         const uint64_t tscr = profile_now();
         symafl::SuffixWalkStats st{};
         symafl::SuffixCmp cmp;
-        if (data->screen_cache.dir <= 1 &&
-            data->screen_cache.frontier == sc_front &&
-            data->screen_cache.dir == sc_dir) {
-          cmp = symafl::suffix_vs_parent_cached(
-              data->analyzer.tree, &data->screen_cache,
-              data->focused_scratch.data(), (uint32_t)buf_size, &st);
+        const int jr = symafl::suffix_screen(data->analyzer.tree, sc_front, sc_dir,
+                                          data->focused_scratch.data());
+        if (jr == 0) {
+          data->suffix_screen_hit += 1;
+          cmp = symafl::SuffixCmp::Same;
+        } else if (jr == 1) {
+          data->suffix_screen_hit += 1;
+          cmp = symafl::SuffixCmp::Unexplored;
         } else {
+          data->suffix_screen_miss += 1;
           cmp = symafl::suffix_vs_parent(
               data->analyzer.tree, sc_front, sc_dir, buf, (uint32_t)buf_size,
-              data->focused_scratch.data(), (uint32_t)buf_size);
+              data->focused_scratch.data(), (uint32_t)buf_size, &st);
         }
         data->suffix_screen_ns += profile_now() - tscr;
         data->suffix_screen_steps += st.steps;
@@ -1295,7 +1385,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
           (unsigned long long)data->admitted,
           (unsigned long long)data->vetoed,
           (unsigned long long)data->traced_entries.size(),
-          (unsigned long long)(data->screening ? 0 : 1),
+          0ull,
           (unsigned long long)data->single_pass_captures,
           (unsigned long long)data->single_pass_overflows,
           (unsigned long long)t.check_admit_empty,
@@ -1371,8 +1461,10 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
     const double scr_tp = data->suffix_screen_ns
         ? (double)data->exp_tgt_mta_cnt * 1e9 / (double)data->suffix_screen_ns
         : 0.0;
-    const uint64_t cov_crash =
-        data->afl ? (uint64_t)data->afl->saved_crashes : 0;
+    const uint64_t mut_wall_ns =
+        data->bootstrap_ns ? profile_now() - data->bootstrap_ns : 0;
+    const double mut_tp =
+        mut_wall_ns ? (double)data->mut_cnt * 1e9 / (double)mut_wall_ns : 0.0;
     const uint64_t queue_n =
         data->afl ? (uint64_t)data->afl->queued_items : 0;
     fprintf(stderr,
@@ -1383,8 +1475,10 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
             "exp_tgt_mta_cnt=%llu exp_tgt_mta_admit_cnt=%llu "
             "suffix_screen_ns=%llu suffix_screen_throughput=%.2f "
             "suffix_screen_steps=%llu suffix_screen_evals=%llu "
+            "suffix_screen_hit=%llu suffix_screen_miss=%llu "
+            "mut_cnt=%llu mut_wall_ns=%llu mut_throughput=%.2f "
             "fsrv_san_crash=%llu fsrv_cov_crash=%llu fsrv_cov_miss=%llu "
-            "queue_seed_cnt=%llu "
+            "queue_seed_cnt=%llu path_s_refresh_cnt=%llu "
             "closure_exec=%llu fsrv_san_identity=%llu\n",
             (unsigned long long)data->fsrv_cov_exec,
             (unsigned long long)data->fsrv_cov_ns, cov_tp,
@@ -1397,10 +1491,15 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
             (unsigned long long)data->suffix_screen_ns, scr_tp,
             (unsigned long long)data->suffix_screen_steps,
             (unsigned long long)data->suffix_screen_evals,
+            (unsigned long long)data->suffix_screen_hit,
+            (unsigned long long)data->suffix_screen_miss,
+            (unsigned long long)data->mut_cnt,
+            (unsigned long long)mut_wall_ns, mut_tp,
             (unsigned long long)data->fsrv_san_crash,
-            (unsigned long long)cov_crash,
+            (unsigned long long)data->fsrv_cov_crash,
             (unsigned long long)data->fsrv_cov_miss,
             (unsigned long long)queue_n,
+            (unsigned long long)data->path_s_refresh_cnt,
             (unsigned long long)data->closure_exec,
             (unsigned long long)(data->cov_gain_cnt + data->con_san_cnt +
                                  data->closure_exec));
@@ -1415,8 +1514,11 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
                 "exp_tgt_mta_cnt=%llu\nexp_tgt_mta_admit_cnt=%llu\n"
                 "suffix_screen_ns=%llu\nsuffix_screen_throughput=%.6f\n"
                 "suffix_screen_steps=%llu\nsuffix_screen_evals=%llu\n"
+                "suffix_screen_hit=%llu\nsuffix_screen_miss=%llu\n"
+                "mut_cnt=%llu\nmut_wall_ns=%llu\nmut_throughput=%.6f\n"
                 "fsrv_san_crash=%llu\nfsrv_cov_crash=%llu\nfsrv_cov_miss=%llu\n"
                 "queue_seed_cnt=%llu\n"
+                "path_s_refresh_cnt=%llu\n"
                 "closure_exec=%llu\n"
                 "fsrv_san_identity=%llu\n"
                 "bitmap_cvg_note=see fuzzer_stats\n"
@@ -1432,10 +1534,15 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
                 (unsigned long long)data->suffix_screen_ns, scr_tp,
                 (unsigned long long)data->suffix_screen_steps,
                 (unsigned long long)data->suffix_screen_evals,
+                (unsigned long long)data->suffix_screen_hit,
+                (unsigned long long)data->suffix_screen_miss,
+                (unsigned long long)data->mut_cnt,
+                (unsigned long long)mut_wall_ns, mut_tp,
                 (unsigned long long)data->fsrv_san_crash,
-                (unsigned long long)cov_crash,
+                (unsigned long long)data->fsrv_cov_crash,
                 (unsigned long long)data->fsrv_cov_miss,
                 (unsigned long long)queue_n,
+                (unsigned long long)data->path_s_refresh_cnt,
                 (unsigned long long)data->closure_exec,
                 (unsigned long long)(data->cov_gain_cnt + data->con_san_cnt +
                                      data->closure_exec));
@@ -1656,16 +1763,16 @@ static void close_focused_bug(my_mutator_t *data, uint32_t ref) {
   if (ref == ~0u || !data->analyzer.tree) return;
   uint32_t nn = data->analyzer.tree->hdr.n_nodes.load(std::memory_order_acquire);
   if (ref >= nn) return;
-  uint8_t dir = data->analyzer.tree->nodes[ref].rsan_bug_dir;
+  uint8_t dir = symafl::shm_nodes(data->analyzer.tree)[ref].rsan_bug_dir;
   if (dir > 1) return;
+  if (!analyzer_submit_close(&data->analyzer, ref, dir)) {
+    fprintf(stderr, "[sedbt] close-bug ring full node=%u dir=%u\n", ref, dir);
+    return;
+  }
   data->closed_rsan.insert(ref);
   auto &open = data->current_open_rsan;
   open.erase(std::remove(open.begin(), open.end(), ref), open.end());
-  if (!analyzer_close_bug_edge(&data->analyzer, ref, dir)) {
-    fprintf(stderr, "[sedbt] close-bug send failed node=%u dir=%u\n", ref, dir);
-  } else {
-    fprintf(stderr, "[sedbt] close-bug node=%u dir=%u\n", ref, dir);
-  }
+  fprintf(stderr, "[sedbt] close-bug job node=%u dir=%u\n", ref, dir);
 }
 
 static void merge_rsan(SeedLearn *st, const std::vector<uint32_t> &add) {
@@ -1673,6 +1780,44 @@ static void merge_rsan(SeedLearn *st, const std::vector<uint32_t> &add) {
     if (std::find(st->rsan_nodes.begin(), st->rsan_nodes.end(), n) ==
         st->rsan_nodes.end())
       st->rsan_nodes.push_back(n);
+  }
+}
+
+static void adopt_path_s_from_shm(SeedLearn *st, const symafl::SedbtShm *shm) {
+  if (!st || !shm || st->last_node < sedbt::kRoot || st->last_dir > 1) return;
+  uint32_t nn = shm->hdr.n_nodes.load(std::memory_order_acquire);
+  if (st->last_node >= nn || st->last_node >= shm->hdr.node_cap) return;
+  const symafl::ShmNode &n = symafl::shm_nodes(shm)[st->last_node];
+  st->path_s_off = __atomic_load_n(&n.term_s_off[st->last_dir], __ATOMIC_ACQUIRE);
+  st->path_s_n = n.term_s_n[st->last_dir];
+  st->path_s_cons_n = n.term_cons_n[st->last_dir];
+  st->path_s_ready = 1;
+}
+
+static void note_seed_round_result(my_mutator_t *data) {
+  if (data->last_queue_name.empty()) return;
+  auto it = data->seed_learn.find(data->last_queue_name);
+  if (it == data->seed_learn.end()) return;
+  if (data->round_found_cov) it->second.stall_rounds = 0;
+  else it->second.stall_rounds += 1;
+}
+
+static void maybe_refresh_path_s(my_mutator_t *data, SeedLearn *st,
+                                 const char *fname) {
+  if (!st || !data->analyzer.tree) return;
+  if (st->learned != symafl::kReady) return;
+  adopt_path_s_from_shm(st, data->analyzer.tree);
+  if (data->path_s_mode != sedbt::PathSMode::Suffix) return;
+  if (st->stall_rounds < 2) return;
+  if (st->last_node < sedbt::kRoot || st->last_dir > 1) return;
+  int r = symafl::refresh_suffix_path_s(data->analyzer.tree, st->last_node,
+                                        st->last_dir);
+  if (r > 0) {
+    data->path_s_refresh_cnt += 1;
+    adopt_path_s_from_shm(st, data->analyzer.tree);
+    fprintf(stderr, "[sedbt] path-s refresh n=%u cons=%u stall=%u %s\n",
+            st->path_s_n, st->path_s_cons_n, st->stall_rounds,
+            fname ? fname : "");
   }
 }
 
@@ -1695,10 +1840,22 @@ static void take_terminal(SeedLearn *st, const symafl::WalkResult &wr) {
   merge_rsan(st, wr.rsan_nodes);
 }
 
+// Concolic deadline = 50 × the queue seed's concrete exec_us (AFL
+// calibration). Floor 50ms so a 1µs seed still bounds the child; cap 5min.
+static uint32_t learn_timeout_ms(const my_mutator_t *data) {
+  u64 us = 0;
+  if (data->afl && data->afl->queue_cur) us = data->afl->queue_cur->exec_us;
+  if (!us) us = 1000;
+  u64 ms = us * 50ull / 1000ull;
+  if (ms < 50) ms = 50;
+  if (ms > 300000) ms = 300000;
+  return (uint32_t)ms;
+}
+
 static bool try_submit_learn(my_mutator_t *data, SeedLearn *st, const u8 *buf,
                              uint32_t len) {
   if (analyzer_submit(&data->analyzer, st->frontier, st->dir, st->skip_cnt, buf,
-                    len)) {
+                      len, learn_timeout_ms(data), symafl::kJobLearn)) {
     st->learned = symafl::kInFlight;
     return true;
   }
@@ -1726,13 +1883,14 @@ static void collect_open(my_mutator_t *data, const SeedLearn &st,
     if (rsan_bug_open(data, ref)) data->current_open_rsan.push_back(ref);
   }
   if (!data->current_open_rsan.empty()) {
-    const symafl::ShmNode &n = shm->nodes[data->current_open_rsan[0]];
+    const symafl::ShmNode &n = symafl::shm_nodes(shm)[data->current_open_rsan[0]];
     const symafl::ShmClosure *c = shm_clos(shm, n);
     fprintf(stderr, "[sedbt] attached closures=%zu s=",
             data->current_open_rsan.size());
     if (c) {
       for (uint16_t i = 0; i < c->s_n && i < 8; ++i)
-        fprintf(stderr, "%s%u", i ? "," : "", shm->s_offs[c->s_off + i]);
+        fprintf(stderr, "%s%u", i ? "," : "",
+                symafl::shm_s_offs(shm)[c->s_off + i]);
     }
     fprintf(stderr, " node=%u %s\n", data->current_open_rsan[0],
             fname ? fname : "");
@@ -1789,6 +1947,9 @@ static void apply_suffix(my_mutator_t *data, SeedLearn *st, const u8 *buf,
 }
 
 static void load_seed_learn(my_mutator_t *data, const char *filename) {
+  note_seed_round_result(data);
+  data->round_found_cov = false;
+  data->last_queue_name = filename ? filename : "";
   data->current_open_rsan.clear();
   data->current_path_s_off = 0;
   data->current_path_s_n = 0;
@@ -1824,7 +1985,7 @@ static void load_seed_learn(my_mutator_t *data, const char *filename) {
         uint32_t ch = sedbt::kUnexplored;
         if (st.frontier >= sedbt::kRoot && st.frontier < nn && st.dir <= 1)
           ch = __atomic_load_n(
-              &data->analyzer.tree->nodes[st.frontier].child[st.dir],
+              &symafl::shm_nodes(data->analyzer.tree)[st.frontier].child[st.dir],
               __ATOMIC_ACQUIRE);
         if (ch != sedbt::kUnexplored) {
           apply_suffix(data, &st, buf.data(), (uint32_t)buf.size());
@@ -1841,27 +2002,14 @@ static void load_seed_learn(my_mutator_t *data, const char *filename) {
       }
     }
   }
+  if (it->second.learned == symafl::kReady)
+    maybe_refresh_path_s(data, &it->second, filename);
   collect_open(data, it->second, filename);
   data->current_learned = it->second.learned;
   {
     std::vector<u8> parent;
     if (read_queue_file(filename, &parent))
       data->parent_seed = std::move(parent);
-  }
-  {
-    symafl::suffix_screen_cache_clear(&data->screen_cache);
-    if (data->path_s_screen && data->current_have_frontier &&
-        data->analyzer.tree && !data->parent_seed.empty()) {
-      uint32_t sc_front = data->current_frontier;
-      uint8_t sc_dir = data->current_dir;
-      if (data->path_s_mode == sedbt::PathSMode::Full) {
-        sc_front = sedbt::kRoot;
-        sc_dir = 0;
-      }
-      symafl::suffix_screen_cache_build(
-          &data->screen_cache, data->analyzer.tree, sc_front, sc_dir,
-          data->parent_seed.data(), (uint32_t)data->parent_seed.size());
-    }
   }
   if (data->afl) {
     const bool have_explore = data->mut_path_s && data->current_path_s_n > 0;
@@ -1877,21 +2025,25 @@ static void load_seed_learn(my_mutator_t *data, const char *filename) {
   }
 }
 
-// Unique sanitizer crash: (signal, peek simplify_trace hash). Peek does not
-// count as fsrv_cov_exec (direct afl_fsrv_run_target). A new unique con_san
-// crash whose peek pattern was already seen on fsrv_cov is fsrv_cov_miss.
+// Unique sanitizer crash: (signal, coverage simplify_trace hash) — same
+// key shape as fsrv_cov_crash. Cov-gain reuses the mutator fsrv_cov hash
+// (that run did not crash, or it would not have entered fsrv_san). con_san
+// / focused skipped cov, so peek for the pattern and for miss. Peek never
+// increments fsrv_cov_crash. Miss = unique con_san crash whose peek neither
+// crashed nor produced a new simplify_trace (cov-first would drop it).
 static void handle_san_crash(my_mutator_t *data, const u8 *buf, size_t len,
                              SanFrom from) {
   afl_forkserver_t *sfsrv = &data->afl->fsrv_san;
-  int sig = 0;
-  if (sfsrv->child_status != -1 && WIFSIGNALED(sfsrv->child_status)) {
-    sig = WTERMSIG(sfsrv->child_status);
-  }
+  const int sig = fsrv_crash_sig(sfsrv);
   data->san_crashes += 1;
   bool peek_cov_crash = false;
-  uint32_t ph = peek_cov_simplify(data, buf, len, &peek_cov_crash);
-  uint64_t key = ((uint64_t)(uint32_t)sig << 32) |
-                 (peek_cov_crash ? 0xffffffffu : ph);
+  uint32_t ph;
+  if (from == kSanCovGain) {
+    ph = data->last_cov_hash;
+  } else {
+    ph = peek_cov_simplify(data, buf, len, &peek_cov_crash);
+  }
+  uint64_t key = crash_uniq_key(sig, ph);
   if (!data->san_crash_keys.insert(key).second) return;
   data->fsrv_san_crash += 1;
   data->san_crashes_saved += 1;
@@ -1952,9 +2104,15 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
   u32 n = fsrv->real_map_size ? fsrv->real_map_size : fsrv->map_size;
   if (n > fsrv->map_size) n = fsrv->map_size;
   uint32_t h = simplify_hash_bits(fsrv->trace_bits, n);
+  data->last_cov_hash = h;
+  const bool cov_crashed = fsrv_was_crash(fsrv);
+  if (mutant) note_cov_crash(data);
   const bool is_new = data->seen_simplify.insert(h).second;
-  if (mutant && is_new) {
+  // A crashing fsrv_cov run never enters fsrv_san (identity: cov_gain_cnt
+  // only counts mutants that do).
+  if (mutant && is_new && !cov_crashed) {
     data->cov_gain_cnt += 1;
+    data->round_found_cov = true;
     if (!data->last_cov_buf.empty()) {
       run_sanitizer_on(data, data->last_cov_buf.data(),
                        data->last_cov_buf.size(), kSanCovGain);
@@ -1965,6 +2123,12 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   if (!data->seeds_flushed) {
     data->seeds_flushed = true;
+    if (!data->analyzer_mode) {
+      data->pending_seeds.clear();
+      data->bootstrap_done = true;
+      if (!data->bootstrap_ns) data->bootstrap_ns = profile_now();
+      return 1;
+    }
     if (!analyzer_wait_tree_ready(&data->analyzer)) {
       FATAL("analyzer TREE_READY failed");
     }
@@ -1972,6 +2136,8 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
       data->path_s_mode =
           (sedbt::PathSMode)data->analyzer.tree->hdr.path_s_mode;
       data->mut_path_s = data->path_s_mode != sedbt::PathSMode::Off;
+      if (data->path_s_mode != sedbt::PathSMode::Suffix)
+        data->path_s_screen = false;
     }
     for (const std::string &seed : data->pending_seeds) {
       std::vector<u8> buf;
@@ -1989,6 +2155,8 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
     }
   }
   data->bootstrap_done = true;
+  if (!data->bootstrap_ns) data->bootstrap_ns = profile_now();
+  if (!data->analyzer_mode) return 1;
   if (data->concolic_deadline && !data->phase_start) {
     data->phase_start = time(nullptr);
   }
@@ -2012,6 +2180,7 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                                          const u8 *filename_new_queue,
                                          const u8 *filename_orig_queue) {
   (void)filename_orig_queue;
+  if (!data->analyzer_mode) return 0;
   if (!data->bootstrap_done) {
     if (filename_new_queue) {
       data->pending_seeds.push_back((const char *)filename_new_queue);
@@ -2039,9 +2208,9 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
 /// GEP-index pin (SYMAFL_PATH_S_CONS_SAN) does the same for path-s explore
 /// and for AFL det/havoc vs the queue parent, once per distinct GEP-byte
 /// tuple, independent of MUT_PATH_S / PATH_S_SCREEN, and does not
-/// CloseUnexplored. A sanitizer
-/// crash then peeks fsrv_cov (no virgin update); path_s_san_cov_miss counts
-/// inputs cov-first would drop.
+/// CloseUnexplored. A con_san / focused sanitizer
+/// crash peeks fsrv_cov (no virgin update, not fsrv_cov_crash);
+/// path_s_san_cov_miss counts inputs cov-first would drop.
 extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                           size_t buf_size, u8 **out_buf) {
   data->profile_exec_armed = false;
@@ -2059,6 +2228,8 @@ extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
   data->path_s_pending = false;
   data->path_s_san_pending = false;
   data->focused_rsan_node = ~0u;
+  if (data->bootstrap_ns && !focused && !from_path_s && !path_s_san)
+    data->mut_cnt += 1;
   if (focused) {
     *out_buf = buf;
     if (buf && buf_size > 0) {
@@ -2128,7 +2299,7 @@ extern "C" const char *afl_custom_introspection(my_mutator_t *data) {
            (unsigned long long)data->admitted,
            (unsigned long long)data->vetoed,
            (unsigned long long)data->traced_entries.size(),
-           (unsigned long long)(data->screening ? 0 : 1),
+           0ull,
            (unsigned long long)data->single_pass_captures,
            (unsigned long long)data->single_pass_overflows,
            (unsigned long long)t.check_admit_empty,

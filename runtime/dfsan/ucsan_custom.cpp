@@ -36,6 +36,8 @@ extern "C" {
   void __taint_set_retval_tls(u32 index, dfsan_label label, u32 size_in_bits);
   dfsan_label __taint_extend_label(dfsan_label label, bool sign_extend,
                                    uint16_t new_size_in_bits);
+  void __taint_trace_copy_len(dfsan_label len_label, uint64_t len,
+                              uint32_t cid);
 
   // event
   void __taint_trace_event_addr(__ucsan::ucsan_label label, uint32_t event_id,
@@ -336,6 +338,7 @@ __attribute__((visibility("default")))
 void *__dfsw_memcpy(void *dest, const void *src, size_t n,
                     ucsan_label dest_label, ucsan_label src_label,
                     ucsan_label n_label, ucsan_label *ret_label) {
+  if (n_label) __taint_trace_copy_len(n_label, n, 18u);
   *ret_label = dest_label;
   // Copy UCSan shadow memory from src to dest
   ucsan_label *sdest = ucsan_shadow_for(dest);
@@ -351,6 +354,7 @@ __attribute__((visibility("default")))
 void *__dfsw_memmove(void *dest, const void *src, size_t n,
                      ucsan_label dest_label, ucsan_label src_label,
                      ucsan_label n_label, ucsan_label *ret_label) {
+  if (n_label) __taint_trace_copy_len(n_label, n, 19u);
   *ret_label = dest_label;
   ucsan_label *sdest = ucsan_shadow_for(dest);
   const ucsan_label *ssrc = ucsan_shadow_for(src);
@@ -365,6 +369,7 @@ __attribute__((visibility("default")))
 void *__dfsw_memset(void *s, int c, size_t n,
                     ucsan_label s_label, ucsan_label c_label,
                     ucsan_label n_label, ucsan_label *ret_label) {
+  if (n_label) __taint_trace_copy_len(n_label, n, 20u);
   *ret_label = s_label;
   // Set actual memory
   internal_memset(s, c, n);

@@ -16,7 +16,7 @@ if (NOT IS_DIRECTORY "${AFLPP_PATH}/include")
 endif()
 
 add_library(SymSanMutator SHARED
-  symsan.cpp sedbt.cpp pred.cpp shm_sedbt.cpp analyzer_client.cpp)
+  symsan.cpp sedbt.cpp pred.cpp suffix_screen.cpp shm_sedbt.cpp analyzer_client.cpp)
 target_include_directories(SymSanMutator PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include
@@ -27,7 +27,7 @@ target_link_libraries(SymSanMutator
 )
 
 add_executable(symafl-analyzer
-  symafl_analyzer.cpp shm_sedbt.cpp sedbt.cpp pred.cpp)
+  symafl_analyzer.cpp shm_sedbt.cpp sedbt.cpp pred.cpp suffix_screen.cpp)
 target_include_directories(symafl-analyzer PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/../../runtime
   ${AFLPP_PATH}/include

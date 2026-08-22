@@ -1,4 +1,6 @@
 #include "sedbt.hpp"
+#include "shm_sedbt.hpp"
+#include "suffix_screen.hpp"
 
 #include <algorithm>
 #include <cstdlib>
@@ -143,13 +145,12 @@ static Predicate pred_from(const symafl::ShmNode &n) {
 void Tree::init_empty() {
   if (!shm_) return;
   auto *s = shmp();
+  if (!s->hdr.node_off) {
+    uint64_t map = s->hdr.map_bytes ? s->hdr.map_bytes : symafl::kLocalTreeBytes;
+    symafl::sedbt_layout(&s->hdr, map);
+  }
   s->hdr.magic = symafl::kIpcMagic;
   s->hdr.version = symafl::kIpcVersion;
-  s->hdr.node_cap = symafl::kNodeCap;
-  s->hdr.pred_cap = symafl::kPredCap;
-  s->hdr.s_cap = symafl::kSCap;
-  s->hdr.e_cap = symafl::kECap;
-  s->hdr.clos_cap = symafl::kClosCap;
   s->hdr.path_s_mode = (uint8_t)path_s_mode_;
   live_n_ = kRoot + 1;
   published_n_ = kRoot + 1;
@@ -158,6 +159,7 @@ void Tree::init_empty() {
   s->hdr.n_s.store(0, std::memory_order_relaxed);
   s->hdr.n_e.store(0, std::memory_order_relaxed);
   s->hdr.n_clos.store(0, std::memory_order_relaxed);
+  s->hdr.n_tab.store(symafl::kTabReserve, std::memory_order_relaxed);
   at(kRoot).child[0] = kUnexplored;
   at(kRoot).child[1] = kUnexplored;
   at(kRoot).parent = kUnexplored;
@@ -165,12 +167,14 @@ void Tree::init_empty() {
 }
 
 Tree::Tree() {
-  shm_ = mmap(nullptr, sizeof(symafl::SedbtShm), PROT_READ | PROT_WRITE,
+  shm_ = mmap(nullptr, (size_t)symafl::kLocalTreeBytes, PROT_READ | PROT_WRITE,
               MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (shm_ == MAP_FAILED) shm_ = nullptr;
   owns_shm_ = shm_ != nullptr;
+  shm_map_bytes_ = owns_shm_ ? symafl::kLocalTreeBytes : 0;
   if (shm_) {
-    memset(shm_, 0, sizeof(symafl::SedbtShm));
+    memset(shm_, 0, 4096);
+    symafl::sedbt_layout(&shmp()->hdr, symafl::kLocalTreeBytes);
     init_empty();
   }
   pred_arena_.nodes.reserve(4096);
@@ -185,37 +189,43 @@ Tree::Tree(Tree &&o) noexcept
       path_s_mode_(o.path_s_mode_),
       compute_closures_(o.compute_closures_),
       creator_max_len_(o.creator_max_len_),
-      shm_(o.shm_), owns_shm_(o.owns_shm_), live_n_(o.live_n_),
+      shm_(o.shm_), owns_shm_(o.owns_shm_), shm_map_bytes_(o.shm_map_bytes_),
+      live_n_(o.live_n_),
       published_n_(o.published_n_), pred_arena_(std::move(o.pred_arena_)),
       creators_(std::move(o.creators_)) {
   o.shm_ = nullptr;
   o.owns_shm_ = false;
+  o.shm_map_bytes_ = 0;
 }
 
 Tree &Tree::operator=(Tree &&o) noexcept {
   if (this == &o) return *this;
-  if (owns_shm_ && shm_) munmap(shm_, sizeof(symafl::SedbtShm));
+  if (owns_shm_ && shm_) munmap(shm_, (size_t)shm_map_bytes_);
   shm_ = o.shm_;
   owns_shm_ = o.owns_shm_;
+  shm_map_bytes_ = o.shm_map_bytes_;
   live_n_ = o.live_n_;
   published_n_ = o.published_n_;
   pred_arena_ = std::move(o.pred_arena_);
   creators_ = std::move(o.creators_);
   o.shm_ = nullptr;
   o.owns_shm_ = false;
+  o.shm_map_bytes_ = 0;
   return *this;
 }
 
 Tree::~Tree() {
-  if (owns_shm_ && shm_) munmap(shm_, sizeof(symafl::SedbtShm));
+  if (owns_shm_ && shm_) munmap(shm_, (size_t)shm_map_bytes_);
 }
 
 void Tree::attach(void *sedbt_shm) {
-  if (owns_shm_ && shm_) munmap(shm_, sizeof(symafl::SedbtShm));
+  if (owns_shm_ && shm_) munmap(shm_, (size_t)shm_map_bytes_);
   shm_ = sedbt_shm;
   owns_shm_ = false;
+  shm_map_bytes_ = 0;
   if (!shm_) return;
   auto *s = shmp();
+  shm_map_bytes_ = s->hdr.map_bytes;
   uint32_t nn = s->hdr.n_nodes.load(std::memory_order_relaxed);
   uint32_t np = s->hdr.n_preds.load(std::memory_order_relaxed);
   if (nn <= kRoot) {
@@ -225,7 +235,7 @@ void Tree::attach(void *sedbt_shm) {
   }
   live_n_ = nn;
   published_n_ = nn;
-  pred_arena_.nodes.assign(s->preds, s->preds + np);
+  pred_arena_.nodes.assign(symafl::shm_preds(s), symafl::shm_preds(s) + np);
 }
 
 uint32_t Tree::pred_root_of(NodeRef ref) const {
@@ -245,6 +255,7 @@ const Node &Tree::node_at(NodeRef ref) const {
   view.skipCnt = n.skipCnt;
   view.constraint = n.constraint != 0;
   view.gep_pin = n.constraint == kConstraintGep;
+  view.memlen_pin = n.constraint == kConstraintMemlen;
   view.unstable = n.unstable;
   view.len_related = n.len_related;
   view.rsan_bug_dir = n.rsan_bug_dir;
@@ -286,13 +297,14 @@ const Closure &Tree::closure_of(NodeRef ref) const {
   uint32_t i = n.clos_i - 1;
   uint32_t nc = shmp()->hdr.n_clos.load(std::memory_order_acquire);
   if (i >= nc) return tmp;
-  const symafl::ShmClosure &c = shmp()->clos[i];
+  const symafl::ShmClosure &c = symafl::shm_clos_tab(shmp())[i];
   tmp.present = true;
   tmp.trigger_neg = c.trigger_neg;
-  tmp.s.assign(shmp()->s_offs + c.s_off, shmp()->s_offs + c.s_off + c.s_n);
+  tmp.s.assign(symafl::shm_s_offs(shmp()) + c.s_off,
+               symafl::shm_s_offs(shmp()) + c.s_off + c.s_n);
   tmp.e.clear();
   for (uint16_t k = 0; k < c.e_n; ++k) {
-    const auto &cl = shmp()->e_clauses[c.e_off + k];
+    const auto &cl = symafl::shm_e_clauses(shmp())[c.e_off + k];
     tmp.e.push_back({cl.pred_root, cl.negated});
   }
   return tmp;
@@ -351,9 +363,9 @@ NodeRef Tree::append(Node &&new_node) {
   d.pred_opaque = new_node.pred.opaque ? 1 : 0;
   d.pred_tautology = new_node.pred.tautology ? 1 : 0;
   d.pred_fixed_dir = new_node.pred.fixed_dir;
-  d.constraint = new_node.gep_pin
-                     ? kConstraintGep
-                     : (new_node.constraint ? kConstraintPin : kConstraintNone);
+  d.constraint = new_node.gep_pin ? kConstraintGep
+                 : new_node.memlen_pin ? kConstraintMemlen
+                 : (new_node.constraint ? kConstraintPin : kConstraintNone);
   d.unstable = new_node.unstable ? 1 : 0;
   d.len_related = new_node.len_related ? 1 : 0;
   d.rsan_bug_dir = new_node.rsan_bug_dir;
@@ -367,8 +379,9 @@ void Tree::commit_publish(NodeRef attach, uint8_t attach_dir, NodeRef first) {
   auto *s = shmp();
   uint32_t old_p = s->hdr.n_preds.load(std::memory_order_relaxed);
   uint32_t new_p = (uint32_t)pred_arena_.nodes.size();
-  if (new_p > old_p && new_p <= s->hdr.pred_cap)
-    memcpy(s->preds + old_p, pred_arena_.nodes.data() + old_p,
+  if (new_p > s->hdr.pred_cap) new_p = s->hdr.pred_cap;
+  if (new_p > old_p)
+    memcpy(symafl::shm_preds(s) + old_p, pred_arena_.nodes.data() + old_p,
            sizeof(PNode) * (new_p - old_p));
   s->hdr.n_preds.store(new_p, std::memory_order_release);
   s->hdr.n_nodes.store(live_n_, std::memory_order_release);
@@ -394,11 +407,9 @@ void Tree::bind_path_s(NodeRef tail, uint8_t tdir, NodeRef frontier,
   if (sn.term_front[tdir]) return;
   sn.term_front[tdir] = frontier;
   sn.term_fdir[tdir] = fdir;
-  // Always latch the bind site. Suffix/Full also collect mutation symbols
-  // (GEP-index offsets are the term_cons_n prefix). Off still writes the
-  // root→terminal GEP-offset set (havoc can hit a prefix GEP) and
-  // omits non-constraint symbols. Indcall/read-length pins stay topology
-  // constraints but are not CONS_SAN symbols.
+  // CONS_SAN offsets: suffix = LearnJob suffix only; off and full =
+  // root→terminal. Mutation symbols: suffix = suffix; full = root→terminal;
+  // off = none. Indcall / fread-length stay out of term_cons_n.
   const bool off = path_s_mode_ == PathSMode::Off;
   const bool full = path_s_mode_ == PathSMode::Full || off;
   std::unordered_set<uint32_t> cons_set;
@@ -413,7 +424,7 @@ void Tree::bind_path_s(NodeRef tail, uint8_t tdir, NodeRef frontier,
       std::vector<uint32_t> one;
       collect_input_offsets(preds, n_preds, n.pred_root, &one);
       for (uint32_t o : one) {
-        if (n.constraint == kConstraintGep) cons_set.insert(o);
+        if (is_cons_san_kind(n.constraint)) cons_set.insert(o);
         if (!off) all_set.insert(o);
       }
     }
@@ -435,16 +446,22 @@ void Tree::bind_path_s(NodeRef tail, uint8_t tdir, NodeRef frontier,
     const uint32_t room = 0xffff - (uint32_t)cons.size();
     if (rest.size() > room) rest.resize(room);
   }
-  uint32_t s_n = shmp()->hdr.n_s.load(std::memory_order_relaxed);
   const uint32_t write_n = (uint32_t)cons.size() + (uint32_t)rest.size();
-  if (s_n + write_n > shmp()->hdr.s_cap) return;
-  for (uint32_t i = 0; i < cons.size(); ++i) shmp()->s_offs[s_n + i] = cons[i];
+  if (write_n == 0) {
+    sn.term_cons_n[tdir] = 0;
+    sn.term_s_n[tdir] = 0;
+    __atomic_store_n(&sn.term_s_off[tdir], 0, __ATOMIC_RELEASE);
+    return;
+  }
+  uint32_t s_n = 0;
+  if (!symafl::reserve_s_offs(shmp(), write_n, &s_n)) return;
+  for (uint32_t i = 0; i < cons.size(); ++i)
+    symafl::shm_s_offs(shmp())[s_n + i] = cons[i];
   for (uint32_t i = 0; i < rest.size(); ++i)
-    shmp()->s_offs[s_n + (uint32_t)cons.size() + i] = rest[i];
-  sn.term_s_off[tdir] = s_n;
-  sn.term_s_n[tdir] = (uint16_t)write_n;
+    symafl::shm_s_offs(shmp())[s_n + (uint32_t)cons.size() + i] = rest[i];
   sn.term_cons_n[tdir] = (uint16_t)cons.size();
-  shmp()->hdr.n_s.store(s_n + write_n, std::memory_order_release);
+  sn.term_s_n[tdir] = (uint16_t)write_n;
+  __atomic_store_n(&sn.term_s_off[tdir], s_n, __ATOMIC_RELEASE);
 }
 
 void Tree::publish_one_closure(const Closure &c, NodeRef ref) {
@@ -458,15 +475,16 @@ void Tree::publish_one_closure(const Closure &c, NodeRef ref) {
   if (ci >= s->hdr.clos_cap) return;
   if (s_n + (uint32_t)c.s.size() > s->hdr.s_cap) return;
   if (e_n + (uint32_t)c.e.size() > s->hdr.e_cap) return;
-  symafl::ShmClosure &sc = s->clos[ci];
+  symafl::ShmClosure &sc = symafl::shm_clos_tab(s)[ci];
   sc.s_off = s_n;
   sc.s_n = (uint16_t)c.s.size();
-  for (uint32_t i = 0; i < c.s.size(); ++i) s->s_offs[s_n + i] = c.s[i];
+  for (uint32_t i = 0; i < c.s.size(); ++i)
+    symafl::shm_s_offs(s)[s_n + i] = c.s[i];
   sc.e_off = e_n;
   sc.e_n = (uint16_t)c.e.size();
   for (uint32_t i = 0; i < c.e.size(); ++i) {
-    s->e_clauses[e_n + i].pred_root = c.e[i].pred_root;
-    s->e_clauses[e_n + i].negated = c.e[i].negated;
+    symafl::shm_e_clauses(s)[e_n + i].pred_root = c.e[i].pred_root;
+    symafl::shm_e_clauses(s)[e_n + i].negated = c.e[i].negated;
   }
   sc.trigger_neg = c.trigger_neg;
   s->hdr.n_s.store(s_n + (uint32_t)c.s.size(), std::memory_order_release);
@@ -476,7 +494,8 @@ void Tree::publish_one_closure(const Closure &c, NodeRef ref) {
 }
 
 void Tree::finish_publish(NodeRef frontier, uint8_t fdir, NodeRef chain_first,
-                         NodeRef tail, uint8_t tdir, bool close_term) {
+                         NodeRef tail, uint8_t tdir, bool close_term,
+                         uint32_t parent_len) {
   if (!shm_) return;
   if (close_term && tail >= kRoot && tail < live_n_ && tail >= published_n_)
     at(tail).child[tdir] = kTerminal;
@@ -484,6 +503,12 @@ void Tree::finish_publish(NodeRef frontier, uint8_t fdir, NodeRef chain_first,
   if (close_term) bind_path_s(tail, tdir, frontier, fdir);
   NodeRef first = chain_first;
   if (first == kUnexplored && close_term) first = kTerminal;
+  if (close_term && first >= kRoot && first < live_n_ &&
+      path_s_mode_ == PathSMode::Suffix) {
+    uint32_t off = symafl::suffix_screen_bind(shmp(), first, live_n_,
+                                             parent_len);
+    if (off) at(first).tab_off = off;
+  }
   commit_publish(frontier, fdir, first);
 }
 
@@ -845,6 +870,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       new_node.pred = pred;
       new_node.constraint = ev.constraint != 0;
       new_node.gep_pin = ev.constraint == kConstraintGep;
+      new_node.memlen_pin = ev.constraint == kConstraintMemlen;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       new_node.rsan_bug_dir = ev.rsan_bug_dir;
       new_node.parent = parent;
@@ -854,7 +880,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) {
         finish_publish(frontier, frontier_dir, chain_first, parent, dir,
-                       /*close_term=*/false);
+                       /*close_term=*/false, len);
         return created;
       }
       maybe_store_creator(next, input, len);
@@ -878,7 +904,7 @@ uint32_t Tree::InsertTrace(const std::vector<Event> &events,
   if (out_tail_node) *out_tail_node = parent;
   if (out_tail_dir) *out_tail_dir = dir;
   finish_publish(frontier, frontier_dir, chain_first, parent, dir,
-                 /*close_term=*/!structural_stop);
+                 /*close_term=*/!structural_stop, len);
   return created;
 }
 
@@ -1036,6 +1062,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       new_node.pred = pred;
       new_node.constraint = event.constraint != 0;
       new_node.gep_pin = event.constraint == kConstraintGep;
+      new_node.memlen_pin = event.constraint == kConstraintMemlen;
       new_node.len_related = pred_has_len_kind(pred_arena_, pred);
       new_node.rsan_bug_dir = event.rsan_bug_dir;
       new_node.parent = cur;
@@ -1043,7 +1070,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
       NodeRef next = append(std::move(new_node));
       if (next == kUnexplored) {
         finish_publish(frontier, frontier_dir, chain_first, cur, dir,
-                       /*close_term=*/false);
+                       /*close_term=*/false, len);
         return created;
       }
       maybe_store_creator(next, input, len);
@@ -1076,7 +1103,7 @@ uint32_t Tree::InsertSuffix(NodeRef parent, uint8_t direction,
   if (out_tail_node) *out_tail_node = cur;
   if (out_tail_dir) *out_tail_dir = dir;
   finish_publish(frontier, frontier_dir, chain_first, cur, dir,
-                 /*close_term=*/!structural_stop);
+                 /*close_term=*/!structural_stop, len);
   return created;
 }
 
