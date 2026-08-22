@@ -16,6 +16,7 @@ auto/
 /bin/
 .DS_Store
 /build/
+/build16/
 /libcxx/
 !/libcxx/build_taint/lib/
 /install
