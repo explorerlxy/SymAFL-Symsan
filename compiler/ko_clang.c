@@ -265,6 +265,13 @@ static void add_taint_pass() {
         alloc_printf("-taint-abilist=%s/zlib_abilist.txt", obj_path);
   }
 
+  // Extra user abilist (e.g. system libs that are linked untainted).
+  if (getenv("KO_TAINT_ABILIST")) {
+    cc_params[cc_par_cnt++] = "-mllvm";
+    cc_params[cc_par_cnt++] =
+        alloc_printf("-taint-abilist=%s", getenv("KO_TAINT_ABILIST"));
+  }
+
   // Floating-point tracing is on by default (ClTraceFP defaults to true).
   // KO_NO_TRACE_FP explicitly disables it.
   if (getenv("KO_NO_TRACE_FP")) {
