@@ -174,11 +174,12 @@ static int remaining_ms(const struct timespec &t0, uint32_t timeout_ms) {
   return (int)left;
 }
 
-// timeout_ms=0 → 30s (bootstrap InsertTrace). Magma concolic execs are
-// 1000x+ slower than their cov twins (DFSan on openssl/sndfile parses;
-// ssl_ext's static-key handshakes ~5-10s), so 5s killed every slow target's
-// bootstrap. Kill the process group on deadline so a hung concolic child
-// cannot stall every fuzzer's LearnJob ring.
+// timeout_ms=0 → 30s. Bootstrap InsertTrace passes SYMAFL_INSERT_TIMEOUT_MS
+// (default 30s): Magma concolic execs are 1000x+ slower than their cov
+// twins (DFSan on openssl/sndfile parses; ssl_ext's static-key handshakes
+// ~5-10s), so a small default killed every slow target's bootstrap. Kill
+// the process group on deadline so a hung concolic child cannot stall
+// every fuzzer's LearnJob ring.
 static bool run_concolic(Concolic *c, const char *bin, const uint8_t *buf,
                          uint32_t len, uint32_t skip, uint32_t timeout_ms,
                          std::vector<sedbt::Event> *events) {
@@ -386,12 +387,24 @@ int main(int argc, char **argv) {
     return 1;
   }
   const size_t max_label = kWorkerUnionBytes / sizeof(dfsan_label_info);
+  // SYMAFL_INSERT_TIMEOUT_MS: bootstrap InsertTrace per-seed concolic
+  // deadline (default 30s). Magma ssl x509 seeds need 5-60s under DFSan;
+  // 30s fails the slow half and still burns the full deadline per seed.
+  uint32_t ins_timeout = 30000;
+  if (const char *e = getenv("SYMAFL_INSERT_TIMEOUT_MS")) {
+    char *end = nullptr;
+    long parsed = strtol(e, &end, 10);
+    if (end && *end == '\0' && parsed > 0) {
+      if (parsed > 600000) parsed = 600000;
+      ins_timeout = (uint32_t)parsed;
+    }
+  }
   for (const std::string &sp : list_seeds(seeds)) {
     std::vector<uint8_t> buf;
     if (!read_file(sp.c_str(), &buf)) continue;
     std::vector<sedbt::Event> ev;
-    if (!run_concolic(&co, concolic, buf.data(), (uint32_t)buf.size(), 0, 0,
-                      &ev)) {
+    if (!run_concolic(&co, concolic, buf.data(), (uint32_t)buf.size(), 0,
+                      ins_timeout, &ev)) {
       fprintf(stderr, "[analyzer] concolic fail %s\n", sp.c_str());
       continue;
     }
