@@ -465,13 +465,17 @@ __taint_trace_memcmp(dfsan_label label) {
                         fmemcmp_operand_captured(info->op, true);
     has_content = info->size != 0 && info->size <= 16 &&
                   (concrete_op1 || concrete_op2);
-  } else if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) ||
-             info->size == 0 ||
-             !(info->l1 == CONST_LABEL ? info->op1.i : info->op2.i)) {
-    // Uncapturable comparisons store op==0 for the concrete side (the
-    // interceptor emitted the event without byte capture; the converter
-    // marks it opaque). A null "pointer" must never reach memcpy/strlen.
-    has_content = 0;
+  } else {
+    // String-op capture: op1/op2 hold the operand pointers. They must be
+    // null-free AND still mapped. Uncapturable comparisons store op==0
+    // (converter marks them opaque); label dedup can also hand back a
+    // stale op value from an earlier same-signature comparison, so check
+    // accessibility like dfsan.cpp does for fsubstr content — poppler's
+    // strncmp/strcmp paths died here on garbage pointers.
+    uptr concrete = info->l1 == CONST_LABEL ? info->op1.i : info->op2.i;
+    has_content =
+        concrete != 0 &&
+        IsAccessibleMemoryRange(concrete, info->size ? info->size : 1);
   }
 
   pipe_msg msg = {
