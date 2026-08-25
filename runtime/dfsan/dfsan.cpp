@@ -272,6 +272,17 @@ static dfsan_label do_taint_union(dfsan_label l1, dfsan_label l2, uint16_t op,
     return label;
   }
 
+  // Label store guard: the union shm holds num_of_labels entries and the
+  // alloca region occupies its last two slots. Exhaustion (poppler's
+  // Splash render creates millions of unique unions per page) must degrade
+  // to the coarse operand label instead of writing past the mapping —
+  // which segfaults the concolic child mid-trace (pdf LearnJobs died).
+  dfsan_label last = atomic_load(&__dfsan_last_label, memory_order_relaxed);
+  if (last + 1 >= __alloca_stack_top) {
+    AOUT("label store full; coarse fallback\n");
+    return l1 ? l1 : l2;
+  }
+
   dfsan_label label = add_taint_info(&label_info);
   __union_table.insert(&__dfsan_label_info[label], label);
 
