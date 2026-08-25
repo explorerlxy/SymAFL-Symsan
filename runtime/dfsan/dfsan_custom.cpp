@@ -723,11 +723,15 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_strcmp(const char *s1, const char *s2,
   if (l1 == 0 && l2 == 0) {
     *ret_label = 0;
   } else {
-    // Determine length for comparison (use concrete side if one is fsubstr)
-    size_t n = strlen(s1) + 1;
-    dfsan_label s1_fsubstr = taint_get_str_content_label(s1);
-    if (s1_fsubstr != 0)
-      n = strlen(s2) + 1;  // use concrete side for length
+    // Comparison length = the shorter string: the concrete capture in
+    // __taint_trace_memcmp copies this many bytes from whichever operand is
+    // concrete. Taking strlen(s1)+1 (or s2+1) alone overreads the OTHER
+    // side when it is a shorter constant (poppler Object::isName against
+    // "Linearized" segfaulted copying strlen(tainted)+1 bytes from the
+    // 11-byte rodata constant at a page edge).
+    size_t n1 = strlen(s1) + 1;
+    size_t n2 = strlen(s2) + 1;
+    size_t n = n1 < n2 ? n1 : n2;
 
     // Small comparisons fit the scalar fmemcmp byte-capture grammar and are
     // exactly solvable by the SEDBT interpreter; larger ones stay on the Z3

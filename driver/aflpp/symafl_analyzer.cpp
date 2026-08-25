@@ -253,7 +253,13 @@ static bool run_concolic(Concolic *c, const char *bin, const uint8_t *buf,
     fprintf(stderr, "[analyzer] concolic timeout %ums\n", timeout_ms);
     return false;
   }
-  return decode_full_stream(wire.data(), wire.size(), events);
+  bool ok = decode_full_stream(wire.data(), wire.size(), events);
+  if (!ok) {
+    fprintf(stderr,
+            "[analyzer] concolic stream fail st=0x%x sig=%d wire=%zu\n", st,
+            WIFSIGNALED(st) ? WTERMSIG(st) : 0, wire.size());
+  }
+  return ok;
 }
 
 int main(int argc, char **argv) {

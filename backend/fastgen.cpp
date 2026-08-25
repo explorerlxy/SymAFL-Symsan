@@ -503,7 +503,16 @@ __taint_trace_memcmp(dfsan_label label) {
     // Copy concrete content: use op1 if l1 is concrete, else op2.
     void *concrete_ptr = (info->l1 == CONST_LABEL)
                              ? (void *)info->op1.i : (void *)info->op2.i;
-    internal_memcpy(mmsg->content, concrete_ptr, info->size);
+    // Belt-and-braces clamp: a string-op's recorded size may exceed the
+    // concrete operand's real length (callers now pass min-lengths, but
+    // other sites keep legacy semantics). Copying past a short rodata
+    // constant can segfault at a page edge; pad with zero bytes, which are
+    // semantically inert past the NUL for string compares.
+    size_t actual = internal_strlen((const char *)concrete_ptr) + 1;
+    size_t copy = info->size < actual ? info->size : actual;
+    internal_memcpy(mmsg->content, concrete_ptr, copy);
+    if (copy < info->size)
+      internal_memset(mmsg->content + copy, 0, info->size - copy);
   }
   AOUT("sending memcmp content for label %d, size %u, msg_size=%lu\n", label, info->size, msg_size);
 
