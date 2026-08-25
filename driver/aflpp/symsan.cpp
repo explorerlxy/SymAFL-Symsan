@@ -2120,6 +2120,19 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
   }
 }
 
+// Bootstrap completion marker for run-expm: the repeat's 8h fuzzing clock
+// starts when this file appears (all initial seeds learned, TREE_READY).
+// The marker also carries the CLOCK_MONOTONIC ns so logs can correlate.
+static void write_tree_ready_marker(uint64_t ready_ns) {
+  const char *path = getenv("SYMAFL_TREE_READY_MARKER");
+  if (!path || !*path) return;
+  FILE *f = fopen(path, "w");
+  if (f) {
+    fprintf(f, "tree_ready_ns=%llu\n", (unsigned long long)ready_ns);
+    fclose(f);
+  }
+}
+
 extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   if (!data->seeds_flushed) {
     data->seeds_flushed = true;
@@ -2127,6 +2140,7 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
       data->pending_seeds.clear();
       data->bootstrap_done = true;
       if (!data->bootstrap_ns) data->bootstrap_ns = profile_now();
+      write_tree_ready_marker(data->bootstrap_ns);
       return 1;
     }
     if (!analyzer_wait_tree_ready(&data->analyzer)) {
@@ -2156,6 +2170,7 @@ extern "C" u8 afl_custom_queue_get(my_mutator_t *data, const u8 *filename) {
   }
   data->bootstrap_done = true;
   if (!data->bootstrap_ns) data->bootstrap_ns = profile_now();
+  write_tree_ready_marker(data->bootstrap_ns);
   if (!data->analyzer_mode) return 1;
   if (data->concolic_deadline && !data->phase_start) {
     data->phase_start = time(nullptr);
