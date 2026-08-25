@@ -466,7 +466,11 @@ __taint_trace_memcmp(dfsan_label label) {
     has_content = info->size != 0 && info->size <= 16 &&
                   (concrete_op1 || concrete_op2);
   } else if ((info->l1 != CONST_LABEL && info->l2 != CONST_LABEL) ||
-             info->size == 0) {
+             info->size == 0 ||
+             !(info->l1 == CONST_LABEL ? info->op1.i : info->op2.i)) {
+    // Uncapturable comparisons store op==0 for the concrete side (the
+    // interceptor emitted the event without byte capture; the converter
+    // marks it opaque). A null "pointer" must never reach memcpy/strlen.
     has_content = 0;
   }
 
