@@ -1842,7 +1842,20 @@ static void take_terminal(SeedLearn *st, const symafl::WalkResult &wr) {
 
 // Concolic deadline = 50 × the queue seed's concrete exec_us (AFL
 // calibration). Floor 50ms so a 1µs seed still bounds the child; cap 5min.
+// SYMAFL_LEARN_TIMEOUT_MS overrides the formula: Magma concolic execs are
+// 1000x+ slower than their cov twins (snd/tiff ~30-40s, ssl/pdf ~10s), so
+// the 50× heuristic (≈50ms) made every LearnJob time out and the SEDBT
+// never grew. The deadline only bites on hangs, so a generous value is safe.
 static uint32_t learn_timeout_ms(const my_mutator_t *data) {
+  if (const char *e = getenv("SYMAFL_LEARN_TIMEOUT_MS")) {
+    char *end = nullptr;
+    long parsed = strtol(e, &end, 10);
+    if (end && *end == '\0' && parsed > 0) {
+      if (parsed > 300000) parsed = 300000;
+      return (uint32_t)parsed;
+    }
+    FATAL("Invalid SYMAFL_LEARN_TIMEOUT_MS=%s", e);
+  }
   u64 us = 0;
   if (data->afl && data->afl->queue_cur) us = data->afl->queue_cur->exec_us;
   if (!us) us = 1000;
