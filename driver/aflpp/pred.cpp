@@ -1591,6 +1591,20 @@ uint32_t RunConverter::convert_strlen_cmp(const dfsan_label_info *info,
     }
     return add(k, info->size, len, cnst);
   }
+  if (n == 0 && (p == bveq || p == bvneq)) {
+    // strlen==0 ⇔ byte0 is NUL, strlen!=0 ⇔ byte0 nonzero.  Handled here
+    // because the generic lowering sets hi = n-1, which underflows to
+    // UINT64_MAX at n==0 and runs the loop out of the zero/nz vectors
+    // (analyzer SIGSEGV seen in Exp-M png bootstrap, e.g. kernel ip at
+    // convert_strlen_cmp+0x34a).
+    std::vector<StringByte> b0;
+    if (!string_bytes(si.l2, 1, b0) || b0.empty()) {
+      fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+      return kInvalidNode;
+    }
+    uint32_t c0 = add_const(0, 8);
+    return add(p == bveq ? PKind::Equal : PKind::Distinct, 8, b0[0].node, c0);
+  }
   if (n > kMaxStrlenBytes) {
     fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
     return kInvalidNode;
@@ -1631,6 +1645,12 @@ uint32_t RunConverter::convert_strlen_cmp(const dfsan_label_info *info,
     default:
       fail(PredError::UnsupportedCompare);
       return kInvalidNode;
+  }
+  if (hi >= need) {
+    // Defense in depth: the n==0 bveq/bvneq case above is the only caller
+    // that could underflow hi; keep the loop airtight regardless.
+    fail(PredError::UnsupportedOp, static_cast<uint16_t>(si.op));
+    return kInvalidNode;
   }
   uint32_t acc = kInvalidNode;
   for (uint64_t i = lo; i <= hi; ++i) {
