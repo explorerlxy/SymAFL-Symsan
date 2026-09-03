@@ -535,6 +535,9 @@ static constexpr uint32_t kMemcpyConstraintCid = 18;
 static constexpr uint32_t kMemmoveConstraintCid = 19;
 static constexpr uint32_t kMemsetConstraintCid = 20;
 static constexpr uint32_t kStrncpyConstraintCid = 21;
+static constexpr uint32_t kMemcmpConstraintCid = 22;
+static constexpr uint32_t kBcmpConstraintCid = 23;
+static constexpr uint32_t kStrncatConstraintCid = 24;
 
 enum undefined_check_ids {
   ub_integer_overflow = 1,
@@ -567,8 +570,9 @@ enum undefined_check_ids {
 #define F_RSAN_BUG_DIR 0x20
 // Tainted GEP-index pin (with F_CONSTRAINT). CONS_SAN binds GEP and copy-size.
 #define F_GEP_PIN 0x40
-// memcpy/memmove/strncpy/memset tainted size pin (with F_CONSTRAINT).
-// Indcall / fread-style read-length stay F_CONSTRAINT only.
+// memcpy-family tainted size pin (with F_CONSTRAINT): memcpy/memmove/
+// strncpy/memset/memcmp/bcmp/strncat n. strcat has no size argument and
+// is not a pin. Indcall / fread-style read-length stay F_CONSTRAINT only.
 #define F_MEMLEN_PIN 0x80
 
 extern "C" void __taint_trace_copy_len(dfsan_label len_label, uint64_t len,

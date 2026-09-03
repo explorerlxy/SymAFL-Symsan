@@ -27,6 +27,9 @@
 
 extern "C" {
 #include "afl-fuzz.h"
+#define XXH_INLINE_ALL
+#include "xxhash.h"
+#undef XXH_INLINE_ALL
 }
 
 #include <algorithm>
@@ -38,6 +41,7 @@ extern "C" {
 
 #include <stdlib.h>
 #include <errno.h>
+#include <time.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -90,6 +94,8 @@ struct SeedLearn {
   uint8_t path_s_ready = 0;
   uint8_t have_frontier = 0;  // 1 = LearnJob edge is this seed's suffix start
   uint32_t stall_rounds = 0;  // consecutive fuzz rounds with no new coverage
+  uint32_t visits = 0;        // custom-stage visits that handed a quota
+  uint64_t cum_quota = 0;     // cumulative custom-mutation quota handed over
   std::vector<uint32_t> rsan_nodes;
 };
 
@@ -135,6 +141,10 @@ struct my_mutator_t {
       anomaly_index = nullptr;
     }
     if (pair_log_path) ck_free(pair_log_path);
+    if (simplified_n_fuzz) {
+      ck_free(simplified_n_fuzz);
+      simplified_n_fuzz = nullptr;
+    }
   }
 
   afl_state_t *afl;
@@ -243,8 +253,24 @@ struct my_mutator_t {
   sedbt::PathSMode path_s_mode = sedbt::PathSMode::Suffix;
   bool mut_closure = true;   // SYMAFL_MUT_CLOSURE, default on
   bool path_s_screen = true; // SYMAFL_PATH_S_SCREEN: parent-suffix skip cov
+  bool path_s_refresh = true; // SYMAFL_PATH_S_REFRESH: stall shrink to unexplored-sib
   bool path_s_cons_san = true; // SYMAFL_PATH_S_CONS_SAN: GEP-index → fsrv_san
   std::unordered_set<uint64_t> gep_skip_keys;  // one CONS_SAN skip per GEP value
+  // SYMAFL_ENERGY=workload: learned=1 seeds draw their custom-stage quota
+  // from a per-cycle pool (SYMAFL_ENERGY_TOTAL mutants) split by each
+  // seed's share of the queue's live path-s bytes; learned=0 seeds keep
+  // the vanilla perf_score path. The 25% AFL-havoc share of a custom-mode
+  // visit is rescaled to the same quota. A learned seed whose path-s hit
+  // zero keeps a minimum havoc pulse instead of full vanilla.
+  bool energy_workload = false;
+  uint64_t energy_total = 1000000;
+  uint32_t energy_min = 64;
+  uint32_t energy_max = 262144;
+  uint8_t energy_min_havoc_pct = 5;
+  uint64_t energy_pool_ps = 0;     // Σ path_s_n over learned=1 seeds
+  bool energy_pool_dirty = true;
+  uint32_t energy_quota = 0;       // quota handed to the current visit
+  uint32_t energy_min_havoc_visits = 0;
   // Canonical MCE counters (docs/evaluation.md). Aliases below keep deinit
   // greps working: path_s_exec, path_s_san_exec, path_s_screened, …
   uint64_t fsrv_cov_exec = 0;
@@ -274,9 +300,16 @@ struct my_mutator_t {
   uint64_t closure_exec = 0;      // vuln mutant ran fsrv_san
   uint64_t default_exec = 0;      // AFL det/havoc (and other non-custom) concrete
   uint64_t vuln_ns = 0;           // mutate+screen + fsrv_san for vuln only
-  std::unordered_set<uint32_t> seen_simplify;
+  // SAND AFL_SAN_ABSTRACTION=simplify_trace: one bit per u32 XXH32
+  // (N_FUZZ_SIZE_BITMAP = 1<<29 bytes). Not an unordered_set.
+  u8 *simplified_n_fuzz = nullptr;
+  uint64_t seen_n = 0;
   std::unordered_set<uint64_t> san_crash_keys;  // (sig<<32)|cov_simplify_hash
   std::unordered_set<uint64_t> cov_crash_keys;  // (sig<<32)|cov_simplify_hash
+  // RQ1 PoC peek (SYMAFL_RQ1_POC): would B/C admit the orig trigger?
+  std::vector<u8> rq1_poc;
+  uint64_t rq1_peek_ns = 60ull * 1000000000ull;
+  uint64_t rq1_last_peek = 0;
   bool last_cov_candidate = false;  // next fsrv_cov is a mutant (not cal)
   uint32_t last_cov_hash = 0;       // simplify hash of that mutator fsrv_cov run
   std::vector<u8> last_cov_buf;
@@ -540,6 +573,15 @@ extern "C" void afl_custom_splice_optout(my_mutator_t *data) {
   (void)(data);
 }
 
+static uint64_t env_u64(const char *name, uint64_t dflt) {
+  const char *e = getenv(name);
+  if (!e || !*e) return dflt;
+  char *end = nullptr;
+  unsigned long long v = strtoull(e, &end, 10);
+  if (end == e) return dflt;
+  return (uint64_t)v;
+}
+
 extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   my_mutator_t *data = new my_mutator_t(afl);
   if (!data) {
@@ -547,6 +589,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     return NULL;
   }
   data->focused_rng = seed ? seed : 1u;
+  data->simplified_n_fuzz = (u8 *)ck_alloc(N_FUZZ_SIZE_BITMAP);
 
   // SYMAFL_ANALYZER=0: split fsrv_cov→fsrv_san only (RQ1 cell B). No
   // SEDBT, LearnJob, path-s, or CONS_SAN. SOCK / CONCOLIC_TARGET unused.
@@ -739,19 +782,25 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
         data->mut_closure = strcmp(e, "0") != 0;
       if (const char *e = getenv("SYMAFL_PATH_S_SCREEN"))
         data->path_s_screen = strcmp(e, "0") != 0;
-      if (data->path_s_mode != sedbt::PathSMode::Suffix)
+      if (const char *e = getenv("SYMAFL_PATH_S_REFRESH"))
+        data->path_s_refresh = strcmp(e, "0") != 0;
+      if (data->path_s_mode != sedbt::PathSMode::Suffix) {
         data->path_s_screen = false;
+        data->path_s_refresh = false;
+      }
       if (const char *e = getenv("SYMAFL_PATH_S_CONS_SAN"))
         data->path_s_cons_san = strcmp(e, "0") != 0;
       data->tree.set_path_s_mode(data->path_s_mode);
       data->tree.set_compute_closures(data->mut_closure);
     }
     fprintf(stderr, "[sedbt] mutate path_s=%s closure=%s havoc_pct=%u "
-            "path_s_screen=%s path_s_cons_san=%s analyzer=%s (0 disables that side / "
-            "AFL havoc tail / parent-suffix skip / CONS_SAN pin→fsrv_san)\n",
+            "path_s_screen=%s path_s_refresh=%s path_s_cons_san=%s analyzer=%s "
+            "(0 disables that side / AFL havoc tail / parent-suffix skip / "
+            "stall path-s shrink / CONS_SAN pin→fsrv_san)\n",
             sedbt::path_s_mode_name(data->path_s_mode),
             data->mut_closure ? "on" : "off", data->havoc_pct,
             data->path_s_screen ? "on" : "off",
+            data->path_s_refresh ? "on" : "off",
             data->path_s_cons_san ? "on" : "off",
             data->analyzer_mode ? "on" : "off");
   }
@@ -776,6 +825,29 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     data->root_shm_enabled = strcmp(root_shm, "0") != 0;
     fprintf(stderr, "[sedbt] root SHM capture %s (SYMAFL_ROOT_SHM=%s)\n",
             data->root_shm_enabled ? "enabled" : "disabled", root_shm);
+  }
+  if (const char *pocp = getenv("SYMAFL_RQ1_POC")) {
+    FILE *pf = fopen(pocp, "rb");
+    if (pf) {
+      fseek(pf, 0, SEEK_END);
+      long sz = ftell(pf);
+      if (sz > 0 && sz <= (1 << 24)) {
+        data->rq1_poc.resize((size_t)sz);
+        rewind(pf);
+        if (fread(data->rq1_poc.data(), 1, (size_t)sz, pf) != (size_t)sz)
+          data->rq1_poc.clear();
+      }
+      fclose(pf);
+    }
+    if (const char *iv = getenv("SYMAFL_RQ1_PEEK_SEC")) {
+      long v = strtol(iv, nullptr, 10);
+      if (v < 1) v = 1;
+      if (v > 600) v = 600;
+      data->rq1_peek_ns = (uint64_t)v * 1000000000ull;
+    }
+    fprintf(stderr, "[sedbt] RQ1 peek poc=%s bytes=%zu every=%llus\n", pocp,
+            data->rq1_poc.size(),
+            (unsigned long long)(data->rq1_peek_ns / 1000000000ull));
   }
   if (getenv("SYMAFL_PROFILE")) {
     data->profile_enabled = true;
@@ -891,6 +963,24 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     fprintf(stderr, "[sedbt] concolic phase deadline: %llus\n",
             (unsigned long long)parsed);
   }
+  if (const char *em = getenv("SYMAFL_ENERGY")) {
+    if (!strcmp(em, "workload")) data->energy_workload = true;
+    else if (strcmp(em, "flat")) FATAL("Invalid SYMAFL_ENERGY=%s", em);
+    data->energy_total = env_u64("SYMAFL_ENERGY_TOTAL", 1000000ull);
+    data->energy_min = (uint32_t)env_u64("SYMAFL_ENERGY_MIN", 64ull);
+    data->energy_max =
+        (uint32_t)env_u64("SYMAFL_ENERGY_MAX", 262144ull);
+    data->energy_min_havoc_pct =
+        (uint8_t)env_u64("SYMAFL_ENERGY_MIN_HAVOC_PCT", 5ull);
+    if (data->energy_min == 0 || data->energy_max < data->energy_min ||
+        data->energy_total == 0)
+      FATAL("Invalid SYMAFL_ENERGY_* configuration");
+    fprintf(stderr,
+            "[sedbt] energy mode=workload total=%llu min=%u max=%u "
+            "min_havoc_pct=%u\n",
+            (unsigned long long)data->energy_total, data->energy_min,
+            data->energy_max, (unsigned)data->energy_min_havoc_pct);
+  }
   if (const char *sw = getenv("SYMAFL_SAT_WINDOW")) {
     char *end = nullptr;
     unsigned long long parsed = strtoull(sw, &end, 10);
@@ -918,12 +1008,37 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   return data;
 }
 
+// SYMAFL_ENERGY=workload pool: Σ path_s_n over learned=1 seeds. Recomputed
+// per custom-stage visit (queue-sized map walk) so enqueues, learning
+// completions, and refresh rewrites are picked up without event plumbing.
+static void recompute_energy_pool(my_mutator_t *data) {
+  uint64_t sum = 0;
+  for (const auto &kv : data->seed_learn) {
+    const SeedLearn &st = kv.second;
+    if (st.learned == symafl::kReady && st.path_s_ready) sum += st.path_s_n;
+  }
+  data->energy_pool_ps = sum;
+  data->energy_pool_dirty = false;
+}
+
+// Attention accounting: record the quota handed to the visited seed so
+// the dump can contrast workload (path_s_n) against actual attention
+// (visits/cum_quota) without assuming uniform per-visit energy.
+static void note_energy_visit(my_mutator_t *data, u32 quota) {
+  if (data->last_queue_name.empty()) return;
+  auto it = data->seed_learn.find(data->last_queue_name);
+  if (it == data->seed_learn.end()) return;
+  it->second.visits += 1;
+  it->second.cum_quota += quota;
+}
+
 extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
                                      size_t buf_size) {
   (void)buf;
   (void)buf_size;
   data->mut_i = 0;
   data->explore_n = 0;
+  data->energy_quota = 0;
   if (data->current_learned != symafl::kReady) return 0;
   const bool have_explore = data->mut_path_s && data->current_path_s_n > 0;
   const bool have_vuln = data->mut_closure && !data->current_open_rsan.empty();
@@ -936,21 +1051,55 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
     if (ps > 0xffff) ps = 0xffff;
     if (data->afl->havoc_div) hd = data->afl->havoc_div;
   }
+  if (data->energy_workload && have_explore) {
+    if (data->energy_pool_dirty) recompute_energy_pool(data);
+    uint64_t pool = data->energy_pool_ps ? data->energy_pool_ps : 1;
+    uint64_t quota = data->energy_total * data->current_path_s_n / pool;
+    if (quota < data->energy_min) quota = data->energy_min;
+    if (quota > data->energy_max) quota = data->energy_max;
+    u32 energy = (u32)quota;
+    data->energy_quota = energy;
+    // Tie this visit's AFL-havoc share to the same quota: the havoc stage
+    // runs right after the custom stage and sizes itself
+    // (HAVOC_CYCLES * ps / hd) >> 8, so encode havoc_pct × quota into the
+    // percentage AFL applies to that base.
+    u32 ps_stage = (HAVOC_CYCLES * ps / hd) >> 8;
+    if (ps_stage < HAVOC_MIN) ps_stage = HAVOC_MIN;
+    uint64_t want = (uint64_t)energy * data->havoc_pct / 100;
+    uint64_t pct = ps_stage ? 100 * want / ps_stage : 100;
+    if (pct < 1) pct = 1;
+    if (pct > 255) pct = 255;
+    if (data->afl) data->afl->sedbt_havoc_pct = (u8)pct;
+    if (!have_vuln) {
+      data->explore_n = energy;
+      note_energy_visit(data, energy);
+      return energy;
+    }
+    data->explore_n = energy * data->explore_pct / 100;
+    if (data->explore_pct > 0 && data->explore_n == 0) data->explore_n = 1;
+    if (data->explore_pct < 100 && data->explore_n >= energy)
+      data->explore_n = energy - 1;
+    note_energy_visit(data, energy);
+    return energy;
+  }
   u32 energy = (HAVOC_CYCLES * ps / hd) >> 8;
   if (energy < HAVOC_MIN) energy = HAVOC_MIN;
   if (energy > 4096) energy = 4096;
   if (!have_vuln) {
     data->explore_n = energy;
+    note_energy_visit(data, energy);
     return energy;
   }
   if (!have_explore) {
     data->explore_n = 0;
+    note_energy_visit(data, energy);
     return energy;
   }
   data->explore_n = energy * data->explore_pct / 100;
   if (data->explore_pct > 0 && data->explore_n == 0) data->explore_n = 1;
   if (data->explore_pct < 100 && data->explore_n >= energy)
     data->explore_n = energy - 1;
+  note_energy_visit(data, energy);
   return energy;
 }
 
@@ -1136,15 +1285,34 @@ static bool cons_san_should_skip(my_mutator_t *data, const u8 *parent,
 
 enum SanFrom { kSanCovGain = 1, kSanConSan = 2, kSanFocused = 3 };
 
-static uint32_t bits_hash32(const u8 *key, u32 len) {
-  uint32_t h = 2166136261u;
-  for (u32 i = 0; i < len; ++i) {
-    h ^= key[i];
-    h *= 16777619u;
-  }
-  return h;
+// SAND simplify_trace seen map: one bit per u32 hash (2^32 bits = 512 MiB).
+#ifndef N_FUZZ_SIZE_BITMAP
+#define N_FUZZ_SIZE_BITMAP (1u << 29)
+#endif
+
+static void sand_bitmap_set(u8 *map, u32 index) {
+  map[index / 8] |= (u8)(1u << (index % 8));
 }
 
+static u8 sand_bitmap_read(const u8 *map, u32 index) {
+  return (u8)((map[index / 8] >> (index % 8)) & 1);
+}
+
+static bool seen_has(const my_mutator_t *data, u32 h) {
+  if (!data->simplified_n_fuzz) return false;
+  return sand_bitmap_read(data->simplified_n_fuzz, h) != 0;
+}
+
+// true if this hash was not present (SAND feed_san / insert.second).
+static bool seen_add(my_mutator_t *data, u32 h) {
+  if (seen_has(data, h)) return false;
+  sand_bitmap_set(data->simplified_n_fuzz, h);
+  data->seen_n += 1;
+  return true;
+}
+
+// SAND AFL_SAN_ABSTRACTION=simplify_trace: 0→1, nz→128, then
+// hash32_xxh32 = XXH32(map, map_size, HASH_CONST).
 static uint32_t simplify_hash_bits(const u8 *bits, u32 map_size) {
   if (!bits || map_size < 8) return 0;
   const u32 n = map_size & ~7u;
@@ -1161,7 +1329,7 @@ static uint32_t simplify_hash_bits(const u8 *bits, u32 map_size) {
     }
     mem++;
   }
-  return bits_hash32(tmp.data(), n);
+  return (u32)XXH32(tmp.data(), n, HASH_CONST);
 }
 
 static uint64_t crash_uniq_key(int sig, uint32_t h) {
@@ -1188,9 +1356,7 @@ static int fsrv_crash_sig(const afl_forkserver_t *fsrv) {
 
 static uint32_t cov_simplify_now(my_mutator_t *data) {
   afl_forkserver_t *fsrv = &data->afl->fsrv;
-  u32 n = fsrv->real_map_size ? fsrv->real_map_size : fsrv->map_size;
-  if (n > fsrv->map_size) n = fsrv->map_size;
-  return simplify_hash_bits(fsrv->trace_bits, n);
+  return simplify_hash_bits(fsrv->trace_bits, fsrv->map_size);
 }
 
 // Unique mutator-driven fsrv_cov crash. Same key shape as fsrv_san_crash:
@@ -1352,8 +1518,11 @@ extern "C" size_t afl_custom_fuzz(my_mutator_t *data, u8 *buf, size_t buf_size,
   return 0;
 }
 
+static void dump_seed_states(my_mutator_t *data);
+
 extern "C" void afl_custom_deinit(my_mutator_t *data) {
   write_progress(data, true);
+  dump_seed_states(data);
   const sedbt::Tree &t = data->tree;
   fprintf(stderr,
           "[sedbt] traces=%llu nodes=%llu pred_nodes=%llu depth=%llu conflicts=%llu "
@@ -1479,7 +1648,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
             "mut_cnt=%llu mut_wall_ns=%llu mut_throughput=%.2f "
             "fsrv_san_crash=%llu fsrv_cov_crash=%llu fsrv_cov_miss=%llu "
             "queue_seed_cnt=%llu path_s_refresh_cnt=%llu "
-            "closure_exec=%llu fsrv_san_identity=%llu\n",
+            "closure_exec=%llu fsrv_san_identity=%llu "
+            "energy_pool_ps=%llu energy_min_havoc_visits=%llu\n",
             (unsigned long long)data->fsrv_cov_exec,
             (unsigned long long)data->fsrv_cov_ns, cov_tp,
             (unsigned long long)data->fsrv_san_exec,
@@ -1502,7 +1672,9 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
             (unsigned long long)data->path_s_refresh_cnt,
             (unsigned long long)data->closure_exec,
             (unsigned long long)(data->cov_gain_cnt + data->con_san_cnt +
-                                 data->closure_exec));
+                                 data->closure_exec),
+            (unsigned long long)data->energy_pool_ps,
+            (unsigned long long)data->energy_min_havoc_visits);
     if (data->afl && data->afl->out_dir) {
       char *mp = alloc_printf("%s/mce_stats.txt", data->afl->out_dir);
       FILE *mf = fopen(mp, "w");
@@ -1522,7 +1694,8 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
                 "closure_exec=%llu\n"
                 "fsrv_san_identity=%llu\n"
                 "bitmap_cvg_note=see fuzzer_stats\n"
-                "seed_exe_depth_note=post-campaign measure-seed-exe-depth.py\n",
+                "seed_exe_depth_note=post-campaign measure-seed-exe-depth.py\n"
+                "energy_pool_ps=%llu\nenergy_min_havoc_visits=%llu\n",
                 (unsigned long long)data->fsrv_cov_exec,
                 (unsigned long long)data->fsrv_cov_ns, cov_tp,
                 (unsigned long long)data->fsrv_san_exec,
@@ -1545,7 +1718,9 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
                 (unsigned long long)data->path_s_refresh_cnt,
                 (unsigned long long)data->closure_exec,
                 (unsigned long long)(data->cov_gain_cnt + data->con_san_cnt +
-                                     data->closure_exec));
+                                     data->closure_exec),
+                (unsigned long long)data->energy_pool_ps,
+                (unsigned long long)data->energy_min_havoc_visits);
         fclose(mf);
       }
       ck_free(mp);
@@ -1802,12 +1977,93 @@ static void note_seed_round_result(my_mutator_t *data) {
   else it->second.stall_rounds += 1;
 }
 
+// Campaign monitor: snapshot per-seed learning state (target frontier,
+// live mutation offsets, stall rounds) to SYMAFL_SEED_DUMP. Rewritten
+// atomically so an external watcher always reads a whole snapshot.
+static void dump_seed_states(my_mutator_t *data) {
+  const char *path = getenv("SYMAFL_SEED_DUMP");
+  if (!path || !*path) return;
+  char tmp[512];
+  if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) return;
+  FILE *f = fopen(tmp, "w");
+  if (!f) return;
+  fprintf(f, "time=%llu seeds=%zu energy_pool=%llu\n",
+          (unsigned long long)time(nullptr), data->seed_learn.size(),
+          (unsigned long long)data->energy_pool_ps);
+  // SYMAFL_SEED_HISTORY=1: append every snapshot block to <path>.hist so
+  // ESS/stall/attention can be integrated over time instead of read as a
+  // final-state snapshot.
+  FILE *hist = nullptr;
+  if (getenv("SYMAFL_SEED_HISTORY")) {
+    char hp[512];
+    if (snprintf(hp, sizeof(hp), "%s.hist", path) < (int)sizeof(hp))
+      hist = fopen(hp, "a");
+    if (hist) fprintf(hist, "time=%llu seeds=%zu energy_pool=%llu\n",
+                      (unsigned long long)time(nullptr),
+                      data->seed_learn.size(),
+                      (unsigned long long)data->energy_pool_ps);
+  }
+  for (const auto &kv : data->seed_learn) {
+    const SeedLearn &st = kv.second;
+    const char *base = strrchr(kv.first.c_str(), '/');
+    base = base ? base + 1 : kv.first.c_str();
+    fprintf(f,
+            "seed=%s learned=%u frontier=%u/%u skip=%u node=%u/%u "
+            "path_s_n=%u path_s_cons=%u stall=%u visits=%u cum_quota=%llu",
+            base, (unsigned)st.learned, st.frontier, (unsigned)st.dir,
+            st.skip_cnt, st.last_node, (unsigned)st.last_dir, st.path_s_n,
+            st.path_s_cons_n, st.stall_rounds, st.visits,
+            (unsigned long long)st.cum_quota);
+    if (hist)
+      fprintf(hist,
+              "seed=%s learned=%u frontier=%u/%u skip=%u node=%u/%u "
+              "path_s_n=%u path_s_cons=%u stall=%u visits=%u cum_quota=%llu",
+              base, (unsigned)st.learned, st.frontier, (unsigned)st.dir,
+              st.skip_cnt, st.last_node, (unsigned)st.last_dir, st.path_s_n,
+              st.path_s_cons_n, st.stall_rounds, st.visits,
+              (unsigned long long)st.cum_quota);
+    // SYMAFL_SEED_DUMP_OFFS=1: also print the live mutation offsets —
+    // m3 gate bytes sit at 8+64c (+1 for the type pair) — for energy and
+    // freeze diagnosis.
+    if (getenv("SYMAFL_SEED_DUMP_OFFS") && st.path_s_ready &&
+        data->analyzer.tree &&
+        (uint64_t)st.path_s_off + st.path_s_n <=
+            (uint64_t)data->analyzer.tree->hdr.n_s) {
+      const uint32_t *offs =
+          symafl::shm_s_offs(data->analyzer.tree) + st.path_s_off;
+      fprintf(f, " offs=");
+      if (hist) fprintf(hist, " offs=");
+      for (uint16_t i = 0; i < st.path_s_n && i < 24; ++i)
+        fprintf(f, "%s%u", i ? "," : "", offs[i]);
+      for (uint16_t i = 0; hist && i < st.path_s_n && i < 24; ++i)
+        fprintf(hist, "%s%u", i ? "," : "", offs[i]);
+    }
+    fprintf(f, "\n");
+    if (hist) fprintf(hist, "\n");
+  }
+  if (hist) fclose(hist);
+  fclose(f);
+  rename(tmp, path);
+}
+
+static uint64_t s_round_calls = 0;
+
+static void note_seed_round_result_and_dump(my_mutator_t *data) {
+  note_seed_round_result(data);
+  if ((++s_round_calls & 0xff) == 0) dump_seed_states(data);
+}
+
+// Time-sliced dump from the post-exec hook: SIGINT-killed campaigns do
+// not reach afl_custom_deinit, and short runs may not hit 256 rounds.
+static uint64_t s_last_seed_dump_ms = 0;
+
 static void maybe_refresh_path_s(my_mutator_t *data, SeedLearn *st,
                                  const char *fname) {
   if (!st || !data->analyzer.tree) return;
   if (st->learned != symafl::kReady) return;
   adopt_path_s_from_shm(st, data->analyzer.tree);
   if (data->path_s_mode != sedbt::PathSMode::Suffix) return;
+  if (!data->path_s_refresh) return;
   if (st->stall_rounds < 2) return;
   if (st->last_node < sedbt::kRoot || st->last_dir > 1) return;
   int r = symafl::refresh_suffix_path_s(data->analyzer.tree, st->last_node,
@@ -1842,12 +2098,17 @@ static void take_terminal(SeedLearn *st, const symafl::WalkResult &wr) {
 
 // Concolic deadline = 50 × the queue seed's concrete exec_us (AFL
 // calibration). Floor 50ms so a 1µs seed still bounds the child; cap 5min.
+// SYMAFL_LEARN_TIMEOUT_FACTOR / SYMAFL_LEARN_TIMEOUT_MIN_MS override the
+// factor / floor — needed under CPU contention where a deep DFSan replay
+// needs far longer than 50 × the contended exec_us (retry storms hold the
+// LearnJob ring slot otherwise).
 static uint32_t learn_timeout_ms(const my_mutator_t *data) {
   u64 us = 0;
   if (data->afl && data->afl->queue_cur) us = data->afl->queue_cur->exec_us;
   if (!us) us = 1000;
-  u64 ms = us * 50ull / 1000ull;
-  if (ms < 50) ms = 50;
+  u64 ms = us * env_u64("SYMAFL_LEARN_TIMEOUT_FACTOR", 50ull) / 1000ull;
+  u64 floor_ms = env_u64("SYMAFL_LEARN_TIMEOUT_MIN_MS", 50ull);
+  if (ms < floor_ms) ms = floor_ms;
   if (ms > 300000) ms = 300000;
   return (uint32_t)ms;
 }
@@ -1947,7 +2208,7 @@ static void apply_suffix(my_mutator_t *data, SeedLearn *st, const u8 *buf,
 }
 
 static void load_seed_learn(my_mutator_t *data, const char *filename) {
-  note_seed_round_result(data);
+  note_seed_round_result_and_dump(data);
   data->round_found_cov = false;
   data->last_queue_name = filename ? filename : "";
   data->current_open_rsan.clear();
@@ -2018,11 +2279,19 @@ static void load_seed_learn(my_mutator_t *data, const char *filename) {
         (have_explore || have_vuln)) {
       data->afl->sedbt_skip_det = 1;
       data->afl->sedbt_havoc_pct = (u8)data->havoc_pct;
+    } else if (data->energy_workload &&
+               data->current_learned == symafl::kReady) {
+      // Learned terminal (path-s exhausted): keep a minimum havoc pulse
+      // instead of reverting to full vanilla det+havoc.
+      data->afl->sedbt_skip_det = 1;
+      data->afl->sedbt_havoc_pct = data->energy_min_havoc_pct;
+      data->energy_min_havoc_visits += 1;
     } else {
       data->afl->sedbt_skip_det = 0;
       data->afl->sedbt_havoc_pct = 100;
     }
   }
+  data->energy_pool_dirty = true;
 }
 
 // Unique sanitizer crash: (signal, coverage simplify_trace hash) — same
@@ -2048,7 +2317,7 @@ static void handle_san_crash(my_mutator_t *data, const u8 *buf, size_t len,
   data->fsrv_san_crash += 1;
   data->san_crashes_saved += 1;
   if (from == kSanConSan && !peek_cov_crash &&
-      data->seen_simplify.count(ph)) {
+      seen_has(data, ph)) {
     data->fsrv_cov_miss += 1;
     data->path_s_san_cov_miss += 1;
   }
@@ -2098,16 +2367,19 @@ static void run_path_s_san_candidate(my_mutator_t *data, const u8 *buf,
 }
 
 extern "C" void afl_custom_post_run(my_mutator_t *data) {
+  const uint64_t dump_now = monotonic_ms();
+  if (dump_now - s_last_seed_dump_ms >= 15000) {
+    s_last_seed_dump_ms = dump_now;
+    dump_seed_states(data);
+  }
   const bool mutant = data->last_cov_candidate;
   data->last_cov_candidate = false;
   afl_forkserver_t *fsrv = &data->afl->fsrv;
-  u32 n = fsrv->real_map_size ? fsrv->real_map_size : fsrv->map_size;
-  if (n > fsrv->map_size) n = fsrv->map_size;
-  uint32_t h = simplify_hash_bits(fsrv->trace_bits, n);
+  uint32_t h = simplify_hash_bits(fsrv->trace_bits, fsrv->map_size);
   data->last_cov_hash = h;
   const bool cov_crashed = fsrv_was_crash(fsrv);
   if (mutant) note_cov_crash(data);
-  const bool is_new = data->seen_simplify.insert(h).second;
+  const bool is_new = seen_add(data, h);
   // A crashing fsrv_cov run never enters fsrv_san (identity: cov_gain_cnt
   // only counts mutants that do).
   if (mutant && is_new && !cov_crashed) {
@@ -2199,6 +2471,16 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   SeedLearn st;
   first_contact(data, &st, buf.data(), (uint32_t)buf.size(), fname, true);
   data->seed_learn[fname] = std::move(st);
+  // Workload-energy bookkeeping (SYMAFL_ENERGY=workload): the new seed's
+  // path-s changes the pool denominator, and the seed it was mutated from
+  // may have had branches covered below its frontier — re-adopt its live
+  // SHM binding so a shrunken suffix releases quota to the rest.
+  data->energy_pool_dirty = true;
+  if (data->energy_workload && filename_orig_queue && data->analyzer.tree) {
+    auto pit = data->seed_learn.find((const char *)filename_orig_queue);
+    if (pit != data->seed_learn.end())
+      adopt_path_s_from_shm(&pit->second, data->analyzer.tree);
+  }
   return 0;
 }
 
@@ -2211,8 +2493,52 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
 /// CloseUnexplored. A con_san / focused sanitizer
 /// crash peeks fsrv_cov (no virgin update, not fsrv_cov_crash);
 /// path_s_san_cov_miss counts inputs cov-first would drop.
+// Read-only: would the orig PoC pass B (new simplify_trace) or C (CONS_SAN)?
+// Does not insert gep_skip_keys / simplified_n_fuzz / crash files.
+static void rq1_peek(my_mutator_t *data) {
+  if (data->rq1_poc.empty() || !data->afl || !data->afl->out_dir) return;
+  const uint64_t now = profile_now();
+  if (data->rq1_last_peek && now - data->rq1_last_peek < data->rq1_peek_ns)
+    return;
+  data->rq1_last_peek = now;
+  bool cov_crash = false;
+  const uint32_t h = peek_cov_simplify(
+      data, data->rq1_poc.data(), data->rq1_poc.size(), &cov_crash);
+  const bool cf_new = !seen_has(data, h);
+  bool cons = false;
+  if (data->analyzer_mode && data->path_s_cons_san &&
+      !data->parent_seed.empty() && data->current_path_s_cons_n > 0) {
+    if (cons_offsets_changed(data, data->parent_seed.data(),
+                             data->parent_seed.size(), data->rq1_poc.data(),
+                             data->rq1_poc.size())) {
+      const uint64_t key =
+          gep_value_key(data, data->rq1_poc.data(), data->rq1_poc.size());
+      cons = data->gep_skip_keys.find(key) == data->gep_skip_keys.end();
+    }
+  }
+  const char *verdict = "mech_miss";
+  if (cov_crash) verdict = "cov_crash";
+  else if (cons) verdict = "would_admit_cons_san";
+  else if (cf_new) verdict = "would_admit_cf";
+  char *path = alloc_printf("%s/rq1_status.json", data->afl->out_dir);
+  FILE *f = fopen(path, "w");
+  if (f) {
+    fprintf(f,
+            "{\"verdict\":\"%s\",\"cf_new\":%s,\"cons_san\":%s,"
+            "\"poc_cov_crash\":%s,\"seen_n\":%zu,\"san_crash_n\":%llu,"
+            "\"cov_crash_n\":%llu,\"hash\":%u}\n",
+            verdict, cf_new ? "true" : "false", cons ? "true" : "false",
+            cov_crash ? "true" : "false", (size_t)data->seen_n,
+            (unsigned long long)data->fsrv_san_crash,
+            (unsigned long long)data->fsrv_cov_crash, h);
+    fclose(f);
+  }
+  ck_free(path);
+}
+
 extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                           size_t buf_size, u8 **out_buf) {
+  if (!data->rq1_poc.empty() && data->bootstrap_done) rq1_peek(data);
   data->profile_exec_armed = false;
   data->afl->sedbt_probe_active = 0;
   data->afl->sedbt_candidate_kind = SEDBT_CANDIDATE_NONE;

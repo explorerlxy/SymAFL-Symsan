@@ -101,9 +101,10 @@ struct Node {
   bool constraint = false;
   // Tainted GEP-index pin (ShmNode.constraint == kConstraintGep).
   bool gep_pin = false;
-  // memcpy/memmove/strncpy/memset size pin (kConstraintMemlen). CONS_SAN
-  // binds gep_pin and memlen_pin. Indcall / fread-style read-length stay
-  // constraint topology only (kConstraintPin).
+  // memcpy-family size pin (kConstraintMemlen): memcpy/memmove/strncpy/
+  // memset/memcmp/bcmp/strncat n. strcat has no size argument and is not
+  // a pin. CONS_SAN binds gep_pin and memlen_pin. Indcall / fread-style
+  // read-length stay constraint topology only (kConstraintPin).
   bool memlen_pin = false;
   // Prefix validation found incompatible symbolic event streams at this node.
   // Descendants are not safe terminal proofs while this flag is set.

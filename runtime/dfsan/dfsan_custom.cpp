@@ -54,6 +54,9 @@
 
 using namespace __dfsan;
 
+static dfsan_label make_fstrlen_label(const char *s, size_t len);
+static void pin_tainted_copy_len(dfsan_label n_label, size_t n, uint32_t cid);
+
 // Lazily clear a freshly-allocated region's shadow instead of eagerly zeroing
 // it. The shadow mapping is mapped no-reserve (demand-zero), so a fresh
 // allocation's shadow pages are already zero and must not be faulted in.
@@ -637,6 +640,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_memcmp(const void *s1, const void *s2,
                              s1_label, s2_label, n_label);
   __taint_check_bounds(s1_label, (uptr)s1, n_label, n);
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
+  pin_tainted_copy_len(n_label, n, kMemcmpConstraintCid);
   int ret = memcmp(s1, s2, n);
 
   // Check for fsubstr labels
@@ -673,6 +677,7 @@ SANITIZER_INTERFACE_ATTRIBUTE int __dfsw_bcmp(const void *s1, const void *s2,
   __taint_check_bounds(s2_label, (uptr)s2, n_label, n);
   __taint_solve_size(s1_label, (uint64_t)s1, n_label, n, 0);
   __taint_solve_size(s2_label, (uint64_t)s2, n_label, n, 0);
+  pin_tainted_copy_len(n_label, n, kBcmpConstraintCid);
   int ret = bcmp(s1, s2, n);
 
   // Check for fsubstr labels (from strncpy with symbolic length)
@@ -988,29 +993,23 @@ __dfsw_strncasecmp(const char *s1, const char *s2, size_t n,
   return ret;
 }
 
+// fstrlen of s[0..len] including the terminating NUL at s[len].
+static dfsan_label make_fstrlen_label(const char *s, size_t len) {
+  dfsan_label str_label = dfsan_read_label(s, len + 1);
+  if (str_label == 0) return 0;
+  dfsan_label null_label = dfsan_read_label(s + len, 1);
+  return dfsan_union(0, str_label, fstrlen, sizeof(size_t) * 8,
+                     null_label != 0 ? 1 : 0, len);
+}
+
+static void pin_tainted_copy_len(dfsan_label n_label, size_t n, uint32_t cid) {
+  if (n_label) __taint_trace_copy_len(n_label, n, cid);
+}
+
 SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_strlen(const char *s, dfsan_label s_label, dfsan_label *ret_label) {
   size_t ret = strlen(s);
-  dfsan_label str_label = dfsan_read_label(s, ret + 1);
-
-  if (str_label == 0) {
-    *ret_label = 0;
-  } else {
-    // Check if the null terminator byte is from input (tainted)
-    // If not, it was added programmatically (e.g., by the program setting '\0')
-    dfsan_label null_label = dfsan_read_label(s + ret, 1);
-    bool null_from_input = (null_label != 0);
-
-    // Create fstrlen label:
-    // - l1 = 0 (following fsize/fatoi pattern to avoid Alloca rejection)
-    // - l2 = str_label (content label for dependencies)
-    // - op1 = null_from_input flag (1 if null is from input, 0 if programmatic)
-    // - op2 = actual length (for solution generation)
-    // Note: str_label contains the offset info via Load labels
-    *ret_label = dfsan_union(0, str_label, fstrlen,
-                             sizeof(size_t) * 8,
-                             null_from_input ? 1 : 0, ret);
-  }
+  *ret_label = make_fstrlen_label(s, ret);
   return ret;
 }
 
@@ -1024,16 +1023,7 @@ SANITIZER_INTERFACE_ATTRIBUTE size_t
 __dfsw_strnlen(const char *s, size_t n, dfsan_label s_label,
                dfsan_label n_label, dfsan_label *ret_label) {
   size_t ret = strnlen(s, n);
-  dfsan_label str_label = dfsan_read_label(s, ret + 1);
-  if (str_label == 0) {
-    *ret_label = 0;
-  } else {
-    dfsan_label null_label = dfsan_read_label(s + ret, 1);
-    bool null_from_input = (null_label != 0);
-    *ret_label = dfsan_union(0, str_label, fstrlen,
-                             sizeof(size_t) * 8,
-                             null_from_input ? 1 : 0, ret);
-  }
+  *ret_label = make_fstrlen_label(s, ret);
   return ret;
 }
 
@@ -1471,6 +1461,7 @@ __dfsw_strncat(char *dest, const char *src, size_t n,
   size_t src_len = strlen(src);
   size_t copy_len = (n < src_len) ? n : src_len;  // min(n, strlen(src))
   __taint_check_bounds(d_label, (uptr)dest, 0, dest_len + copy_len + 1);
+  pin_tainted_copy_len(n_label, n, kStrncatConstraintCid);
 
   AOUT("strncat: dest=%p, src=%p, n=%zu, d_label=%u, s_label=%u, n_label=%u\n",
        dest, src, n, d_label, s_label, n_label);
