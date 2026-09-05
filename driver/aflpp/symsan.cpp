@@ -24,6 +24,7 @@
 #include "sedbt.hpp"
 #include "analyzer_client.hpp"
 #include "suffix_screen.hpp"
+#include "seed_refresh.hpp"
 
 extern "C" {
 #include "afl-fuzz.h"
@@ -93,7 +94,6 @@ struct SeedLearn {
   uint16_t path_s_cons_n = 0;
   uint8_t path_s_ready = 0;
   uint8_t have_frontier = 0;  // 1 = LearnJob edge is this seed's suffix start
-  uint32_t stall_rounds = 0;  // consecutive fuzz rounds with no new coverage
   uint32_t visits = 0;        // custom-stage visits that handed a quota
   uint64_t cum_quota = 0;     // cumulative custom-mutation quota handed over
   std::vector<uint32_t> rsan_nodes;
@@ -243,7 +243,10 @@ struct my_mutator_t {
   uint8_t current_have_frontier = 0;
   uint8_t current_learned = symafl::kWalkFail;
   std::string last_queue_name;
-  bool round_found_cov = false;
+  symafl::SeedRefreshQueue refresh_events;
+  uint64_t refresh_head = ~0ull;
+  uint64_t refresh_poll_ns = 0;
+  uint64_t path_s_refresh_events = 0;
   uint64_t path_s_refresh_cnt = 0;
   uint32_t explore_n = 0;
   uint32_t mut_i = 0;
@@ -253,7 +256,7 @@ struct my_mutator_t {
   sedbt::PathSMode path_s_mode = sedbt::PathSMode::Suffix;
   bool mut_closure = true;   // SYMAFL_MUT_CLOSURE, default on
   bool path_s_screen = true; // SYMAFL_PATH_S_SCREEN: parent-suffix skip cov
-  bool path_s_refresh = true; // SYMAFL_PATH_S_REFRESH: stall shrink to unexplored-sib
+  bool path_s_refresh = true; // SYMAFL_PATH_S_REFRESH: parent/child learning events
   bool path_s_cons_san = true; // SYMAFL_PATH_S_CONS_SAN: GEP-index → fsrv_san
   std::unordered_set<uint64_t> gep_skip_keys;  // one CONS_SAN skip per GEP value
   // SYMAFL_ENERGY=workload: learned=1 seeds draw their custom-stage quota
@@ -796,7 +799,7 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
     fprintf(stderr, "[sedbt] mutate path_s=%s closure=%s havoc_pct=%u "
             "path_s_screen=%s path_s_refresh=%s path_s_cons_san=%s analyzer=%s "
             "(0 disables that side / AFL havoc tail / parent-suffix skip / "
-            "stall path-s shrink / CONS_SAN pin→fsrv_san)\n",
+            "parent/child event refresh / CONS_SAN pin→fsrv_san)\n",
             sedbt::path_s_mode_name(data->path_s_mode),
             data->mut_closure ? "on" : "off", data->havoc_pct,
             data->path_s_screen ? "on" : "off",
@@ -1008,6 +1011,8 @@ extern "C" my_mutator_t *afl_custom_init(afl_state *afl, unsigned int seed) {
   return data;
 }
 
+static void process_refresh_events(my_mutator_t *data, bool force = false);
+
 // SYMAFL_ENERGY=workload pool: Σ path_s_n over learned=1 seeds. Recomputed
 // per custom-stage visit (queue-sized map walk) so enqueues, learning
 // completions, and refresh rewrites are picked up without event plumbing.
@@ -1036,6 +1041,7 @@ extern "C" u32 afl_custom_fuzz_count(my_mutator_t *data, const u8 *buf,
                                      size_t buf_size) {
   (void)buf;
   (void)buf_size;
+  process_refresh_events(data, true);
   data->mut_i = 0;
   data->explore_n = 0;
   data->energy_quota = 0;
@@ -1402,6 +1408,7 @@ extern "C" size_t afl_custom_fuzz(my_mutator_t *data, u8 *buf, size_t buf_size,
     *out_buf = buf;
     return 0;
   }
+  if ((data->mut_i & 0xff) == 0) process_refresh_events(data);
   data->focused_pending = false;
   data->path_s_pending = false;
   data->path_s_san_pending = false;
@@ -1647,7 +1654,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
             "suffix_screen_hit=%llu suffix_screen_miss=%llu "
             "mut_cnt=%llu mut_wall_ns=%llu mut_throughput=%.2f "
             "fsrv_san_crash=%llu fsrv_cov_crash=%llu fsrv_cov_miss=%llu "
-            "queue_seed_cnt=%llu path_s_refresh_cnt=%llu "
+            "queue_seed_cnt=%llu path_s_refresh_cnt=%llu path_s_refresh_events=%llu "
             "closure_exec=%llu fsrv_san_identity=%llu "
             "energy_pool_ps=%llu energy_min_havoc_visits=%llu\n",
             (unsigned long long)data->fsrv_cov_exec,
@@ -1670,6 +1677,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
             (unsigned long long)data->fsrv_cov_miss,
             (unsigned long long)queue_n,
             (unsigned long long)data->path_s_refresh_cnt,
+            (unsigned long long)data->path_s_refresh_events,
             (unsigned long long)data->closure_exec,
             (unsigned long long)(data->cov_gain_cnt + data->con_san_cnt +
                                  data->closure_exec),
@@ -1690,7 +1698,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
                 "mut_cnt=%llu\nmut_wall_ns=%llu\nmut_throughput=%.6f\n"
                 "fsrv_san_crash=%llu\nfsrv_cov_crash=%llu\nfsrv_cov_miss=%llu\n"
                 "queue_seed_cnt=%llu\n"
-                "path_s_refresh_cnt=%llu\n"
+                "path_s_refresh_cnt=%llu\npath_s_refresh_events=%llu\n"
                 "closure_exec=%llu\n"
                 "fsrv_san_identity=%llu\n"
                 "bitmap_cvg_note=see fuzzer_stats\n"
@@ -1716,6 +1724,7 @@ extern "C" void afl_custom_deinit(my_mutator_t *data) {
                 (unsigned long long)data->fsrv_cov_miss,
                 (unsigned long long)queue_n,
                 (unsigned long long)data->path_s_refresh_cnt,
+            (unsigned long long)data->path_s_refresh_events,
                 (unsigned long long)data->closure_exec,
                 (unsigned long long)(data->cov_gain_cnt + data->con_san_cnt +
                                      data->closure_exec),
@@ -1969,16 +1978,8 @@ static void adopt_path_s_from_shm(SeedLearn *st, const symafl::SedbtShm *shm) {
   st->path_s_ready = 1;
 }
 
-static void note_seed_round_result(my_mutator_t *data) {
-  if (data->last_queue_name.empty()) return;
-  auto it = data->seed_learn.find(data->last_queue_name);
-  if (it == data->seed_learn.end()) return;
-  if (data->round_found_cov) it->second.stall_rounds = 0;
-  else it->second.stall_rounds += 1;
-}
-
 // Campaign monitor: snapshot per-seed learning state (target frontier,
-// live mutation offsets, stall rounds) to SYMAFL_SEED_DUMP. Rewritten
+// live mutation offsets, completed refresh events) to SYMAFL_SEED_DUMP. Rewritten
 // atomically so an external watcher always reads a whole snapshot.
 static void dump_seed_states(my_mutator_t *data) {
   const char *path = getenv("SYMAFL_SEED_DUMP");
@@ -1991,7 +1992,7 @@ static void dump_seed_states(my_mutator_t *data) {
           (unsigned long long)time(nullptr), data->seed_learn.size(),
           (unsigned long long)data->energy_pool_ps);
   // SYMAFL_SEED_HISTORY=1: append every snapshot block to <path>.hist so
-  // ESS/stall/attention can be integrated over time instead of read as a
+  // ESS/refresh/attention can be integrated over time instead of read as a
   // final-state snapshot.
   FILE *hist = nullptr;
   if (getenv("SYMAFL_SEED_HISTORY")) {
@@ -2009,18 +2010,18 @@ static void dump_seed_states(my_mutator_t *data) {
     base = base ? base + 1 : kv.first.c_str();
     fprintf(f,
             "seed=%s learned=%u frontier=%u/%u skip=%u node=%u/%u "
-            "path_s_n=%u path_s_cons=%u stall=%u visits=%u cum_quota=%llu",
+            "path_s_n=%u path_s_cons=%u visits=%u cum_quota=%llu",
             base, (unsigned)st.learned, st.frontier, (unsigned)st.dir,
             st.skip_cnt, st.last_node, (unsigned)st.last_dir, st.path_s_n,
-            st.path_s_cons_n, st.stall_rounds, st.visits,
+            st.path_s_cons_n, st.visits,
             (unsigned long long)st.cum_quota);
     if (hist)
       fprintf(hist,
               "seed=%s learned=%u frontier=%u/%u skip=%u node=%u/%u "
-              "path_s_n=%u path_s_cons=%u stall=%u visits=%u cum_quota=%llu",
+              "path_s_n=%u path_s_cons=%u visits=%u cum_quota=%llu",
               base, (unsigned)st.learned, st.frontier, (unsigned)st.dir,
               st.skip_cnt, st.last_node, (unsigned)st.last_dir, st.path_s_n,
-              st.path_s_cons_n, st.stall_rounds, st.visits,
+              st.path_s_cons_n, st.visits,
               (unsigned long long)st.cum_quota);
     // SYMAFL_SEED_DUMP_OFFS=1: also print the live mutation offsets —
     // m3 gate bytes sit at 8+64c (+1 for the type pair) — for energy and
@@ -2048,34 +2049,13 @@ static void dump_seed_states(my_mutator_t *data) {
 
 static uint64_t s_round_calls = 0;
 
-static void note_seed_round_result_and_dump(my_mutator_t *data) {
-  note_seed_round_result(data);
+static void note_seed_visit_and_dump(my_mutator_t *data) {
   if ((++s_round_calls & 0xff) == 0) dump_seed_states(data);
 }
 
 // Time-sliced dump from the post-exec hook: SIGINT-killed campaigns do
 // not reach afl_custom_deinit, and short runs may not hit 256 rounds.
 static uint64_t s_last_seed_dump_ms = 0;
-
-static void maybe_refresh_path_s(my_mutator_t *data, SeedLearn *st,
-                                 const char *fname) {
-  if (!st || !data->analyzer.tree) return;
-  if (st->learned != symafl::kReady) return;
-  adopt_path_s_from_shm(st, data->analyzer.tree);
-  if (data->path_s_mode != sedbt::PathSMode::Suffix) return;
-  if (!data->path_s_refresh) return;
-  if (st->stall_rounds < 2) return;
-  if (st->last_node < sedbt::kRoot || st->last_dir > 1) return;
-  int r = symafl::refresh_suffix_path_s(data->analyzer.tree, st->last_node,
-                                        st->last_dir);
-  if (r > 0) {
-    data->path_s_refresh_cnt += 1;
-    adopt_path_s_from_shm(st, data->analyzer.tree);
-    fprintf(stderr, "[sedbt] path-s refresh n=%u cons=%u stall=%u %s\n",
-            st->path_s_n, st->path_s_cons_n, st->stall_rounds,
-            fname ? fname : "");
-  }
-}
 
 static void take_terminal(SeedLearn *st, const symafl::WalkResult &wr) {
   st->learned = symafl::kReady;
@@ -2207,9 +2187,57 @@ static void apply_suffix(my_mutator_t *data, SeedLearn *st, const u8 *buf,
   st->have_frontier = 1;
 }
 
+static void process_refresh_events(my_mutator_t *data, bool force) {
+  if (!data->refresh_events.size() || !data->analyzer.tree) return;
+  const uint64_t now = profile_now();
+  const uint64_t head = data->analyzer.ring
+      ? data->analyzer.ring->head.v.load(std::memory_order_acquire) : 0;
+  // A completed ring job is the cheap publication signal. Periodic retry
+  // also covers lock contention, ring-full seeds and another fuzzer's insert.
+  if (!force && head == data->refresh_head &&
+      now - data->refresh_poll_ns < 100000000ull) return;
+  data->refresh_head = head;
+  data->refresh_poll_ns = now;
+  auto resolve = [&](const std::string &name) {
+    auto it = data->seed_learn.find(name);
+    if (it == data->seed_learn.end()) return symafl::RefreshReady::Unavailable;
+    SeedLearn &st = it->second;
+    if (st.learned == symafl::kInFlight || st.learned == symafl::kRingFull) {
+      std::vector<u8> buf;
+      if (!read_queue_file(name.c_str(), &buf))
+        return symafl::RefreshReady::Unavailable;
+      apply_suffix(data, &st, buf.data(), (uint32_t)buf.size());
+      if (st.learned == symafl::kRingFull)
+        try_submit_learn(data, &st, buf.data(), (uint32_t)buf.size());
+    }
+    if (st.learned == symafl::kReady) return symafl::RefreshReady::Ready;
+    if (st.learned == symafl::kWalkFail) return symafl::RefreshReady::Unavailable;
+    return symafl::RefreshReady::Pending;
+  };
+  auto refresh = [&](const std::string &name) {
+    SeedLearn &st = data->seed_learn.at(name);
+    const int r = symafl::refresh_suffix_path_s(data->analyzer.tree,
+                                               st.last_node, st.last_dir);
+    if (r < 0) return false;
+    adopt_path_s_from_shm(&st, data->analyzer.tree);
+    data->energy_pool_dirty = true;
+    if (name == data->last_queue_name) {
+      data->current_path_s_off = st.path_s_off;
+      data->current_path_s_n = st.path_s_n;
+      data->current_path_s_cons_n = st.path_s_cons_n;
+    }
+    if (r > 0) {
+      ++data->path_s_refresh_cnt;
+      fprintf(stderr, "[sedbt] event path-s refresh n=%u cons=%u %s\n",
+              st.path_s_n, st.path_s_cons_n, name.c_str());
+    }
+    return true;
+  };
+  data->path_s_refresh_events += data->refresh_events.drain(resolve, refresh);
+}
+
 static void load_seed_learn(my_mutator_t *data, const char *filename) {
-  note_seed_round_result_and_dump(data);
-  data->round_found_cov = false;
+  note_seed_visit_and_dump(data);
   data->last_queue_name = filename ? filename : "";
   data->current_open_rsan.clear();
   data->current_path_s_off = 0;
@@ -2264,7 +2292,8 @@ static void load_seed_learn(my_mutator_t *data, const char *filename) {
     }
   }
   if (it->second.learned == symafl::kReady)
-    maybe_refresh_path_s(data, &it->second, filename);
+    adopt_path_s_from_shm(&it->second, data->analyzer.tree);
+  process_refresh_events(data, true);
   collect_open(data, it->second, filename);
   data->current_learned = it->second.learned;
   {
@@ -2384,7 +2413,6 @@ extern "C" void afl_custom_post_run(my_mutator_t *data) {
   // only counts mutants that do).
   if (mutant && is_new && !cov_crashed) {
     data->cov_gain_cnt += 1;
-    data->round_found_cov = true;
     if (!data->last_cov_buf.empty()) {
       run_sanitizer_on(data, data->last_cov_buf.data(),
                        data->last_cov_buf.size(), kSanCovGain);
@@ -2451,7 +2479,6 @@ extern "C" void afl_custom_probe_result(my_mutator_t *data, const u8 *buf,
 extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
                                          const u8 *filename_new_queue,
                                          const u8 *filename_orig_queue) {
-  (void)filename_orig_queue;
   if (!data->analyzer_mode) return 0;
   if (!data->bootstrap_done) {
     if (filename_new_queue) {
@@ -2471,15 +2498,11 @@ extern "C" u8 afl_custom_queue_new_entry(my_mutator_t *data,
   SeedLearn st;
   first_contact(data, &st, buf.data(), (uint32_t)buf.size(), fname, true);
   data->seed_learn[fname] = std::move(st);
-  // Workload-energy bookkeeping (SYMAFL_ENERGY=workload): the new seed's
-  // path-s changes the pool denominator, and the seed it was mutated from
-  // may have had branches covered below its frontier — re-adopt its live
-  // SHM binding so a shrunken suffix releases quota to the rest.
   data->energy_pool_dirty = true;
-  if (data->energy_workload && filename_orig_queue && data->analyzer.tree) {
-    auto pit = data->seed_learn.find((const char *)filename_orig_queue);
-    if (pit != data->seed_learn.end())
-      adopt_path_s_from_shm(&pit->second, data->analyzer.tree);
+  if (data->path_s_refresh && data->path_s_mode == sedbt::PathSMode::Suffix) {
+    data->refresh_events.enqueue(fname, filename_orig_queue
+        ? (const char *)filename_orig_queue : "");
+    process_refresh_events(data, true);
   }
   return 0;
 }
@@ -2538,6 +2561,7 @@ static void rq1_peek(my_mutator_t *data) {
 
 extern "C" size_t afl_custom_post_process(my_mutator_t *data, u8 *buf,
                                           size_t buf_size, u8 **out_buf) {
+  process_refresh_events(data);
   if (!data->rq1_poc.empty() && data->bootstrap_done) rq1_peek(data);
   data->profile_exec_armed = false;
   data->afl->sedbt_probe_active = 0;

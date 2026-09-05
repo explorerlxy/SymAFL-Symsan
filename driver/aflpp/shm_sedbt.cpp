@@ -292,7 +292,7 @@ int refresh_suffix_path_s(SedbtShm *shm, uint32_t tail, uint8_t tdir) {
   uint8_t fdir = sn.term_fdir[tdir];
   (void)fdir;
   if (frontier < sedbt::kRoot) return 0;
-  if (!try_lock_path_s_refresh(shm)) return 0;
+  if (!try_lock_path_s_refresh(shm)) return -1;
 
   std::unordered_set<uint32_t> cons_set, all_set;
   uint32_t cur = tail;
@@ -356,7 +356,7 @@ int refresh_suffix_path_s(SedbtShm *shm, uint32_t tail, uint8_t tdir) {
   uint32_t s_n = 0;
   if (!reserve_s_offs(shm, write_n, &s_n)) {
     unlock_path_s_refresh(shm);
-    return 0;
+    return -1;
   }
   for (uint32_t i = 0; i < cons.size(); ++i) shm_s_offs(shm)[s_n + i] = cons[i];
   for (uint32_t i = 0; i < rest.size(); ++i)

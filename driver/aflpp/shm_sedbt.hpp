@@ -44,7 +44,8 @@ void dump_shm_tree(const SedbtShm *shm, const char *path);
 
 // Recompute suffix path-s on a closed terminal: keep only symbols from
 // suffix nodes that still have an unexplored sibling. Readers of term_s_*
-// do not lock. Returns 1 if SHM path-s changed, 0 if skipped / unchanged.
+// do not lock. Returns 1 if SHM path-s changed, 0 if skipped / unchanged,
+// -1 if the caller must retry (writer busy or symbol arena full).
 int refresh_suffix_path_s(SedbtShm *shm, uint32_t tail, uint8_t tdir);
 bool try_lock_path_s_refresh(SedbtShm *shm);
 void unlock_path_s_refresh(SedbtShm *shm);
